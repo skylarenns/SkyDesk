@@ -1,0 +1,66 @@
+name: SkyDesk
+options:
+  bundleIdPrefix: com.skylar.skydesk
+  deploymentTarget:
+    macOS: "14.0"
+    iOS: "17.0"
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    SWIFT_STRICT_CONCURRENCY: targeted
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: 13
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+    CODE_SIGN_STYLE: Automatic
+    GENERATE_INFOPLIST_FILE: NO
+    # Optional personal signing configuration; never committed.
+configFiles:
+  Debug: Local.xcconfig
+  Release: Local.xcconfig
+targets:
+  SkyDeskHost:
+    type: application
+    platform: macOS
+    sources: [Sources/Core, Sources/Host]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.skylar.skydesk.host
+        PRODUCT_NAME: SkyDesk Host
+        ENABLE_HARDENED_RUNTIME: YES
+        INFOPLIST_FILE: Config/Host-Info.plist
+        CODE_SIGN_ENTITLEMENTS: Config/Host.entitlements
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/Host/SkyDesk-Bridging-Header.h
+    dependencies:
+      - target: SkyDeskRestore
+        link: false
+        embed: true
+        codeSign: true
+        copy:
+          destination: wrapper
+          subpath: Contents/Helpers
+    scheme:
+      gatherCoverageData: false
+  SkyDeskRestore:
+    type: tool
+    platform: macOS
+    sources: [Sources/Core/DisplayLayout.swift, Sources/Recovery]
+    settings:
+      base:
+        PRODUCT_NAME: SkyDeskRestore
+        PRODUCT_BUNDLE_IDENTIFIER: com.skylar.skydesk.restore
+        GENERATE_INFOPLIST_FILE: YES
+        ENABLE_HARDENED_RUNTIME: YES
+        SKIP_INSTALL: YES
+  SkyDeskPad:
+    type: application
+    platform: iOS
+    sources: [Sources/Core, Sources/Pad]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.skylar.skydesk.pad
+        PRODUCT_NAME: SkyDesk
+        TARGETED_DEVICE_FAMILY: "2"
+        SUPPORTS_MACCATALYST: NO
+        INFOPLIST_FILE: Config/Pad-Info.plist
+    scheme:
+      gatherCoverageData: false
