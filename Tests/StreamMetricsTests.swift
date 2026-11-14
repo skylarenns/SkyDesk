@@ -176,7 +176,9 @@ final class TotalLatencyTests: XCTestCase {
         let value = stats.snapshot(now: start + 1_200 * ms)
         XCTAssertEqual(value.totalAverageMS ?? 0, 36, accuracy: 0.01)
         XCTAssertEqual(value.totalHigh1MS ?? 0, 36, accuracy: 0.01)
-        XCTAssertEqual(StatisticsText.total(value), "Total  avg 36.0 ms · 1% high 36.0 ms")
+        // The picture itself only made the one-way trip: 12 + 4 + 16.
+        XCTAssertEqual(value.pictureAverageMS ?? 0, 32, accuracy: 0.01)
+        XCTAssertEqual(StatisticsText.total(value), "Picture delay  avg 32.0 ms · Click to screen  avg 36.0 ms · 1% high 36.0 ms")
         XCTAssertTrue(StatisticsText.pipeline(value).hasSuffix("Local display avg 16.0 ms"))
         // No RTT yet or no Mac timing: no total sample rather than a misleading one.
         let fresh = StreamStatistics()
@@ -203,5 +205,15 @@ final class RoundTripReportTests: XCTestCase {
         XCTAssertNil(path.roundTripMS(maxAge: 3, now: monotonicNanos() + 4_000_000_000))
         path.bind(control: UUID())
         XCTAssertNil(path.roundTripMS())
+    }
+}
+
+final class CornerReadoutTests: XCTestCase {
+    func testCornerShowsBitrateDelayAndBuild() {
+        var values = StreamStatistics.Snapshot()
+        values.megabitsPerSecond = 1.52; values.totalAverageMS = 40.4
+        XCTAssertEqual(StatisticsText.corner(values, build: 34), "1.5 mb/s · 40 ms · v34")
+        values.megabitsPerSecond = 23.96; values.totalAverageMS = nil
+        XCTAssertEqual(StatisticsText.corner(values, build: 35), "24.0 mb/s · — ms · v35")
     }
 }

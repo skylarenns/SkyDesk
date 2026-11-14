@@ -101,6 +101,10 @@ final class ClientModel: ObservableObject {
     @Published var sharpenText = UserDefaults.standard.object(forKey: "sharpenText") as? Bool ?? true {
         didSet { UserDefaults.standard.set(sharpenText, forKey: "sharpenText") }
     }
+    /// Draw each frame as soon as it arrives when it can still make the next screen refresh (build 35).
+    @Published var presentOnArrival = UserDefaults.standard.object(forKey: "presentOnArrival") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(presentOnArrival, forKey: "presentOnArrival") }
+    }
     @Published var preferCable = UserDefaults.standard.bool(forKey: "preferCable") {
         didSet { UserDefaults.standard.set(preferCable, forKey: "preferCable") }
     }
@@ -1051,7 +1055,8 @@ final class ClientModel: ObservableObject {
         let values = mailbox.statistics.snapshot()
         Breadcrumb.mark("tick:text")
         stats.update(headline: StatisticsText.headline(values), network: StatisticsText.network(values),
-                     display: StatisticsText.total(values), details: StatisticsText.pipeline(values))
+                     display: StatisticsText.total(values), details: StatisticsText.pipeline(values),
+                     corner: StatisticsText.corner(values, build: Self.ownBuild))
         statsTick += 1
         if statsTick % 2 == 0, (info?.features ?? 0) & StreamFeature.clientStatsLog != 0 {
             control?.send(.clientStats(StatisticsText.logLine(values, link: usingCable ? "cable" : usingVPN ? "vpn" : networkSymbol)))
@@ -1068,10 +1073,63 @@ final class StreamStatsModel: ObservableObject {
     @Published var networkTiming = ""
     @Published var displayTiming = ""
     @Published var timingDetails = ""
-    func update(headline: String, network: String, display: String, details: String) {
+    @Published var corner = ""
+    func update(headline: String, network: String, display: String, details: String, corner: String) {
+        if self.corner != corner { self.corner = corner }
         if metrics != headline { metrics = headline }
         if networkTiming != network { networkTiming = network }
         if displayTiming != display { displayTiming = display }
         if timingDetails != details { timingDetails = details }
     }
 }
+
+#if targetEnvironment(simulator)
+import CoreVideo
+
+/// Simulator-only self-check (SKYDESK_DEMO=1): shows the streaming screen with generated frames, so the drawing
+/// path, toolbar and readouts can be looked at without a Mac session. Not compiled into the iPad app.
+extension ClientModel {
+    func startDemo() {
+        let mailbox = FrameMailbox(); self.mailbox = mailbox
+        info = StreamInfo(width: 1376, height: 1032, fps: 120, bitrate: 25_000_000, displayName: "Demo", inputEnabled: false)
+        let queue = DispatchQueue(label: "skydesk.demo")
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        var sequence: UInt64 = 0
+        timer.schedule(deadline: .now() + 0.2, repeating: .milliseconds(16))
+        timer.setEventHandler {
+            sequence += 1
+            var buffer: CVPixelBuffer?
+            let attributes: [CFString: Any] = [kCVPixelBufferIOSurfacePropertiesKey: [:], kCVPixelBufferMetalCompatibilityKey: true]
+            guard CVPixelBufferCreate(nil, 1376, 1032, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, attributes as CFDictionary, &buffer) == kCVReturnSuccess,
+                  let pixels = buffer else { return }
+            CVPixelBufferLockBaseAddress(pixels, [])
+            for plane in 0..<2 {
+                let base = CVPixelBufferGetBaseAddressOfPlane(pixels, plane)!.assumingMemoryBound(to: UInt8.self)
+                let stride = CVPixelBufferGetBytesPerRowOfPlane(pixels, plane), rows = CVPixelBufferGetHeightOfPlane(pixels, plane)
+                for row in 0..<rows {
+                    // Moving diagonal bands in luma, a slow colour drift in chroma.
+                    if plane == 0 { for x in 0..<stride { base[row * stride + x] = UInt8(60 + ((x + row + Int(sequence) * 4) / 64 % 2) * 140) } }
+                    else { memset(base + row * stride, Int32(110 + (Int(sequence) / 4 + row / 8) % 40), stride) }
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(pixels, [])
+            let now = monotonicNanos()
+            _ = mailbox.statistics.recordPong(sentAt: now - 6_000_000, now: now)
+            mailbox.put(DecodedImage(pixels: pixels, sequence: sequence, receivedAt: now, macMS: 9), bytes: 26_000, decodeMS: 2)
+        }
+        timer.resume()
+        demoTimer = timer
+        demoStats = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                let values = mailbox.statistics.snapshot()
+                self.stats.update(headline: StatisticsText.headline(values), network: StatisticsText.network(values),
+                                  display: StatisticsText.total(values), details: StatisticsText.pipeline(values),
+                                  corner: StatisticsText.corner(values, build: Self.ownBuild))
+            }
+        }
+    }
+}
+nonisolated(unsafe) private var demoTimer: DispatchSourceTimer?
+nonisolated(unsafe) private var demoStats: Timer?
+#endif

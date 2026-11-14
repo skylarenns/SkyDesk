@@ -15,15 +15,21 @@ final class FrameMailbox {
     private let lock = NSLock()
     private var latest: DecodedImage?
     private var highestSequence: UInt64 = 0
+    private var arrival: (() -> Void)?
+    /// Called (on the decoding thread) each time a newer frame is ready to draw.
+    func onArrival(_ handler: (() -> Void)?) { lock.lock(); arrival = handler; lock.unlock() }
     func put(_ image: DecodedImage, bytes: Int, decodeMS: Double) {
         statistics.recordReceived(bytes: bytes, decodeMS: decodeMS)
-        lock.lock(); defer { lock.unlock() }
-        guard image.sequence > highestSequence else { return }
+        lock.lock()
+        guard image.sequence > highestSequence else { lock.unlock(); return }
         highestSequence = image.sequence
         var image = image
         // A replaced frame never reaches the screen, so the pause it ended belongs to its successor.
         if latest?.afterIdle == true { image.afterIdle = true }
         latest = image
+        let notify = arrival
+        lock.unlock()
+        notify?()
     }
     func take() -> DecodedImage? {
         lock.lock(); defer { lock.unlock() }
@@ -46,6 +52,10 @@ final class FrameRenderer: NSObject, MTKViewDelegate {
     private var keyboardFraction: CGFloat = 0
     private var focusRect: CGRect?
     private let inFlight = DispatchSemaphore(value: 2)
+    /// Counts frames handed to the display; the view compares it before and after a draw.
+    private(set) var submitted = 0
+    /// Set just before a draw to learn when that frame reaches the screen (host clock, seconds). Used once.
+    var presentedOnce: ((Double) -> Void)?
 
     init(device: MTLDevice, mailbox: FrameMailbox) throws {
         guard let queue = device.makeCommandQueue() else { throw DeskError.invalid("Metal command queue unavailable.") }
@@ -86,6 +96,11 @@ final class FrameRenderer: NSObject, MTKViewDelegate {
         }
         let isNew = fresh.sequence != submittedSequence
         submittedSequence = fresh.sequence; needsRedraw = false
+        submitted &+= 1
+        let observer = presentedOnce; presentedOnce = nil
+        #if !targetEnvironment(simulator)
+        if let observer { drawable.addPresentedHandler { drawable in if drawable.presentedTime > 0 { observer(drawable.presentedTime) } } }
+        #endif
         if isNew {
             #if targetEnvironment(simulator)
             // The simulator SDK has no drawable presentation callback.

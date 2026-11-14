@@ -47,8 +47,11 @@ public struct RollingSamples {
 /// - Latency average: mean of the samples from the last 2 s. Latency 1% high: 99th percentile of the last 10 s.
 /// - Network RTT: ping/pong round trip on the control connection, sampled `pingsPerSecond` times a second.
 /// - Local display: frame fully received → on screen. Excludes Mac capture, encode, and network transit.
-/// - Total (estimate): per on-screen frame, the Mac's capture→encoded time (both timestamps on the Mac's clock)
-///   + the current RTT average + that frame's local display time. Excludes the Mac app's own reaction time.
+/// - Picture delay (estimate): per on-screen frame, the Mac's capture→encoded time (both timestamps on the Mac's
+///   clock) + half the current RTT average (a frame travels one way) + that frame's local display time: how old
+///   the picture is when it is seen.
+/// - Click to screen (estimate, `total`): the same with the whole RTT, because the input that caused the picture
+///   travelled the other way first. Excludes the Mac app's own reaction time.
 /// - A percentile needs `minimumTailSamples` samples in its window; otherwise it is nil ("—").
 public final class StreamStatistics {
     public static let rateSpan: UInt64 = 1_000_000_000
@@ -68,6 +71,7 @@ public final class StreamStatistics {
         public var displayHigh1MS: Double?
         public var totalAverageMS: Double?
         public var totalHigh1MS: Double?
+        public var pictureAverageMS: Double?
         public var decodeAverageMS: Double?
         /// Frames that finished arriving in the last second, whether or not they reached the screen.
         public var arrivedFPS = 0.0
@@ -80,6 +84,7 @@ public final class StreamStatistics {
     private var intervals = RollingSamples(span: StreamStatistics.tailSpan)
     private var display = RollingSamples(span: StreamStatistics.tailSpan)
     private var total = RollingSamples(span: StreamStatistics.tailSpan)
+    private var picture = RollingSamples(span: StreamStatistics.averageSpan)
     private var rtt = RollingSamples(span: StreamStatistics.tailSpan)
     private var lastPresented: UInt64?
     private var lastPong: UInt64?
@@ -97,7 +102,10 @@ public final class StreamStatistics {
         if time >= receivedAt {
             let local = Double(time - receivedAt) / 1_000_000
             display.add(local, at: time)
-            if let macMS, macMS >= 0, let round = rtt.mean(last: Self.averageSpan, now: time) { total.add(macMS + round + local, at: time) }
+            if let macMS, macMS >= 0, let round = rtt.mean(last: Self.averageSpan, now: time) {
+                total.add(macMS + round + local, at: time)
+                picture.add(macMS + round / 2 + local, at: time)
+            }
         }
         if let last = lastPresented {
             guard time > last else { return }
@@ -129,6 +137,7 @@ public final class StreamStatistics {
         value.displayHigh1MS = display.percentile(0.99, now: now, minimumSamples: minimum)
         value.totalAverageMS = total.mean(last: Self.averageSpan, now: now)
         value.totalHigh1MS = total.percentile(0.99, now: now, minimumSamples: minimum)
+        value.pictureAverageMS = picture.mean(now: now)
         value.decodeAverageMS = decode.mean(now: now)
         value.arrivedFPS = Double(received.recent(now: now).count) / (Double(Self.rateSpan) / 1_000_000_000)
         return value
@@ -147,11 +156,16 @@ public enum StatisticsText {
         "Local display  avg \(milliseconds(s.displayAverageMS)) · 1% high \(milliseconds(s.displayHigh1MS))"
     }
     public static func total(_ s: StreamStatistics.Snapshot) -> String {
-        "Total  avg \(milliseconds(s.totalAverageMS)) · 1% high \(milliseconds(s.totalHigh1MS))"
+        "Picture delay  avg \(milliseconds(s.pictureAverageMS)) · Click to screen  avg \(milliseconds(s.totalAverageMS)) · 1% high \(milliseconds(s.totalHigh1MS))"
     }
     public static func pipeline(_ s: StreamStatistics.Snapshot) -> String {
         String(format: "Arrived %.0f FPS · Decode avg %@ · Local display avg %@", s.arrivedFPS, milliseconds(s.decodeAverageMS),
                milliseconds(s.displayAverageMS))
+    }
+    /// The small fixed readout in the corner of the stream: bitrate received, click-to-screen delay, build.
+    public static func corner(_ s: StreamStatistics.Snapshot, build: Int) -> String {
+        let delay = s.totalAverageMS.map { String(format: "%.0f ms", $0) } ?? "— ms"
+        return String(format: "%.1f mb/s · %@ · v%d", s.megabitsPerSecond, delay, build)
     }
     /// One compact line for the host's diagnostic log.
     public static func logLine(_ s: StreamStatistics.Snapshot, link: String) -> String {
@@ -169,7 +183,8 @@ public enum StatisticsText {
     }
     public static let explanation = "Avg: last 2 s. 1% high/low: 99th percentile of the last 10 s, shown once 100 samples exist. "
         + "1% low skips pauses where the Mac screen was not changing. RTT: network round trip, 20 samples/s. "
-        + "Total: Mac capture and encoding + network round trip + iPad display."
+        + "Picture delay: Mac capture and encoding + half the round trip (a frame travels one way) + iPad display. "
+        + "Click to screen adds the other half, for your input travelling to the Mac first."
 }
 
 /// Append-only diagnostic log (~/Library/Logs/SkyDesk/stream-metrics.log on the Mac). Numbers only, no screen content.

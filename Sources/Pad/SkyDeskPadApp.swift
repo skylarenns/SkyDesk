@@ -29,6 +29,12 @@ final class PadAppDelegate: UIResponder, UIApplicationDelegate {
                 guard let self else { return }
                 // A scene that connected before this observer existed still gets its window.
                 self.attach(note.object as? UIScene)
+                #if targetEnvironment(simulator)
+                if ProcessInfo.processInfo.environment["SKYDESK_DEMO"] != nil {
+                    if self.client.info == nil { self.client.startDemo() }
+                    return
+                }
+                #endif
                 // The first call starts discovery and tries the most recent Mac; later calls only resume.
                 self.client.launch()
                 self.client.enterForeground()
@@ -325,6 +331,7 @@ private struct StreamView: View {
                     .allowsHitTesting(false).zIndex(20)
             }
         }
+        .overlay(alignment: .bottomTrailing) { CornerReadout(stats: client.stats) }
         .background(GeometryReader { proxy in Color.clear.preference(key: ContainerSizePreference.self, value: proxy.size) })
         .onPreferenceChange(ContainerSizePreference.self) { containerSize = $0 }
         .persistentSystemOverlays(.hidden).ignoresSafeArea(.keyboard)
@@ -452,6 +459,7 @@ private struct StreamView: View {
                             Toggle("Show keyboard for text fields", isOn: $client.automaticKeyboard)
                             Toggle("Detailed statistics", isOn: $client.showTimingDetails)
                             Toggle("Sharpen text", isOn: $client.sharpenText)
+                            Toggle("Show frames sooner (less delay)", isOn: $client.presentOnArrival)
                             Toggle("Use USB cable when plugged in", isOn: $client.preferCable)
                             Section("SkyDesk build \(ClientModel.ownBuild)") { EmptyView() }
                         } label: { Label("Settings", systemImage: "gearshape") }
@@ -488,6 +496,23 @@ private struct StatsHUD: View {
             }
         }.monospacedDigit().padding(10)
             .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12)).allowsHitTesting(false)
+    }
+}
+
+/// Bitrate · click-to-screen delay · build, fixed in the bottom-right corner, always shown whether or not
+/// "Show statistics" is on, with no box behind it (user request 2026-11-13). A thin dark edge keeps the white text
+/// readable over a light Mac window. It never takes a touch or a click, so whatever is under it stays usable.
+/// Observes only the statistics, like StatsHUD.
+private struct CornerReadout: View {
+    @ObservedObject var stats: StreamStatsModel
+    var body: some View {
+        Text(stats.corner.isEmpty ? "v\(ClientModel.ownBuild)" : stats.corner)
+            .font(.system(size: 11, weight: .medium, design: .monospaced)).monospacedDigit()
+            .foregroundStyle(.white)
+            .shadow(color: .black, radius: 0.6).shadow(color: .black.opacity(0.9), radius: 1.5)
+            .padding(.trailing, 10).padding(.bottom, 6)
+            .allowsHitTesting(false)
+            .accessibilityLabel("Stream: \(stats.corner)")
     }
 }
 

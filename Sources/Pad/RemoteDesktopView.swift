@@ -23,13 +23,14 @@ struct RemoteDesktopView: UIViewRepresentable {
         Breadcrumb.mark("swiftui:update"); defer { Breadcrumb.mark("swiftui:updated") }
         view.controlsFrame = controlsFrame
         view.setSharpening(client.sharpenText)
+        view.presentOnArrival = client.presentOnArrival
         view.setLocalCursorEnabled(client.localCursorActive)
         view.setPointerScale(client.pointerScale)
         view.setCursor(client.remoteCursor)
         view.updateKeyboard(wanted: client.keyboardWanted, focus: client.textFocus, fallback: client.lastTapRect)
     }
     static func dismantleUIView(_ view: DesktopMetalView, coordinator: ()) {
-        view.releaseKeys(); view.isPaused = true
+        view.releaseKeys(); view.stopDisplayLink()
         // Same rule as updateKeyboard: no responder change while SwiftUI is updating.
         DispatchQueue.main.async { view.endKeyboard() }
     }
@@ -72,8 +73,14 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
     private var repeatKey: Int?
     private var heldKeys: Set<Int> = []
     private var deactivateObserver: NSObjectProtocol?
+    /// Draw a frame the moment it arrives when it can still make the next screen refresh (build 35).
+    var presentOnArrival = true
+    private let mailbox: FrameMailbox
+    private var displayLink: CADisplayLink?
+    private var pacer = ArrivalPacer()
 
     init(mailbox: FrameMailbox, info: StreamInfo) {
+        self.mailbox = mailbox
         remoteSize = CGSize(width: info.width, height: info.height); targetFPS = info.fps
         localCursor = (info.features ?? 0) & StreamFeature.localCursor != 0
         super.init(frame: .zero, device: MTLCreateSystemDefaultDevice())
@@ -82,7 +89,8 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
         clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
         colorPixelFormat = .bgra8Unorm
         autoResizeDrawable = true
-        preferredFramesPerSecond = info.fps
+        // Drawn by this view's own display link (and on frame arrival), not by MTKView's timer.
+        isPaused = true; enableSetNeedsDisplay = false
         if let layer = layer as? CAMetalLayer { layer.maximumDrawableCount = 3; layer.allowsNextDrawableTimeout = true }
         if let device {
             do { renderer = try FrameRenderer(device: device, mailbox: mailbox); delegate = renderer }
@@ -160,6 +168,7 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
     required init(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     deinit {
         repeatTimer?.invalidate()
+        displayLink?.invalidate(); mailbox.onArrival(nil)
         if let deactivateObserver { NotificationCenter.default.removeObserver(deactivateObserver) }
         keyboardObservers.forEach { NotificationCenter.default.removeObserver($0) }
     }
@@ -169,9 +178,41 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
         super.didMoveToWindow()
         if let window {
             contentScaleFactor = window.screen.nativeScale
-            preferredFramesPerSecond = min(targetFPS, window.screen.maximumFramesPerSecond)
+            startDisplayLink(rate: min(targetFPS, window.screen.maximumFramesPerSecond))
             becomeFirstResponder()
-        } else { releaseKeys() }
+        } else { stopDisplayLink(); releaseKeys() }
+    }
+    private func startDisplayLink(rate: Int) {
+        displayLink?.invalidate()
+        let link = CADisplayLink(target: DisplayLinkTarget(self), selector: #selector(DisplayLinkTarget.tick(_:)))
+        let fastest = Float(max(30, rate))
+        link.preferredFrameRateRange = CAFrameRateRange(minimum: min(fastest, 80), maximum: fastest, preferred: fastest)
+        link.add(to: .main, forMode: .common)
+        displayLink = link
+        mailbox.onArrival { [weak self] in DispatchQueue.main.async { self?.frameArrived() } }
+    }
+    func stopDisplayLink() {
+        displayLink?.invalidate(); displayLink = nil
+        mailbox.onArrival(nil)
+    }
+    /// Every screen refresh: draw whatever is waiting (a new frame, or a redraw after a layout change).
+    fileprivate func displayTick(_ link: CADisplayLink) {
+        pacer.tick(target: link.targetTimestamp, interval: link.targetTimestamp - link.timestamp)
+        let before = renderer?.submitted
+        draw()
+        if renderer?.submitted != before { pacer.drew() }
+    }
+    /// A frame finished decoding. If nothing has been drawn for the coming refresh and there is still time to
+    /// make it, draw now; otherwise the next tick takes it, as before.
+    private func frameArrived() {
+        guard presentOnArrival, displayLink != nil, let renderer, pacer.mayDrawOnArrival(now: CACurrentMediaTime()) else { return }
+        let expected = pacer.nextRefresh
+        let before = renderer.submitted
+        renderer.presentedOnce = { [weak self] presented in
+            DispatchQueue.main.async { self?.pacer.arrivalResult(expected: expected, presented: presented) }
+        }
+        draw()
+        if renderer.submitted != before { pacer.drew() } else { renderer.presentedOnce = nil }
     }
     override func resignFirstResponder() -> Bool { releaseKeys(); return super.resignFirstResponder() }
     override func layoutSubviews() { Breadcrumb.mark("layout"); super.layoutSubviews(); updateViewport(); placeCursor(); Breadcrumb.mark("layout:end") }
@@ -410,5 +451,15 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
         if value.contains(.alternate) { flags |= 4 }; if value.contains(.command) { flags |= 8 }
         if value.contains(.alphaShift) { flags |= 16 }
         return flags
+    }
+}
+
+/// A display link keeps its target alive; this stand-in lets the view go away.
+private final class DisplayLinkTarget {
+    private weak var view: DesktopMetalView?
+    init(_ view: DesktopMetalView) { self.view = view }
+    @objc func tick(_ link: CADisplayLink) {
+        guard let view else { link.invalidate(); return }
+        view.displayTick(link)
     }
 }
