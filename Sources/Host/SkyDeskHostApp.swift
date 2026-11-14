@@ -424,10 +424,11 @@ private struct HostView: View {
                 }
                 HStack {
                     Picker("Frame rate", selection: $host.fps) { Text("30").tag(30); Text("60").tag(60); Text("120").tag(120) }
-                    Picker("Bitrate", selection: $host.bitrateMbps) {
+                    Picker(host.adaptiveBitrate ? "Bitrate, up to" : "Bitrate", selection: $host.bitrateMbps) {
                         ForEach([15, 25, 40, 60, 80], id: \.self) { Text("\($0) Mbps").tag($0) }
                     }
                 }
+                Toggle("Lower the bitrate when the network is slow (recommended)", isOn: $host.adaptiveBitrate)
                 Toggle("Allow keyboard, trackpad and touch input", isOn: $host.allowInput)
                 Toggle("Sync clipboard text with the iPad automatically", isOn: $host.allowClipboard)
                 Toggle("Allow file transfers (incoming files go to Downloads)", isOn: $host.allowFiles)

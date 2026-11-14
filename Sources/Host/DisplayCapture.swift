@@ -99,6 +99,8 @@ final class DisplayCapture: NSObject, SCStreamOutput, SCStreamDelegate {
         try await stream.updateConfiguration(configuration)
     }
     var isPaused: Bool { lock.withLock { paused } }
+    /// Applied on the capture queue, in order with the frames being encoded.
+    func setBitrate(_ bitrate: Int) { queue.async { [weak self] in self?.encoder.setBitrate(bitrate) } }
     func statistics() -> (captured: Int, frames: Int, skipped: Int, encodeMS: Double, bytes: Int) {
         lock.lock(); defer { lock.unlock() }
         let value = (captured, received, skipped, encodeMilliseconds, encodedBytes)
@@ -141,6 +143,7 @@ final class DisplayCapture: NSObject, SCStreamOutput, SCStreamDelegate {
                 self.encodedBytes += frame.bytes.count
                 self.encodeMilliseconds = Double(frame.encodeTime - now) / 1_000_000
                 self.lock.unlock()
+                self.window.markSent(frame.sequence, bytes: frame.bytes.count)
                 self.onFrame?(frame)
             case .failure(let error):
                 self.window.acknowledge(sequence)

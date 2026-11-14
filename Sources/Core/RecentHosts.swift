@@ -124,3 +124,32 @@ public enum LinkKind: Equatable {
         return wifi || cellular ? .wireless : .cable
     }
 }
+
+/// Several remembered addresses can belong to the same Mac (home Wi-Fi, a VPN address for use away from home).
+/// The iPad asks all of them at once and uses the newest one that answers (build 33). Index 0 is the newest.
+public struct AddressRace {
+    public enum Step: Equatable {
+        case wait
+        /// A newer address may still answer: give it a moment, then use the best one so far.
+        case waitBriefly
+        case choose(Int?)
+    }
+    private let count: Int
+    private var answered: Set<Int> = []
+    private var failed: Set<Int> = []
+    public init(count: Int) { self.count = count }
+    public var best: Int? { answered.min() }
+    public mutating func answered(_ index: Int) -> Step {
+        answered.insert(index)
+        return settled ?? .waitBriefly
+    }
+    public mutating func failed(_ index: Int) -> Step {
+        failed.insert(index)
+        return settled ?? .wait
+    }
+    /// Decided once nothing newer than the best answer is still pending, or once everything failed.
+    private var settled: Step? {
+        if let best, (0..<best).allSatisfy(failed.contains) { return .choose(best) }
+        return failed.count >= count ? .choose(nil) : nil
+    }
+}

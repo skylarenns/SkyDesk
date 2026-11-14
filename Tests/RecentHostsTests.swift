@@ -81,3 +81,30 @@ final class SessionLifecycleTests: XCTestCase {
         XCTAssertEqual(SessionLifecycle.onForeground(connected: false, lastReplyAge: nil, resumeWanted: false, connecting: true), .nothing)
     }
 }
+
+final class AddressRaceTests: XCTestCase {
+    func testNewestAddressWinsAtOnce() {
+        var race = AddressRace(count: 3)
+        XCTAssertEqual(race.answered(0), .choose(0))
+    }
+    func testAnOlderAnswerWaitsBrieflyForANewerOne() {
+        var race = AddressRace(count: 3)
+        XCTAssertEqual(race.answered(2), .waitBriefly)
+        XCTAssertEqual(race.best, 2)
+        XCTAssertEqual(race.answered(1), .waitBriefly)
+        XCTAssertEqual(race.best, 1)
+        // Once the newest has failed, nothing better can come.
+        XCTAssertEqual(race.failed(0), .choose(1))
+    }
+    func testAwayFromHomeTheVPNAddressIsChosenWhenHomeFails() {
+        var race = AddressRace(count: 2)       // 0 = home Wi-Fi (newest), 1 = VPN
+        XCTAssertEqual(race.failed(0), .wait)
+        XCTAssertEqual(race.answered(1), .choose(1))
+    }
+    func testNothingAnswering() {
+        var race = AddressRace(count: 2)
+        XCTAssertEqual(race.failed(1), .wait)
+        XCTAssertEqual(race.failed(0), .choose(nil))
+        XCTAssertNil(race.best)
+    }
+}

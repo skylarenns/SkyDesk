@@ -45,6 +45,13 @@ final class HostModel: ObservableObject {
         didSet { UserDefaults.standard.set(knownPadBuild, forKey: "knownPadBuild") }
     }
     @Published var lowLatencyRateControl = false
+    /// Lower the bitrate when the network falls behind, back up to the Bitrate setting when it recovers (build 33).
+    @Published var adaptiveBitrate = UserDefaults.standard.object(forKey: "adaptiveBitrate") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(adaptiveBitrate, forKey: "adaptiveBitrate") }
+    }
+    private var bitrateController: BitrateController?
+    private var bitrateTimer: Timer?
+    private var lastBitrateSample = monotonicNanos()
     @Published var password = ""
     @Published var pairingLocked = false
     @Published var metrics = "No client connected"
@@ -269,6 +276,7 @@ final class HostModel: ObservableObject {
         focusMonitor?.stop(); focusMonitor = nil
         cursorMonitor?.stop(); cursorMonitor = nil
         clipboardTimer?.invalidate(); clipboardTimer = nil; clipboard = nil
+        bitrateTimer?.invalidate(); bitrateTimer = nil; bitrateController = nil
         fileRoute.set(nil, engine: nil)
         fileEngine?.close(reason: "The iPad disconnected."); fileEngine = nil; files = nil; filesReady = false
         current.forEach { $0.close() }
@@ -289,7 +297,8 @@ final class HostModel: ObservableObject {
         refreshStatus()
     }
     private func accept(_ connection: NWConnection) {
-        guard channels.count < 4 else { connection.cancel(); return }
+        // Control, video and files, plus room for the iPad's "which address answers?" probes (build 33).
+        guard channels.count < 8 else { connection.cancel(); return }
         let channel = SecureChannel(connection: connection, queue: transportQueue, maxPendingBytes: 18 * 1024 * 1024)
         channels[channel.id] = channel
         channel.onPacket = { [weak self, weak channel, fastPath, fileRoute] packet in
@@ -404,6 +413,7 @@ final class HostModel: ObservableObject {
                 // The iPad went to the background: nothing it holds may stay pressed on the Mac.
                 if paused { input.releaseAll() }
                 capture?.setPaused(paused)
+                bitrateController?.startGrace(1.5)
                 MetricsLog.shared.append(paused ? "host  iPad in background: input released, video paused" : "host  iPad back: video resumed with keyframe")
                 status = paused ? "iPad is in the background · video paused" : (capture.map { "\($0.info.width) × \($0.info.height) · streaming to iPad" } ?? status)
             case .clipboard(let text):
@@ -520,6 +530,7 @@ final class HostModel: ObservableObject {
                 if agreed & StreamFeature.localCursor != 0 { startCursorMonitor() }
                 if agreed & StreamFeature.clipboardSync != 0 { startClipboardSync() }
                 if agreed & StreamFeature.remoteUpdate != 0 { offeredBuild = nil; offerUpdateIfNeeded() }
+                if adaptiveBitrate { startBitrateControl(maximum: pipeline.info.bitrate) }
                 status = "Streaming to iPad · \(pipeline.info.width) × \(pipeline.info.height) · \(sessionFPS) FPS"
                 startingCapture = false
             } catch {
@@ -535,6 +546,38 @@ final class HostModel: ObservableObject {
             }
         }
     }
+    // MARK: Adaptive bitrate
+
+    private func startBitrateControl(maximum: Int) {
+        var controller = BitrateController(maximum: maximum)
+        controller.startGrace(1.5)
+        bitrateController = controller
+        lastBitrateSample = monotonicNanos()
+        _ = capture?.window.drainTransit()
+        let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in MainActor.assumeIsolated { self?.adjustBitrate() } }
+        RunLoop.main.add(timer, forMode: .common); bitrateTimer = timer
+    }
+    private func adjustBitrate() {
+        guard let capture, var controller = bitrateController else { return }
+        let now = monotonicNanos()
+        let seconds = Double(now &- lastBitrateSample) / 1_000_000_000
+        lastBitrateSample = now
+        let transit = capture.window.drainTransit()
+        guard !capture.isPaused else { return }
+        let before = controller.target
+        let changed = controller.update(.init(seconds: seconds, transitMS: transit.meanMS, acknowledged: transit.count,
+                                              backlogBytes: video?.backlogBytes ?? 0, deliveredBytes: transit.bytes))
+        bitrateController = controller
+        guard let changed else { return }
+        capture.setBitrate(changed)
+        // Every cut is logged with its cause; the climb back only when it reaches the setting again.
+        if changed < before {
+            MetricsLog.shared.append(String(format: "host  bitrate %.1f → %.1f Mbps (%@)", Double(before) / 1e6, Double(changed) / 1e6, controller.reason))
+        } else if changed == controller.maximum {
+            MetricsLog.shared.append(String(format: "host  bitrate back to %.1f Mbps", Double(changed) / 1e6))
+        }
+    }
+
     // MARK: Pointer, clipboard and files
 
     private func startCursorMonitor() {
@@ -765,6 +808,9 @@ final class HostModel: ObservableObject {
         metrics = String(format: "%.0f capture / %.0f encoded FPS · %.0f skipped/s · %.1f ms encode · %.1f ms feedback · %d in-flight limit",
                          Double(stats.captured) / elapsed, Double(stats.frames) / elapsed, Double(stats.skipped) / elapsed, stats.encodeMS,
                          capture.window.feedbackMilliseconds, capture.window.currentLimit)
+        if let controller = bitrateController, controller.target < controller.maximum {
+            metrics += String(format: " · bitrate limited to %.1f Mbps by the network", Double(controller.target) / 1e6)
+        }
         MetricsLog.shared.append(String(format: "host  %@ · %.1f Mbps encoded", metrics, Double(stats.bytes) * 8 / elapsed / 1_000_000))
         if let age = capture.window.oldestAge(), age > 5_000_000_000 { disconnect(); status = "Video stalled; reconnect the iPad." }
     }

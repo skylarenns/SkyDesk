@@ -343,6 +343,11 @@ public final class FrameWindow {
     private let maximumCapacity: Int
     private var limit: Int
     private var feedbackSamples: [UInt64] = []
+    /// When each outstanding frame left the encoder, and the network-and-decode time of acknowledged frames.
+    private var handedOver: [UInt64: (at: UInt64, bytes: Int)] = [:]
+    private var transitTotal: UInt64 = 0
+    private var transitCount = 0
+    private var transitBytes = 0
     public init(capacity: Int = 2) {
         self.capacity = max(1, capacity); limit = max(1, capacity)
         maximumCapacity = max(1, capacity); frameInterval = nil
@@ -366,8 +371,24 @@ public final class FrameWindow {
            now - oldest > 120_000_000 { return nil }
         next &+= 1; outstanding[next] = now; return next
     }
+    /// The frame left the encoder and was handed to the network (for BitrateController).
+    public func markSent(_ sequence: UInt64, bytes: Int = 0, now: UInt64 = monotonicNanos()) {
+        lock.lock(); defer { lock.unlock() }
+        if outstanding[sequence] != nil { handedOver[sequence] = (now, bytes) }
+    }
+    /// Since the last call: mean time from `markSent` to `acknowledge` in milliseconds, how many frames were
+    /// acknowledged, and their size.
+    public func drainTransit() -> (meanMS: Double, count: Int, bytes: Int) {
+        lock.lock(); defer { lock.unlock() }
+        let value = (transitCount > 0 ? Double(transitTotal) / Double(transitCount) / 1_000_000 : 0, transitCount, transitBytes)
+        transitTotal = 0; transitCount = 0; transitBytes = 0
+        return value
+    }
     public func acknowledge(_ sequence: UInt64, now: UInt64 = monotonicNanos()) {
         lock.lock(); defer { lock.unlock() }
+        if let handed = handedOver.removeValue(forKey: sequence), now >= handed.at {
+            transitTotal += now - handed.at; transitCount += 1; transitBytes += handed.bytes
+        }
         guard let sent = outstanding.removeValue(forKey: sequence), now >= sent, let frameInterval else { return }
         feedbackSamples.append(now - sent)
         if feedbackSamples.count > 64 { feedbackSamples.removeFirst() }
@@ -384,6 +405,7 @@ public final class FrameWindow {
     public func reset() {
         lock.lock(); defer { lock.unlock() }
         outstanding.removeAll(); feedbackSamples.removeAll(); limit = capacity
+        handedOver.removeAll(); transitTotal = 0; transitCount = 0; transitBytes = 0
     }
 }
 

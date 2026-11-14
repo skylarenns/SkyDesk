@@ -135,8 +135,12 @@ public final class SecureChannel {
     private var parser = WireParser()
     private var closed = false
     private var ready = false
-    private var pendingBytes = 0
+    private var pendingBytes = 0 { didSet { backlogLock.lock(); backlog = pendingBytes; backlogLock.unlock() } }
     private var pendingMessages = 0
+    private let backlogLock = NSLock()
+    private var backlog = 0
+    /// Bytes handed to the connection that it has not taken yet; readable from any thread.
+    public var backlogBytes: Int { backlogLock.lock(); defer { backlogLock.unlock() }; return backlog }
     private let maxPendingBytes: Int
     private let failWhenWaiting: Bool
     /// `failWhenWaiting` ends an attempt as soon as no usable route exists, so a caller can fall back to another link.

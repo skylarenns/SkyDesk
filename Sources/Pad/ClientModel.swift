@@ -21,6 +21,51 @@ struct ConnectTarget {
     var cableFirst = false
 }
 
+/// Asks several addresses at once whether SkyDesk answers there: a plain TCP connection to its port, closed at
+/// once. Nothing is sent, so no password or key is involved. Main thread only.
+final class AddressProbe {
+    private var connections: [NWConnection] = []
+    private var race = AddressRace(count: 0)
+    private var reported: Set<Int> = []
+    private var completion: ((Int?) -> Void)?
+    func start(_ endpoints: [NWEndpoint], timeout: TimeInterval = 2.5, completion: @escaping (Int?) -> Void) {
+        self.completion = completion
+        race = AddressRace(count: endpoints.count)
+        for (index, endpoint) in endpoints.enumerated() {
+            let tcp = NWProtocolTCP.Options(); tcp.connectionTimeout = Int(timeout.rounded(.up))
+            let connection = NWConnection(to: endpoint, using: NWParameters(tls: nil, tcp: tcp))
+            connection.stateUpdateHandler = { [weak self] state in
+                switch state {
+                case .ready: self?.report(index, answered: true)
+                case .failed, .waiting: self?.report(index, answered: false)
+                default: break
+                }
+            }
+            connections.append(connection)
+            connection.start(queue: .main)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + timeout) { [weak self] in self?.finish(self?.race.best) }
+    }
+    private func report(_ index: Int, answered: Bool) {
+        guard completion != nil, reported.insert(index).inserted else { return }
+        switch answered ? race.answered(index) : race.failed(index) {
+        case .wait: break
+        case .waitBriefly: DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in self?.finish(self?.race.best) }
+        case .choose(let choice): finish(choice)
+        }
+    }
+    private func finish(_ choice: Int?) {
+        guard let completion else { return }
+        cancel()
+        completion(choice)
+    }
+    func cancel() {
+        completion = nil
+        connections.forEach { $0.stateUpdateHandler = nil; $0.cancel() }
+        connections = []
+    }
+}
+
 /// Only touched on the video queue.
 private final class VideoGate {
     var paused = false
@@ -135,6 +180,7 @@ final class ClientModel: ObservableObject {
     private var videoGate: VideoGate?
     private var decoder: HEVCDecoder?
     private var launched = false
+    private var probe: AddressProbe?
 
     init() {
         if recents.entries.isEmpty { manualHost = UserDefaults.standard.string(forKey: "lastManualHost") ?? "" }
@@ -151,11 +197,31 @@ final class ClientModel: ObservableObject {
     }
     /// Tries the newest remembered Mac that has a saved password; does nothing on a first launch.
     private func connectToMostRecent() {
-        guard info == nil, !connecting else { return }
-        if let recent = AutoConnect.launchTarget(recents, hasCredential: { self.credential(for: $0) != nil }),
-           let target = target(for: recent) {
-            start(target, automatic: true)
+        guard info == nil, !connecting, probe == nil else { return }
+        let candidates = automaticTargets
+        guard let newest = candidates.first else { return }
+        guard candidates.count > 1 else { start(newest, automatic: true); return }
+        // Several remembered addresses (home Wi-Fi, a VPN address…): ask them all, use the newest that answers.
+        autoConnectLabel = newest.label
+        status = "Looking for \(newest.label)…"
+        if autoDeadline == nil { armAutoDeadline(label: newest.label) }
+        let probe = AddressProbe(); self.probe = probe
+        probe.start(candidates.map(\.endpoint)) { [weak self] answered in
+            guard let self, self.probe === probe else { return }
+            self.probe = nil
+            guard self.info == nil, !self.connecting else { return }
+            // Nothing answered yet (the Mac may still be waking): keep trying the newest until the deadline.
+            self.start(candidates[answered ?? 0], automatic: true)
         }
+    }
+    /// Remembered Macs with a saved password, newest first.
+    private var automaticTargets: [ConnectTarget] {
+        recents.entries.filter { credential(for: $0) != nil }.compactMap { target(for: $0) }
+    }
+    /// After a lost link or a return to the app: the address that just worked may be the wrong one now
+    /// (left home, joined the VPN), so with several remembered addresses they are all asked again.
+    private func reconnect(to target: ConnectTarget) {
+        if automaticTargets.count > 1 { connectToMostRecent() } else { start(target, automatic: true) }
     }
     func browse() {
         guard browser == nil else { return }
@@ -275,6 +341,7 @@ final class ClientModel: ObservableObject {
 
     private func start(_ target: ConnectTarget, automatic: Bool) {
         guard info == nil else { return }
+        probe?.cancel(); probe = nil
         if connecting { endSession(reason: nil) }
         if automatic {
             autoConnectLabel = target.label
@@ -535,6 +602,7 @@ final class ClientModel: ObservableObject {
     }
     private func endSession(reason: String?, keepDeadline: Bool = false) {
         token = UUID()
+        if !keepDeadline { probe?.cancel(); probe = nil }
         if !keepDeadline, autoDeadline != nil { clearAutoDeadline() }
         heartbeat?.invalidate(); heartbeat = nil
         pinger?.cancel(); pinger = nil
@@ -603,7 +671,7 @@ final class ClientModel: ObservableObject {
             let target = activeTarget ?? resumeTarget
             resumeTarget = nil
             endSession(reason: nil)
-            if let target { start(target, automatic: true) }
+            if let target { reconnect(to: target) }
         case .connectToMostRecent:
             // Not while the user is part-way through the connection form (e.g. back from copying a password).
             if pairingText.isEmpty, !passwordNeeded, selectedHost.isEmpty { connectToMostRecent() }
@@ -919,7 +987,7 @@ final class ClientModel: ObservableObject {
             let target = activeTarget
             let wasStreaming = info != nil
             endSession(reason: "Lost the connection to your Mac.")
-            if wasStreaming, !inBackground, let target { start(target, automatic: true) }
+            if wasStreaming, !inBackground, let target { reconnect(to: target) }
             return
         }
         guard !inBackground else { return }

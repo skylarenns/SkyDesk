@@ -60,6 +60,12 @@ public final class HEVCEncoder {
         if status != noErr { completion(.failure(DeskError.system("Submit frame for encoding", status))) }
     }
     public func flush() { if let session { VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid) } }
+    /// Changes the target bitrate of the running session; takes effect within a few frames, with no keyframe.
+    @discardableResult
+    public func setBitrate(_ bitrate: Int) -> Bool {
+        guard let session else { return false }
+        return VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: NSNumber(value: bitrate)) == noErr
+    }
     private static func packet(_ sample: CMSampleBuffer, sequence: UInt64, captureTime: UInt64, afterIdle: Bool) throws -> VideoFrame {
         guard let block = CMSampleBufferGetDataBuffer(sample), let format = CMSampleBufferGetFormatDescription(sample) else {
             throw DeskError.invalid("Encoder returned an empty frame.")
