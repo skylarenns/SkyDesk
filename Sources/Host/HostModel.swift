@@ -171,9 +171,6 @@ final class HostModel: ObservableObject {
         let blanker = MacDisplayController()
         blanker.onChange = { [weak self] blanked in self?.control?.send(.macDisplayBlanked(blanked)) }
         blanker.onLayoutChange = { [weak self] in self?.refreshInputGeometry() }
-        // The switch can be held back for up to about fifteen seconds; the Dock need not wait with it (user request
-        // 2026-11-14): bring it to the iPad's desktop straight away.
-        blanker.onWaiting = { [weak self] _ in self?.pullDockToSession() }
         return blanker
     }()
     private var timer: Timer?
@@ -563,6 +560,7 @@ final class HostModel: ObservableObject {
                         currentDevice = device
                     }
                     control = channel
+                    acceptedFrom[Self.address(of: channel.connection)] = Date()
                     fastPath.bind(control: channel.id)
                 case .video:
                     guard video == nil else { throw DeskError.invalid("Video channel already connected.") }
@@ -784,31 +782,29 @@ final class HostModel: ObservableObject {
             }
         }
     }
-    /// Brings the Dock onto the streamed desktop the way "Show Dock here" does from the iPad: macOS moves the Dock
-    /// to a display when the pointer pushes down against that display's bottom edge, and the injector turns pointer
-    /// moves along the bottom row into that push.
-    private func pullDockToSession() {
-        guard allowInput, capture != nil else { return }
-        let session = sessionID
-        for step in 0..<12 {
-            DispatchQueue.main.asyncAfter(deadline: .now() + Double(step) * 0.03) { [weak self] in
-                guard let self, self.sessionID == session, self.capture != nil, self.allowInput else { return }
-                self.input.handle(InputEvent(kind: .move, x: 0.5, y: 1))
-            }
-        }
-        MetricsLog.shared.append("host  Dock brought to the iPad's desktop while the display switch waits")
-    }
     /// Connections that never became part of a session, for the log: a wrong key, or a handshake never finished.
     private var refusedAttempts: [Date] = []
     private var lastRefusalNote = Date.distantPast
+    /// When each address last started a real session.
+    private var acceptedFrom: [String: Date] = [:]
+    private static func address(of connection: NWConnection) -> String {
+        if case .hostPort(let host, _) = connection.endpoint { return "\(host)".components(separatedBy: "%").first ?? "unknown address" }
+        return "unknown address"
+    }
     private func noteRefused(_ connection: NWConnection, reason: String) {
-        let now = Date()
-        refusedAttempts = refusedAttempts.filter { now.timeIntervalSince($0) < 60 } + [now]
-        guard now.timeIntervalSince(lastRefusalNote) >= 10 else { return }
-        lastRefusalNote = now
-        var from = "unknown address"
-        if case .hostPort(let host, _) = connection.endpoint { from = "\(host)".components(separatedBy: "%").first ?? from }
-        MetricsLog.shared.append("host  refused a connection from \(from) (\(reason)); \(refusedAttempts.count) refused in the last minute")
+        let from = Self.address(of: connection), at = Date()
+        // The iPad's own "which address answers?" probe opens a connection and closes it without a handshake, which
+        // looks the same from here as a wrong key (build 41 logged it as one). Wait a moment: an address that
+        // goes on to start a session was only asking.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            guard let self else { return }
+            if let accepted = self.acceptedFrom[from], abs(accepted.timeIntervalSince(at)) < 5 { return }
+            let now = Date()
+            self.refusedAttempts = self.refusedAttempts.filter { now.timeIntervalSince($0) < 60 } + [at]
+            guard now.timeIntervalSince(self.lastRefusalNote) >= 10 else { return }
+            self.lastRefusalNote = now
+            MetricsLog.shared.append("host  refused a connection from \(from) (\(reason)); \(self.refusedAttempts.count) refused in the last minute")
+        }
     }
 
     // MARK: Adaptive bitrate

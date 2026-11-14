@@ -33,4 +33,17 @@ final class DisplayControlTests: XCTestCase {
         }
     }
     #endif
+
+    func testMakingTheIPadMainKeepsTheArrangementAroundIt() {
+        // As in the log of 2026-11-14: the Mac's display at 0, 0 (main), the iPad's desktop to its left.
+        let before = DisplayLayoutSnapshot(main: 1, sessionDisplay: 40, screens: [.init(id: 1, x: 0, y: 0), .init(id: 40, x: -1376, y: 0)])
+        let moved = DisplayLayout.origins(withMain: 40, in: before)
+        XCTAssertEqual(moved?.map(\.id), [1, 40])
+        XCTAssertEqual(moved?.map(\.x), [1376, 0]); XCTAssertEqual(moved?.map(\.y), [0, 0])
+        // A third display keeps its place relative to the others.
+        let three = DisplayLayoutSnapshot(main: 1, sessionDisplay: 40, screens: [.init(id: 1, x: 0, y: 0), .init(id: 2, x: 2056, y: -200), .init(id: 40, x: -1376, y: 100)])
+        let shifted = DisplayLayout.origins(withMain: 40, in: three)
+        XCTAssertEqual(shifted?.map(\.x), [1376, 3432, 0]); XCTAssertEqual(shifted?.map(\.y), [-100, -300, 0])
+        XCTAssertNil(DisplayLayout.origins(withMain: 99, in: before))
+    }
 }

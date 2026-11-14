@@ -2,7 +2,7 @@
 
 A native Apple remote desktop for one person's own devices. **SkyDesk Host** runs in the Mac's menu bar, captures a display and streams it as hardware-encoded HEVC. **SkyDesk** on the iPad decodes it in hardware, draws it with Metal and sends back keyboard, trackpad, touch and gesture input. The same link carries clipboard text, files in both directions, the Mac's sound, and updates of both apps. The two devices talk to each other directly: there is no account, relay or server.
 
-This file describes the code at **build 41** (`CURRENT_PROJECT_VERSION` in `project.yml`). [VERIFICATION.md](VERIFICATION.md) is the dated record of the first builds and does not describe the current state.
+This file describes the code at **build 42** (`CURRENT_PROJECT_VERSION` in `project.yml`). [VERIFICATION.md](VERIFICATION.md) is the dated record of the first builds and does not describe the current state.
 
 **No end-to-end performance figure has been measured.** 120 FPS is the default target frame rate, not a verified result. The delays the iPad shows are estimates added up from parts (see [Statistics](#statistics)); nobody has yet filmed an input and its response to check them.
 
@@ -15,14 +15,15 @@ This file describes the code at **build 41** (`CURRENT_PROJECT_VERSION` in `proj
 | 38 (video over encrypted UDP, the "Late" figure, host settings saved) | Installed on 2026-11-13. **Video over UDP failed on the real devices**: the UDP flow came up 36 ms after connecting, but the session's first frame (about 200 kB on a quiet desktop) was sent over UDP, the iPad was waiting for it on TCP, nothing was shown for 1.5 s, and the fallback then carried the session on TCP. No frame has yet been displayed from UDP on the real devices. |
 | 39 (first frame always over TCP, the iPad reports a stream that started on the wrong path within half a second, faster encoder mode) | Installed and used on 2026-11-14. Video stayed on UDP for a 62-minute session on home Wi-Fi (Late: average 2.3 ms, 1% high 12.2 ms). The Mac's sound was heard on the iPad and the log shows the Mac's speakers silenced. Encoding took 13.9 ms at 10 to 29 frames a second against 17.0 ms in build 38, and click-to-screen 37.3 ms against 41.1. A session through WireGuard worked (46 ms round trip, video on UDP), but the Mac re-sent a piece of every frame after a fixed 35 ms without an acknowledgement, counted those as loss, and cut the bitrate to its 1.5 Mbps floor within a minute. |
 | 40 (the Mac learns how long acknowledgements take; its own probes no longer count as loss) | Installed on 2026-11-14 and used on home Wi-Fi (video on UDP, no bitrate cuts). Not yet used through the VPN, which is where its fix matters. |
-| 41 (parity packets on slow links, connections without forward secrecy refused, no automatic use of the saved password, Dock brought over while iPad only waits, refused connections logged) | Built and unit-tested. Not yet run on the real devices. |
+| 41 (parity packets on slow links, connections without forward secrecy refused, no automatic use of the saved password, Dock brought over while iPad only waits, refused connections logged) | Installed on 2026-11-14. Sessions connect and use the forward-secret exchange and UDP. **The Dock did not come over during the wait**: the injected pointer push was sent on time and did nothing. The iPad's own address probe was logged as a refused connection. Parity and the VPN fix have not been exercised (no VPN session yet). |
+| 42 (the iPad's desktop is made the main display during the wait, which is what moves the Dock; the address probe is no longer logged as a refusal) | Built and unit-tested. Not yet run on the real devices; the display change in particular can only be tried there. |
 
 Not yet confirmed on real hardware, even in the installed builds:
 
 - that the Mac's speakers really are silent while the iPad plays its sound (the log says the Mac asked for that; nobody has yet confirmed it by ear);
 - pinch and rotate actually reaching Mac apps (a unit test shows AppKit reads the injected events as magnify and rotate events, nothing more).
 
-`swift test` runs 156 tests with no failures (last run 2026-11-14 on the build 41 sources). Tests use the Mac's hardware encoder and loopback connections; they never capture the screen.
+`swift test` runs 157 tests with no failures (last run 2026-11-14 on the build 42 sources). Tests use the Mac's hardware encoder and loopback connections; they never capture the screen.
 
 ## Requirements
 
@@ -226,7 +227,7 @@ The Mac's displays and arrangement come back when you tap **Restore Mac**, when 
 Safeguards:
 
 - A separate helper process (`SkyDeskRestore`, inside the app bundle) gets a heartbeat every second and restores the saved layout if the host quits, crashes or stalls for six seconds.
-- The Mac's display stays off for at least 5 seconds and on for at least 20 before it is switched again, because switching the built-in panel in quick succession once left it dark (2026-11-13). The toolbar shows **Switching…** while the Mac waits, and since build 41 the Dock is brought onto the iPad's desktop straight away during that wait, the same way "Show Dock here" does it (not yet seen on the real devices).
+- The Mac's display stays off for at least 5 seconds and on for at least 20 before it is switched again, because switching the built-in panel in quick succession once left it dark (2026-11-13). The toolbar shows **Switching…** while the Mac waits. Since build 42 the iPad's desktop is made the Mac's main display at the start of that wait, with every display still on and only their positions changed, so the Dock and new windows go to the iPad straight away; the Mac's own display is switched off when the wait is over, and a restore during the wait puts the arrangement back. (Build 41 tried to bring the Dock over by pushing the pointer against the bottom edge with injected events, which is also what "Show Dock here" does. On the real devices that did not move the Dock, so "Show Dock here" should be assumed not to work either.)
 - Only which displays are enabled and where they sit is changed; never resolution, brightness or mirroring. Display sleep is held off while the mode is on.
 
 This uses the private `SLSConfigureDisplayEnabled` call, behind an availability check. It is a convenience, not a security lock.
@@ -355,7 +356,7 @@ That refusal happens after the handshake because it cannot happen in it: Apple's
 ## Tests and checks
 
 ```sh
-swift test                                  # 156 tests at build 41 (about 30 s; several open loopback sockets) (about 20 s; a few open loopback sockets)
+swift test                                  # 157 tests at build 42 (about 30 s; several open loopback sockets) (about 20 s; a few open loopback sockets)
 swift run skydesk-check --frames 120        # synthetic frames, hardware HEVC, encrypted loopback
 swift run skydesk-check --width 1920 --height 1200 --frames 240 --low-latency
 ```

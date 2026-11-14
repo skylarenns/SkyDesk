@@ -7,8 +7,6 @@ final class MacDisplayController {
     private(set) var isEnabled = false
     var onChange: ((Bool) -> Void)?
     var onLayoutChange: (() -> Void)?
-    /// The switch to iPad only has to wait (seconds) because the Mac's display was switched a moment ago.
-    var onWaiting: ((Double) -> Void)?
     private var snapshot: DisplayLayoutSnapshot?
     private var recovery: DisplayRecoveryGuard?
     private var globalMonitor: Any?
@@ -31,15 +29,27 @@ final class MacDisplayController {
         guard AXIsProcessTrusted() else { throw DisplayLayoutFailure.unsafeLayout }
         // The Mac display was only just turned back on: let it stay on a while before turning it off again.
         let wait = DisplaySwitchClock.load().waitBeforeOff()
+        var early: DisplayLayoutSnapshot?
         if wait > 0 {
             let before = generation
             DisplayLog.write("enable: waiting \(String(format: "%.1f", wait)) s (Mac display was just switched)")
-            onWaiting?(wait)
+            // The Mac's display may not be switched off yet, but the iPad can already be the main display: the Dock
+            // and new windows go there at once (user request 2026-11-14). Nothing is switched off or on by this.
+            // The arrangement as it was is kept in `snapshot`, so a restore during the wait puts it back.
+            if snapshot == nil, let original = try? DisplayLayout.snapshot(sessionDisplay: displayID), original.main != displayID,
+               original.screens.contains(where: { $0.id == displayID }) {
+                do {
+                    try DisplayLayout.makeMain(displayID, snapshot: original)
+                    snapshot = original; early = original
+                    onLayoutChange?()
+                    DisplayLog.write("enable: iPad display \(displayID) made main while waiting; \(DisplayLog.displays())")
+                } catch { DisplayLog.write("enable: could not make the iPad display main early: \(error.localizedDescription)") }
+            }
             try await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
             // A restore, a new session or another request during the wait cancels this one.
             guard generation == before, !isEnabled else { return }
         }
-        let saved = try DisplayLayout.snapshot(sessionDisplay: displayID)
+        let saved = try early ?? DisplayLayout.snapshot(sessionDisplay: displayID)
         guard saved.main != displayID, saved.screens.contains(where: { $0.id == displayID }) else {
             throw DisplayLayoutFailure.unsafeLayout
         }
@@ -93,7 +103,7 @@ final class MacDisplayController {
         }
     }
     func restore(reason: String = "requested by host or iPad") {
-        if isEnabled { DisplayLog.write("restore reason: \(reason)") }
+        if isEnabled || snapshot != nil { DisplayLog.write("restore reason: \(reason)") }
         let changed = isEnabled
         generation = UUID(); isEnabled = false; changing = false
         if let globalMonitor { NSEvent.removeMonitor(globalMonitor) }; globalMonitor = nil

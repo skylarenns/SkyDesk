@@ -8,10 +8,14 @@ public struct DisplayLayoutSnapshot: Codable, Sendable {
         public let id: CGDirectDisplayID
         public let x: Int32
         public let y: Int32
+        public init(id: CGDirectDisplayID, x: Int32, y: Int32) { self.id = id; self.x = x; self.y = y }
     }
     public let main: CGDirectDisplayID
     public let sessionDisplay: CGDirectDisplayID?
     public let screens: [Screen]
+    public init(main: CGDirectDisplayID, sessionDisplay: CGDirectDisplayID?, screens: [Screen]) {
+        self.main = main; self.sessionDisplay = sessionDisplay; self.screens = screens
+    }
 }
 
 public enum DisplayLayoutFailure: Error, LocalizedError {
@@ -50,6 +54,24 @@ public enum DisplayLayout {
             let bounds = CGDisplayBounds($0)
             return DisplayLayoutSnapshot.Screen(id: $0, x: Int32(bounds.minX), y: Int32(bounds.minY))
         })
+    }
+    /// Where every display goes when `display` becomes the main one (the main display is the one at 0, 0) and the
+    /// arrangement around it stays as it was.
+    public static func origins(withMain display: CGDirectDisplayID, in snapshot: DisplayLayoutSnapshot) -> [DisplayLayoutSnapshot.Screen]? {
+        guard let own = snapshot.screens.first(where: { $0.id == display }) else { return nil }
+        return snapshot.screens.map { DisplayLayoutSnapshot.Screen(id: $0.id, x: $0.x - own.x, y: $0.y - own.y) }
+    }
+    /// Makes `display` the main display while every display stays on: only origins change. The Dock and the menu
+    /// bar's home follow the main display, which is how the Dock reaches the iPad before the Mac's own display may
+    /// be switched off (build 42; pushing the pointer against the bottom edge with injected events did not move it).
+    public static func makeMain(_ display: CGDirectDisplayID, snapshot: DisplayLayoutSnapshot) throws {
+        let ids = Set(try online())
+        guard ids.contains(display), let moved = origins(withMain: display, in: snapshot) else { throw DisplayLayoutFailure.unsafeLayout }
+        try configure(scope: .forAppOnly) { config in
+            for screen in moved where ids.contains(screen.id) {
+                try check(CGConfigureDisplayOrigin(config, screen.id, screen.x, screen.y), "Make iPad the main display")
+            }
+        }
     }
     public static func makeExclusive(_ display: CGDirectDisplayID, snapshot: DisplayLayoutSnapshot) throws {
         guard let setEnabled else { throw DisplayLayoutFailure.unavailable }
