@@ -29,7 +29,7 @@ private func seconds() -> Double { Double(monotonicNanos()) / 1_000_000_000 }
 
 /// Mac side of video over UDP. Thread-safe: everything runs on `queue`.
 public final class VideoDatagramSender {
-    public struct Counters: Equatable { public var sent = 0, resent = 0 }
+    public struct Counters: Equatable { public var sent = 0, resent = 0, probed = 0 }
     private let connection: NWConnection
     private let queue: DispatchQueue
     private var buffer = DatagramSendBuffer()
@@ -81,12 +81,12 @@ public final class VideoDatagramSender {
             pump()
         }
     }
-    public func acknowledge(_ frame: UInt64) { queue.async { [self] in buffer.acknowledge(frame) } }
+    public func acknowledge(_ frame: UInt64) { queue.async { [self] in buffer.acknowledge(frame, now: seconds()) } }
     /// Pieces sent and resent since the last call (for the log and the bitrate control).
     public func drainCounters(_ handler: @escaping (Counters) -> Void) {
         queue.async { [self] in
-            let total = Counters(sent: buffer.piecesSent, resent: buffer.piecesResent)
-            handler(Counters(sent: total.sent - reported.sent, resent: total.resent - reported.resent))
+            let total = Counters(sent: buffer.piecesSent, resent: buffer.piecesResent, probed: buffer.piecesProbed)
+            handler(Counters(sent: total.sent - reported.sent, resent: total.resent - reported.resent, probed: total.probed - reported.probed))
             reported = total
         }
     }

@@ -140,6 +140,45 @@ final class DatagramVideoTests: XCTestCase {
         XCTAssertFalse(receive.waitingForStart)
     }
 
+    func testASlowAcknowledgementIsNotMistakenForLoss() {
+        // Through a VPN an acknowledgement takes about 55 ms. Nothing is lost here; no piece may count as resent.
+        var send = DatagramSendBuffer()
+        var pendingAcks: [(at: Double, frame: UInt64)] = []
+        var now = 0.0, frame: UInt64 = 1
+        while now < 3 {
+            if Int((now * 1_000).rounded()) % 16 == 0 {                       // a frame every 16 ms, one or two pieces
+                XCTAssertTrue(send.add(frame: frame, bytes: Data(count: 1_500), now: now))
+                pendingAcks.append((now + 0.055, frame)); frame += 1
+            }
+            for ack in pendingAcks where ack.at <= now { send.acknowledge(ack.frame, now: now) }
+            pendingAcks.removeAll { $0.at <= now }
+            send.probe(now: now)
+            while send.next(budget: 100_000, now: now) != nil {}
+            now += 0.001
+        }
+        XCTAssertEqual(send.acknowledgeTime ?? 0, 0.055, accuracy: 0.004)
+        XCTAssertEqual(send.piecesResent, 0, "nothing was asked for again, so nothing counts as loss")
+        // Before the first acknowledgement arrived nothing was known, so the first few frames were probed; after that, none.
+        XCTAssertLessThan(send.piecesProbed, 8)
+        XCTAssertGreaterThan(send.piecesSent, 300)
+        // The last few acknowledgements come in; then a frame that really is never acknowledged is still probed, later.
+        for ack in pendingAcks { send.acknowledge(ack.frame, now: ack.at) }
+        now += 0.1
+        XCTAssertTrue(send.isEmpty)
+        XCTAssertTrue(send.add(frame: frame, bytes: Data(count: 500), now: now))
+        while send.next(budget: 100_000, now: now) != nil {}
+        let before = send.piecesProbed
+        send.probe(now: now + 0.06); XCTAssertNil(send.next(budget: 100_000, now: now + 0.06))
+        send.probe(now: now + 0.12)
+        XCTAssertNotNil(send.next(budget: 100_000, now: now + 0.12))
+        XCTAssertEqual(send.piecesProbed, before + 1)
+        // And a piece the iPad asks for is loss, even if a probe for it was already waiting.
+        send.probe(now: now + 0.5)
+        send.request([.init(frame: frame, range: 0...0)], now: now + 0.5)
+        XCTAssertNotNil(send.next(budget: 100_000, now: now + 0.5))
+        XCTAssertEqual(send.piecesResent, 1)
+    }
+
     func testPacingSpreadsAKeyframeButNotAnOrdinaryFrame() {
         var pacer = DatagramPacer()
         XCTAssertEqual(DatagramPacer.rate(forBitrate: 25_000_000), 150_000_000)
@@ -176,7 +215,7 @@ final class DatagramVideoTests: XCTestCase {
                 XCTAssertTrue(send.add(frame: nextFrame, bytes: Data(repeating: UInt8(truncatingIfNeeded: nextFrame), count: size), now: now))
                 encodedAt[nextFrame] = now; nextFrame += 1; nextFrameAt += 1.0 / 120
             }
-            for ack in acks where ack.at <= now { send.acknowledge(ack.frame) }
+            for ack in acks where ack.at <= now { send.acknowledge(ack.frame, now: now) }
             acks.removeAll { $0.at <= now }
             for item in toSender where item.at <= now { if case .nack(let missing) = item.packet { send.request(missing, now: now) } }
             toSender.removeAll { $0.at <= now }

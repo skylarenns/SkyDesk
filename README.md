@@ -2,7 +2,7 @@
 
 A native Apple remote desktop for one person's own devices. **SkyDesk Host** runs in the Mac's menu bar, captures a display and streams it as hardware-encoded HEVC. **SkyDesk** on the iPad decodes it in hardware, draws it with Metal and sends back keyboard, trackpad, touch and gesture input. The same link carries clipboard text, files in both directions, the Mac's sound, and updates of both apps. The two devices talk to each other directly: there is no account, relay or server.
 
-This file describes the code at **build 39** (`CURRENT_PROJECT_VERSION` in `project.yml`). [VERIFICATION.md](VERIFICATION.md) is the dated record of the first builds and does not describe the current state.
+This file describes the code at **build 40** (`CURRENT_PROJECT_VERSION` in `project.yml`). [VERIFICATION.md](VERIFICATION.md) is the dated record of the first builds and does not describe the current state.
 
 **No end-to-end performance figure has been measured.** 120 FPS is the default target frame rate, not a verified result. The delays the iPad shows are estimates added up from parts (see [Statistics](#statistics)); nobody has yet filmed an input and its response to check them.
 
@@ -13,15 +13,15 @@ This file describes the code at **build 39** (`CURRENT_PROJECT_VERSION` in `proj
 | 31 to 35 | Installed and used on the real Mac and iPad. |
 | 36 and 37 | Installed on 2026-11-13. Build 37's log shows the forward-secret exchange in use and the iPad issued its own key. The 4:4:4 option has not been switched on yet. |
 | 38 (video over encrypted UDP, the "Late" figure, host settings saved) | Installed on 2026-11-13. **Video over UDP failed on the real devices**: the UDP flow came up 36 ms after connecting, but the session's first frame (about 200 kB on a quiet desktop) was sent over UDP, the iPad was waiting for it on TCP, nothing was shown for 1.5 s, and the fallback then carried the session on TCP. No frame has yet been displayed from UDP on the real devices. |
-| 39 (first frame always over TCP, the iPad reports a stream that started on the wrong path within half a second, faster encoder mode) | Built and unit-tested, with tests that reproduce build 38's failure. Not yet run on the real devices. |
+| 39 (first frame always over TCP, the iPad reports a stream that started on the wrong path within half a second, faster encoder mode) | Installed and used on 2026-11-14. Video stayed on UDP for a 62-minute session on home Wi-Fi (Late: average 2.3 ms, 1% high 12.2 ms). The Mac's sound was heard on the iPad and the log shows the Mac's speakers silenced. Encoding took 13.9 ms at 10 to 29 frames a second against 17.0 ms in build 38, and click-to-screen 37.3 ms against 41.1. A session through WireGuard worked (46 ms round trip, video on UDP), but the Mac re-sent a piece of every frame after a fixed 35 ms without an acknowledgement, counted those as loss, and cut the bitrate to its 1.5 Mbps floor within a minute. |
+| 40 (the Mac learns how long acknowledgements take; its own probes no longer count as loss) | Built and unit-tested. Not yet run on the real devices. |
 
 Not yet confirmed on real hardware, even in the installed builds:
 
-- that the Mac's speakers go silent once the iPad is playing its sound;
-- a connection through WireGuard from start to finish;
+- that the Mac's speakers really are silent while the iPad plays its sound (the log says the Mac asked for that; nobody has yet confirmed it by ear);
 - pinch and rotate actually reaching Mac apps (a unit test shows AppKit reads the injected events as magnify and rotate events, nothing more).
 
-`swift test` runs 151 tests with no failures (last run 2026-11-13 on the build 39 sources). Tests use the Mac's hardware encoder and loopback connections; they never capture the screen.
+`swift test` runs 152 tests with no failures (last run 2026-11-14 on the build 40 sources). Tests use the Mac's hardware encoder and loopback connections; they never capture the screen.
 
 ## Requirements
 
@@ -271,7 +271,7 @@ Every message has a 12-byte header (`SKYD`, version, kind, length). The length i
 **Video over UDP (build 38).** On TCP one lost packet holds back everything sent after it until the retransmission arrives, and TCP then slows the sender down. So when both sides offer it, video moves to UDP:
 
 - The iPad opens a DTLS 1.2 flow to UDP port 48772 using the same key and the same preferred cipher suite as its TCP connections, and says which session it belongs to. The Mac accepts a flow only for the session in progress. No new secret and no home-made encryption is involved.
-- Each frame is cut into datagrams of at most 1,180 bytes of frame data, small enough for any IPv6 path or VPN tunnel. The iPad asks again for exactly the pieces that are missing: after 2 ms for a gap below a piece that did arrive, after 4 ms when a frame's tail stops arriving. The time an answer takes is measured and sets how soon to ask again. The Mac keeps every frame until the iPad acknowledges it (the acknowledgement travels on the control connection) and re-sends the last piece of a frame it has heard nothing about, so a frame that vanished whole is noticed too.
+- Each frame is cut into datagrams of at most 1,180 bytes of frame data, small enough for any IPv6 path or VPN tunnel. The iPad asks again for exactly the pieces that are missing: after 2 ms for a gap below a piece that did arrive, after 4 ms when a frame's tail stops arriving. The time an answer takes is measured and sets how soon to ask again. The Mac keeps every frame until the iPad acknowledges it (the acknowledgement travels on the control connection) and re-sends the last piece of a frame it has heard nothing about, so a frame that vanished whole is noticed too. How long "nothing" has to last is learned from the acknowledgements themselves (the quickest of the last 32, times one and a half, plus 20 ms, and never under 35 ms), and such a probe is not counted as loss (both since build 40).
 - Frames are still handed to the decoder complete and in order, because each one builds on the one before. The stream therefore stays lossless and still needs no periodic keyframes. What changes is how long a loss costs.
 - Frames carry their sequence number on both paths and the iPad orders them by it, so switching paths needs no keyframe. TCP always carries the first frame of a session, whatever its size (build 39; build 38 chose by size alone and failed on a small first frame), and any frame over 256 kB (a keyframe is a megabyte or two; as datagrams one measured 2 MB frame took 110 ms and delayed the frames behind it).
 - If the UDP flow never comes up (a network that blocks it), or the Mac gets no acknowledgement for a second while frames are outstanding, or the iPad's flow fails or receives video before the stream has started, everything outstanding is re-sent over TCP and the session carries on there. It does not return to UDP until the next connection.
@@ -340,7 +340,7 @@ A fourth connection, so sound never waits behind video or files. Opus packets ca
 - Video over UDP is new and unproven on real networks. After a fallback to TCP a session stays on TCP. There is no forward error correction: every loss costs at least a round trip.
 - Wireless updates only work when the iPad reaches the Mac on a private network address (10.x, 172.16–31.x, 192.168.x, 169.254.x); on other addresses, which some VPNs use, the Mac says so instead of offering a download the iPad could not trust.
 - "Use USB cable when plugged in" only applies when a Mac is chosen under Nearby; automatic connections and Recent Macs never try the cable first.
-- No relay or NAT traversal; away from home needs a VPN, not yet confirmed.
+- No relay or NAT traversal; away from home needs a VPN (a WireGuard session worked on 2026-11-14).
 - One iPad at a time. No HDR. A MacBook with its lid closed is not handled.
 - The desktop size is set when the session starts and is not renegotiated.
 - Clipboard: text only. Files: no folders, 4 GB each. Sound: Mac to iPad only.
@@ -351,7 +351,7 @@ A fourth connection, so sound never waits behind video or files. Opus packets ca
 ## Tests and checks
 
 ```sh
-swift test                                  # 151 tests at build 39 (about 20 s; a few open loopback sockets)
+swift test                                  # 152 tests at build 40 (about 20 s; a few open loopback sockets)
 swift run skydesk-check --frames 120        # synthetic frames, hardware HEVC, encrypted loopback
 swift run skydesk-check --width 1920 --height 1200 --frames 240 --low-latency
 ```
@@ -362,7 +362,7 @@ The tests cover message framing and hostile input, HEVC framing, 4:4:4 colour, g
 
 Two self-checks exist for development: starting the host with `SKYDESK_SMOKE_PNG=<file>` builds its window off screen, saves a picture and exits without opening the port or touching displays; `SKYDESK_DEMO=1` in the simulator shows the streaming screen with generated frames.
 
-Still to do on the real devices: run build 39 and see video actually displayed from UDP; switch 4:4:4 on once; compare the Late figure with video over UDP off and on; the three unconfirmed items under [Status](#status); and film an input and its response at high speed, with both screens in view, to check the delay estimates.
+Still to do on the real devices: run build 40 through the VPN and see the bitrate stay up; switch 4:4:4 on once; compare the Late figure with video over UDP off and on; the three unconfirmed items under [Status](#status); and film an input and its response at high speed, with both screens in view, to check the delay estimates.
 
 ## Source map
 

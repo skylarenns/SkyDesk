@@ -91,20 +91,40 @@ public struct DatagramSendBuffer {
         var lastSent: [Double]
         var lastProbe: Double
         var probes = 0
+        /// The iPad asked for a piece of it again.
+        var repaired = false
     }
     private var frames: [UInt64: Entry] = [:]
     /// Pieces waiting for their turn: retransmissions first, then new frames in order.
     private var urgent: [Piece] = []
+    /// Which of the urgent pieces are probes (sent on the Mac's own initiative) rather than answers to the iPad.
+    private var probing: [Piece] = []
     private var queued: [Piece] = []
     private var queuedHead = 0
     public private(set) var bytesHeld = 0
     public private(set) var piecesSent = 0
+    /// Pieces sent again because the iPad asked: the measure of loss.
     public private(set) var piecesResent = 0
+    /// Pieces sent again because nothing had been heard about their frame. Not a sign of loss on its own.
+    public private(set) var piecesProbed = 0
+    /// How long the iPad usually takes to acknowledge a frame (network both ways plus decoding), learned from the
+    /// acknowledgements themselves. Build 39 used fixed times tuned on a 5 ms home network; through a VPN, where
+    /// an acknowledgement takes about 55 ms, every frame was probed after 35 ms, the probes were counted as loss,
+    /// and the bitrate was cut to its floor for nothing (2026-11-14).
+    ///
+    /// It is the quickest of the last 32, not their average: a frame that waited for a lost piece, or behind one,
+    /// says nothing about how fast the link is, and an average would stretch every timer just when pieces are
+    /// being lost.
+    public private(set) var acknowledgeTime: Double?
+    private var acknowledgeSamples: [Double] = []
     /// A piece is not sent again within this time of its last sending: the first copy may still be on its way.
     public var resendSpacing = 0.008
-    /// An unacknowledged frame gets its last piece sent again after this long, in case all of it (or its tail) was
-    /// lost and nothing came after it for the iPad to notice by.
+    /// An unacknowledged frame gets its last piece sent again after this long (and never before an acknowledgement
+    /// could reasonably have arrived), in case all of it or its tail was lost and nothing came after it for the
+    /// iPad to notice by.
     public var probeAfter = 0.035
+    private var probeWait: Double { max(probeAfter, (acknowledgeTime ?? 0) * 1.5 + 0.02) }
+    private var resendWait: Double { max(resendSpacing, (acknowledgeTime ?? 0) * 0.4) }
     public static let maximumFrames = 96
     public static let maximumBytes = 48 * 1_024 * 1_024
     public init() {}
@@ -130,9 +150,16 @@ public struct DatagramSendBuffer {
         return true
     }
     /// The iPad decoded the frame: nothing of it is needed any more.
-    public mutating func acknowledge(_ frame: UInt64) {
+    public mutating func acknowledge(_ frame: UInt64, now: Double? = nil) {
         guard let entry = frames.removeValue(forKey: frame) else { return }
         bytesHeld -= entry.pieces.reduce(0) { $0 + $1.count }
+        // Frames that needed no repair say how long an acknowledgement normally takes. (A probe does not delay a
+        // frame, so probed frames count: otherwise a slow link, where every early frame is probed, would never be learned.)
+        if let now, !entry.repaired, now >= entry.sentAt, now - entry.sentAt < 2 {
+            acknowledgeSamples.append(now - entry.sentAt)
+            if acknowledgeSamples.count > 32 { acknowledgeSamples.removeFirst() }
+            acknowledgeTime = acknowledgeSamples.min()
+        }
     }
     /// The iPad says these pieces are missing: they jump the queue, unless a copy was sent a moment ago.
     public mutating func request(_ missing: [DatagramPacket.Missing], now: Double) {
@@ -141,8 +168,10 @@ public struct DatagramSendBuffer {
             let range = item.range ?? 0...(entry.pieces.count - 1)
             for index in range where index < entry.pieces.count {
                 // Never sent yet: it is still in the queue and will go out in its turn.
-                guard entry.lastSent[index] >= 0, now - entry.lastSent[index] >= resendSpacing else { continue }
+                guard entry.lastSent[index] >= 0, now - entry.lastSent[index] >= resendWait else { continue }
                 let piece = Piece(frame: item.frame, index: index)
+                if let asked = probing.firstIndex(of: piece) { probing.remove(at: asked) }      // the iPad wants it: count it as loss
+                frames[item.frame]?.repaired = true
                 if !urgent.contains(piece) { urgent.append(piece) }
             }
         }
@@ -152,11 +181,11 @@ public struct DatagramSendBuffer {
         for (frame, entry) in frames {
             guard let last = entry.lastSent.last, last >= 0 else { continue }       // not fully sent yet
             // Each further probe waits twice as long, up to a quarter second.
-            let wait = min(0.25, probeAfter * Double(1 << min(entry.probes, 3)))
+            let wait = min(0.5, probeWait * Double(1 << min(entry.probes, 3)))
             guard now - max(entry.lastProbe, last) >= wait else { continue }
             frames[frame]?.lastProbe = now; frames[frame]?.probes += 1
             let piece = Piece(frame: frame, index: entry.pieces.count - 1)
-            if !urgent.contains(piece) { urgent.append(piece) }
+            if !urgent.contains(piece) { urgent.append(piece); probing.append(piece) }
         }
     }
     /// The next datagram to send, if any. `budget` is the number of bytes the pacing allows right now.
@@ -167,12 +196,17 @@ public struct DatagramSendBuffer {
             if let first = urgent.first { piece = first; resend = true }
             else if queuedHead < queued.count { piece = queued[queuedHead]; resend = false }
             else { compact(); return nil }
-            guard let entry = frames[piece.frame] else { drop(resend); continue }  // acknowledged meanwhile
+            guard let entry = frames[piece.frame] else {                           // acknowledged meanwhile
+                if resend, let probe = probing.firstIndex(of: piece) { probing.remove(at: probe) }
+                drop(resend); continue
+            }
             let payload = entry.pieces[piece.index]
             guard payload.count <= budget else { return nil }
             drop(resend)
             frames[piece.frame]?.lastSent[piece.index] = now
-            if resend { piecesResent += 1 } else { piecesSent += 1 }
+            if !resend { piecesSent += 1 }
+            else if let probe = probing.firstIndex(of: piece) { probing.remove(at: probe); piecesProbed += 1 }
+            else { piecesResent += 1 }
             return .data(frame: piece.frame, index: piece.index, count: entry.pieces.count, payload: payload)
         }
     }
@@ -182,7 +216,7 @@ public struct DatagramSendBuffer {
     public func unacknowledged() -> [(frame: UInt64, bytes: Data)] {
         frames.keys.sorted().map { key in (key, frames[key]!.pieces.reduce(into: Data()) { $0.append($1) }) }
     }
-    public mutating func removeAll() { frames.removeAll(); urgent.removeAll(); queued.removeAll(); queuedHead = 0; bytesHeld = 0 }
+    public mutating func removeAll() { frames.removeAll(); urgent.removeAll(); probing.removeAll(); queued.removeAll(); queuedHead = 0; bytesHeld = 0 }
 }
 
 /// iPad side: puts frames back together and releases them complete and in order, whichever way they arrived

@@ -1,0 +1,21 @@
+.build/
+build/
+build-pad/
+build-device/
+build-address/
+build-native/
+.DS_Store
+*.xcuserstate
+xcuserdata/
+Local.xcconfig
+artifacts/
+
+# Generated builds and Xcode project
+build*/
+.build*/
+SkyDesk.xcodeproj/
+*.xcuserdatad/
+# Archived binaries and diagnostic captures
+Verification/
+# AppleDouble metadata
+._*
