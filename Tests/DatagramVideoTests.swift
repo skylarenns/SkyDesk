@@ -112,6 +112,34 @@ final class DatagramVideoTests: XCTestCase {
         XCTAssertNil(send.next(budget: 10_000, now: 0.06))
     }
 
+    func testTheFirstFrameOfASessionGoesOverTCPHoweverSmallItIs() {
+        // The failure of build 38 on the real devices: UDP was up 36 ms after connecting, the opening keyframe of a
+        // quiet desktop was about 200 kB, and it went over UDP although the iPad starts the stream on TCP.
+        var policy = VideoPathPolicy()
+        XCTAssertFalse(policy.useDatagrams(available: true, bytes: 200_000))
+        XCTAssertTrue(policy.useDatagrams(available: true, bytes: 26_000))
+        // Large frames (a keyframe after returning from the background) stay on TCP; so does everything while UDP is down.
+        XCTAssertFalse(policy.useDatagrams(available: true, bytes: 1_500_000))
+        XCTAssertFalse(policy.useDatagrams(available: false, bytes: 26_000))
+        XCTAssertTrue(policy.useDatagrams(available: true, bytes: VideoPathPolicy.largestDatagramFrame))
+        // UDP not up yet when the session starts: the first frames go over TCP anyway, then UDP takes over.
+        var later = VideoPathPolicy()
+        XCTAssertFalse(later.useDatagrams(available: false, bytes: 1_500_000))
+        XCTAssertTrue(later.useDatagrams(available: true, bytes: 26_000))
+    }
+
+    func testTheIPadKnowsWhenVideoArrivesBeforeTheStreamHasStarted() {
+        var receive = DatagramReceiveBuffer()
+        XCTAssertFalse(receive.waitingForStart)
+        _ = receive.insert(frame: 1, index: 0, count: 2, payload: Data([1]), now: 0)
+        XCTAssertTrue(receive.waitingForStart)
+        _ = receive.insert(frame: 1, index: 1, count: 2, payload: Data([2]), now: 0)
+        XCTAssertTrue(receive.waitingForStart, "complete, but nothing says the stream starts here")
+        // TCP brings the frame (the Mac resends it after being told): the stream starts.
+        XCTAssertEqual(receive.insert(frame: 1, bytes: Data([1, 2])).map(\.frame), [1])
+        XCTAssertFalse(receive.waitingForStart)
+    }
+
     func testPacingSpreadsAKeyframeButNotAnOrdinaryFrame() {
         var pacer = DatagramPacer()
         XCTAssertEqual(DatagramPacer.rate(forBitrate: 25_000_000), 150_000_000)

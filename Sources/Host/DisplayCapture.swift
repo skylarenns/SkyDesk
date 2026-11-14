@@ -27,7 +27,7 @@ final class DisplayCapture: NSObject, SCStreamOutput, SCStreamDelegate {
 
     init(display: SCDisplay, longestEdge: Int, fps: Int, bitrate: Int, inputEnabled: Bool,
          lowLatencyRateControl: Bool, nativeDesktop: Bool = false, clientFeatures: Int = 0, hostName: String? = nil,
-         clipboard: Bool = false, files: Bool = false, audio: Bool = false, chroma444: Bool = false) throws {
+         clipboard: Bool = false, files: Bool = false, audio: Bool = false, chroma444: Bool = false, preferSpeed: Bool = false) throws {
         window = .streaming(fps: fps)
         markIdleGaps = clientFeatures & StreamFeature.idleGapFlags != 0
         let mode = CGDisplayCopyDisplayMode(display.displayID)
@@ -41,7 +41,7 @@ final class DisplayCapture: NSObject, SCStreamOutput, SCStreamDelegate {
         try info.validate()
         let full = (info.features ?? 0) & StreamFeature.chroma444 != 0
         encoder = try HEVCEncoder(width: info.width, height: info.height, fps: fps, bitrate: bitrate,
-                                  lowLatencyRateControl: lowLatencyRateControl, chroma444: full)
+                                  lowLatencyRateControl: lowLatencyRateControl, chroma444: full, preferSpeed: preferSpeed)
         super.init()
         let configuration = SCStreamConfiguration()
         configuration.width = info.width; configuration.height = info.height

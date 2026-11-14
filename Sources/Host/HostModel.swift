@@ -103,6 +103,10 @@ final class HostModel: ObservableObject {
     @Published var lowLatencyRateControl = UserDefaults.standard.bool(forKey: "lowLatencyRateControl") {
         didSet { UserDefaults.standard.set(lowLatencyRateControl, forKey: "lowLatencyRateControl") }
     }
+    /// Ask the encoder for its fastest mode (build 39): about 5 ms less delay in ordinary desktop use.
+    @Published var fastEncoding = UserDefaults.standard.object(forKey: "fastEncoding") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(fastEncoding, forKey: "fastEncoding") }
+    }
     /// Lower the bitrate when the network falls behind, back up to the Bitrate setting when it recovers (build 33).
     @Published var adaptiveBitrate = UserDefaults.standard.object(forKey: "adaptiveBitrate") as? Bool ?? true {
         didSet { UserDefaults.standard.set(adaptiveBitrate, forKey: "adaptiveBitrate") }
@@ -702,7 +706,8 @@ final class HostModel: ObservableObject {
                     try DisplayCapture(display: display, longestEdge: useiPadDesktop ? 4096 : longestEdge, fps: sessionFPS,
                         bitrate: bitrateMbps * 1_000_000, inputEnabled: allowInput, lowLatencyRateControl: lowLatencyRateControl,
                         nativeDesktop: useiPadDesktop, clientFeatures: clientFeatures, hostName: Host.current().localizedName,
-                        clipboard: allowClipboard, files: allowFiles, audio: allowAudio && HostAudio.supported, chroma444: chroma444)
+                        clipboard: allowClipboard, files: allowFiles, audio: allowAudio && HostAudio.supported, chroma444: chroma444,
+                        preferSpeed: fastEncoding)
                 }
                 // The iPad asked for full colour detail: use it if this Mac's encoder has it, otherwise carry on as before.
                 let wants444 = clientFeatures & StreamFeature.chroma444 != 0

@@ -497,6 +497,7 @@ private struct HostView: View {
                 Toggle("Play this Mac's sound on the iPad", isOn: $host.allowAudio)
                 Text("The Mac's own speakers go quiet only while the iPad is playing. macOS asks once for permission to record system audio.")
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                Toggle("Encode faster (about 5 ms less delay; uses more data while little is moving)", isOn: $host.fastEncoding)
                 Toggle("Low-latency rate control (experimental)", isOn: $host.lowLatencyRateControl)
                 Text("Changes apply the next time the iPad connects.").font(.caption).foregroundStyle(.secondary)
             }.padding(.top, 8).disabled(host.clientConnected || host.busy)

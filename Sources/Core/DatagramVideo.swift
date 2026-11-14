@@ -224,6 +224,8 @@ public struct DatagramReceiveBuffer {
     public init(first: UInt64? = nil) { next = first }
 
     public var waiting: Int { partial.count + complete.count }
+    /// Pieces are arriving but the stream has no starting point yet (no frame has come over TCP).
+    public var waitingForStart: Bool { next == nil && waiting > 0 }
 
     /// One piece from UDP. Returns the frames that are now ready for the decoder, in order.
     public mutating func insert(frame: UInt64, index: Int, count: Int, payload: Data, now: Double) -> [(frame: UInt64, bytes: Data)] {
@@ -321,4 +323,23 @@ public struct DatagramPacer {
     /// The pace for a given video bitrate: six times it, and never under 30 Mbps, so sending is never the limit
     /// on a healthy link while a megabyte keyframe still takes tens of milliseconds, not one burst.
     public static func rate(forBitrate bitrate: Int) -> Int { max(30_000_000, bitrate * 6) }
+}
+
+/// Which path a frame takes, decided on the Mac for every frame.
+///
+/// The iPad starts the stream at the first frame TCP brings it, so the first frame of a session must go over TCP
+/// whatever its size. Build 38 chose by size alone: a quiet desktop's opening keyframe was about 200 kB, went over
+/// UDP, and the iPad waited 1.5 s for a TCP frame that never came before the fallback rescued it (2026-11-13).
+/// Large frames always go over TCP: a keyframe is a megabyte or two, and as datagrams it would have to be spread
+/// over a tenth of a second (measured: 2 MB took 110 ms and held up the frames behind it).
+public struct VideoPathPolicy: Equatable {
+    public static let largestDatagramFrame = 256_000
+    public private(set) var startedOnTCP = false
+    public init() {}
+    /// True = send this frame as datagrams. `available`: the iPad's UDP flow is up.
+    public mutating func useDatagrams(available: Bool, bytes: Int) -> Bool {
+        if available, startedOnTCP, bytes <= Self.largestDatagramFrame { return true }
+        startedOnTCP = true
+        return false
+    }
 }

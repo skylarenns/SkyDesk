@@ -50,7 +50,7 @@ public final class VideoDatagramSender {
     /// resends them over TCP so the stream continues without a gap.
     public var onStopped: ((_ reason: String?, _ unsent: [(frame: UInt64, bytes: Data)]) -> Void)?
     /// No acknowledgement for this long while frames are outstanding means UDP is not getting through.
-    public var stallLimit = 1.5
+    public var stallLimit = 1.0
 
     public init(connection: NWConnection, queue: DispatchQueue) { self.connection = connection; self.queue = queue }
 
@@ -169,6 +169,7 @@ public final class VideoDatagramReceiver {
     private var session: UUID?
     private var hellos = 0
     private var ready = false
+    private var orphanedSince: Double?
     /// Complete frames, in order (the bytes of an encoded VideoFrame).
     public var onFrame: ((UInt64, Data) -> Void)?
     /// The Mac accepted the UDP flow; `onStopped` if it never does or the flow fails later.
@@ -242,7 +243,16 @@ public final class VideoDatagramReceiver {
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + .milliseconds(2), repeating: .milliseconds(2), leeway: .microseconds(500))
         timer.setEventHandler { [weak self, weak connection] in
-            guard let self, let connection, self.connection === connection, self.buffer.waiting > 0 else { return }
+            guard let self, let connection, self.connection === connection, self.buffer.waiting > 0 else { self?.orphanedSince = nil; return }
+            // Video is arriving here but the stream never started on TCP: nothing can be shown. Say so quickly, so
+            // the Mac sends everything over TCP, instead of waiting for it to notice the silence.
+            if self.buffer.waitingForStart {
+                let now = seconds()
+                if let since = self.orphanedSince, now - since > 0.4 { self.stop("Video arrived over UDP before the stream had started."); return }
+                if self.orphanedSince == nil { self.orphanedSince = now }
+                return
+            }
+            self.orphanedSince = nil
             let missing = self.buffer.missing(now: seconds())
             if !missing.isEmpty { connection.send(content: DatagramPacket.nack(missing).encoded(), completion: .contentProcessed { _ in }) }
         }

@@ -104,7 +104,10 @@ final class ClientModel: ObservableObject {
         didSet { UserDefaults.standard.set(sharpenText, forKey: "sharpenText") }
     }
     /// Draw each frame as soon as it arrives when it can still make the next screen refresh (build 35).
-    @Published var presentOnArrival = UserDefaults.standard.object(forKey: "presentOnArrival") as? Bool ?? true {
+    /// Off by default since build 38: on the real iPad (build 36, timer confirmed at 120 Hz) 94 of 123 frames drawn
+    /// this way still missed the refresh they were aimed at, even with 7.5 ms to spare, and the display delay did
+    /// not improve. iPadOS evidently wants a frame almost a whole refresh ahead. Kept as a switch for experiments.
+    @Published var presentOnArrival = UserDefaults.standard.object(forKey: "presentOnArrival") as? Bool ?? false {
         didSet { UserDefaults.standard.set(presentOnArrival, forKey: "presentOnArrival") }
     }
     /// Receive video as UDP datagrams when the Mac offers it (build 38): a lost packet is asked for again at once

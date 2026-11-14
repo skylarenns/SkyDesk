@@ -18,7 +18,12 @@ public final class HEVCEncoder {
     /// creating the session fails cleanly on a Mac whose encoder does not have it.
     public static let main444Profile = "HEVC_Main444_AutoLevel"
     public let chroma444: Bool
-    public init(width: Int, height: Int, fps: Int, bitrate: Int, lowLatencyRateControl: Bool = false, chroma444: Bool = false) throws {
+    /// `preferSpeed` (build 39) asks the encoder for its fastest mode. Measured on an M4 Max at 2752 × 2064 with
+    /// frames 62 ms apart, which is ordinary desktop use: 11.5 ms per frame instead of 16.8, with frames about
+    /// twice the size (the stream is far below its bitrate limit then). With frames 17 ms apart it made no
+    /// difference to either. The encoder otherwise spends the spare time between sparse frames on compression.
+    public init(width: Int, height: Int, fps: Int, bitrate: Int, lowLatencyRateControl: Bool = false, chroma444: Bool = false,
+                preferSpeed: Bool = false) throws {
         self.fps = fps; self.chroma444 = chroma444
         var specification: [CFString: Any] = [kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: true]
         if lowLatencyRateControl { specification[kVTVideoEncoderSpecification_EnableLowLatencyRateControl] = true }
@@ -43,6 +48,8 @@ public final class HEVCEncoder {
             kVTCompressionPropertyKey_YCbCrMatrix: kCVImageBufferYCbCrMatrix_ITU_R_709_2
         ]
         try checkVT(VTSessionSetProperties(session, propertyDictionary: properties as CFDictionary), "Configure HEVC encoder")
+        // Set on its own: an encoder that does not know the option must not fail the whole configuration.
+        if preferSpeed { VTSessionSetProperty(session, key: kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, value: kCFBooleanTrue) }
         try checkVT(VTCompressionSessionPrepareToEncodeFrames(session), "Prepare HEVC encoder")
         var hardware: Unmanaged<CFTypeRef>?
         try checkVT(VTSessionCopyProperty(session, key: kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,

@@ -243,6 +243,50 @@ final class DatagramTransportTests: XCTestCase {
     }
     #endif
 
+    /// Build 38's failure, end to end: the Mac sends the opening frame over UDP. The iPad must say so within half a
+    /// second, and the stream must then start from what the Mac resends over TCP.
+    func testAStreamWronglyStartedOnUDPIsRescuedQuickly() throws {
+        let credential = PairingCredential.password(try PairingKey())
+        let session = UUID()
+        let macQueue = DispatchQueue(label: "skydesk.test.mac.orphan"), padQueue = DispatchQueue(label: "skydesk.test.pad.orphan")
+        let parameters = DeskNetwork.datagramParameters(credentials: [credential])
+        parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: .any)
+        let listener = try NWListener(using: parameters)
+        let listening = expectation(description: "listening"), active = expectation(description: "UDP accepted")
+        let told = expectation(description: "iPad reports the orphaned stream"), shown = expectation(description: "frames released after the resend")
+        listener.stateUpdateHandler = { if case .ready = $0 { listening.fulfill() } }
+        var sender: VideoDatagramSender?
+        let receiver = VideoDatagramReceiver(queue: padQueue)
+        var released: [UInt64] = []
+        var began = Date()
+        var noticedAfter = 0.0
+        listener.newConnectionHandler = { connection in
+            let made = VideoDatagramSender(connection: connection, queue: macQueue)
+            made.onHello = { $0 == session }
+            made.onActive = { active.fulfill() }
+            // What the real host does when UDP stops: everything unacknowledged goes over TCP.
+            made.onStopped = { _, unsent in padQueue.async { for item in unsent { receiver.insertReliable(frame: item.frame, bytes: item.bytes) } } }
+            sender = made; made.start()
+        }
+        listener.start(queue: macQueue)
+        wait(for: [listening], timeout: 5)
+        let port = try XCTUnwrap(listener.port)
+        receiver.onFrame = { frame, _ in released.append(frame); if frame == 3 { shown.fulfill() } }
+        receiver.onStopped = { _ in
+            noticedAfter = Date().timeIntervalSince(began)
+            told.fulfill()
+            macQueue.async { sender?.close() }          // the iPad's "UDP stopped" message reaches the Mac
+        }
+        padQueue.async { receiver.attach(NWConnection(host: "127.0.0.1", port: port, using: DeskNetwork.datagramParameters(credentials: [credential])), session: session) }
+        wait(for: [active], timeout: 8)
+        began = Date()
+        for frame in UInt64(1)...3 { sender?.send(frame: frame, bytes: frameBytes(frame)) }
+        wait(for: [told, shown], timeout: 5)
+        XCTAssertLessThan(noticedAfter, 0.9)
+        XCTAssertEqual(padQueue.sync { released }, [1, 2, 3])
+        listener.cancel()
+    }
+
     func testTheWrongKeyNeverGetsAUDPFlow() throws {
         let parameters = DeskNetwork.datagramParameters(credentials: [.password(try PairingKey())])
         parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: .any)

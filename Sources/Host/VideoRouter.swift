@@ -12,13 +12,13 @@ final class VideoRouter: @unchecked Sendable {
     private var bitrateTarget = 25_000_000
     private var resent: Double?
     private var gaveUp = false
-    static let largestDatagramFrame = 256_000
+    private var policy = VideoPathPolicy()
     /// Called (on any thread) when the path changes: true = UDP, with the reason when it went back to TCP.
     var onPathChange: ((Bool, String?) -> Void)?
 
     /// A session starts. `session` nil means UDP was not agreed and every frame goes over TCP.
     func begin(session: UUID?, tcp: SecureChannel, bitrate: Int) {
-        lock.withLock { self.session = session; self.tcp = tcp; bitrateTarget = bitrate; resent = nil; gaveUp = false }
+        lock.withLock { self.session = session; self.tcp = tcp; bitrateTarget = bitrate; resent = nil; gaveUp = false; policy = VideoPathPolicy() }
     }
     func end() {
         let old: VideoDatagramSender? = lock.withLock { let value = udp; udp = nil; tcp = nil; session = nil; resent = nil; return value }
@@ -57,16 +57,16 @@ final class VideoRouter: @unchecked Sendable {
         old?.close()          // its `onStopped` hands the unacknowledged frames to TCP
     }
     func send(_ frame: VideoFrame) {
-        let (channel, sender): (SecureChannel?, VideoDatagramSender?) = lock.withLock { (tcp, udp) }
         do {
             let payload = try frame.encoded()
-            // A keyframe is a megabyte or two (a session's first frame, or the first after the iPad returns from the
-            // background). As datagrams it would have to be spread over a tenth of a second or risk overflowing
-            // buffers (measured: 2 MB took 110 ms and held up the frames behind it); TCP is built for exactly that
-            // kind of burst, and the iPad orders frames by number whichever way they come.
-            if let sender, payload.count <= Self.largestDatagramFrame { sender.send(frame: frame.sequence, bytes: payload) }
+            // The path is chosen by VideoPathPolicy: TCP for the session's first frame and for large ones, UDP for
+            // the rest while the iPad's flow is up. The iPad orders frames by number whichever way they come.
+            let (channel, sender): (SecureChannel?, VideoDatagramSender?) = lock.withLock {
+                policy.useDatagrams(available: udp != nil, bytes: payload.count) ? (tcp, udp) : (tcp, nil)
+            }
+            if let sender { sender.send(frame: frame.sequence, bytes: payload) }
             else { channel?.send(WirePacket(kind: .video, payload: payload)) }
-        } catch { channel?.close(reason: error.localizedDescription) }
+        } catch { lock.withLock { tcp }?.close(reason: error.localizedDescription) }
     }
     func acknowledge(_ sequence: UInt64) { lock.withLock { udp }?.acknowledge(sequence) }
     /// Measures the share of resent datagrams since the last call; the result is read through `resentShare`.

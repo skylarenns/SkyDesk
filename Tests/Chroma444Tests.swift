@@ -98,6 +98,32 @@ final class Chroma444Tests: XCTestCase {
         XCTAssertEqual(red, 230, accuracy: 14); XCTAssertEqual(green, 60, accuracy: 14); XCTAssertEqual(blue, 40, accuracy: 14)
     }
 
+    /// The fast encoder mode must still produce a stream the decoder accepts, in both colour layouts.
+    func testFastEncodingStillDecodes() throws {
+        for full in [false, true] {
+            let encoder: HEVCEncoder
+            do { encoder = try HEVCEncoder(width: width, height: height, fps: 60, bitrate: 40_000_000, chroma444: full, preferSpeed: true) }
+            catch { throw XCTSkip("Hardware HEVC encoding is unavailable here: \(error.localizedDescription)") }
+            let decoder = HEVCDecoder()
+            let done = expectation(description: "decoded \(full)")
+            var good = 0
+            for index in 1...5 {
+                encoder.encode(stripes(), sequence: UInt64(index), captureTime: monotonicNanos(), timestamp: CMTime(value: Int64(index), timescale: 60)) { encoded in
+                    guard let frame = try? encoded.get() else { if index == 5 { done.fulfill() }; return }
+                    try? decoder.decode(frame) { decoded in
+                        if case .success = decoded { good += 1 }
+                        if index == 5 { done.fulfill() }
+                    }
+                }
+            }
+            encoder.flush()
+            wait(for: [done], timeout: 10)
+            decoder.flush()
+            XCTAssertEqual(good, 5)
+            XCTAssertEqual(decoder.chroma444, full)
+        }
+    }
+
     func testAStreamDescribesItsOwnColourLayout() throws {
         let format = try HEVCDecoder.description(parameterSets: HEVCDecoder.sample444ParameterSets)
         XCTAssertEqual(HEVCDecoder.chromaFormat(of: format), 3)
