@@ -120,6 +120,8 @@ final class ClientModel: ObservableObject {
     private var pinger: DispatchSourceTimer?
     private var connectedAt = Date()
     private var usingCable = false
+    /// The session runs through a VPN tunnel (WireGuard and the like), so the toolbar shows that instead of Wi-Fi.
+    private var usingVPN = false
     private var statsTick = 0
     private var awaitingTextFocus = false
     private var activeTarget: ConnectTarget?
@@ -323,7 +325,7 @@ final class ClientModel: ObservableObject {
         monitor.pathUpdateHandler = { [weak self] path in
             Task { @MainActor in
                 guard let self, self.token == session else { return }
-                if self.usingCable { return }
+                if self.usingCable || self.usingVPN { return }
                 let wifi = path.usesInterfaceType(.wifi)
                 self.networkSymbol = path.status == .satisfied ? (wifi ? "wifi" : "network") : "wifi.slash"
                 self.networkDescription = path.status == .satisfied ? (wifi ? "Wi-Fi connected" : "Network connected") : "Network unavailable"
@@ -369,9 +371,17 @@ final class ClientModel: ObservableObject {
                     try info.validate()
                     self.info = info; self.connecting = false; self.status = "Connected"
                     self.clearAutoDeadline()
-                    if let path = control?.connection.currentPath, !path.usesInterfaceType(.wifi), !path.usesInterfaceType(.cellular) {
-                        self.usingCable = true
-                        self.networkSymbol = "cable.connector"; self.networkDescription = "USB cable connected"
+                    if let path = control?.connection.currentPath {
+                        switch LinkKind.of(interfaces: path.availableInterfaces.map(\.name), wifi: path.usesInterfaceType(.wifi),
+                                           cellular: path.usesInterfaceType(.cellular)) {
+                        case .vpn:
+                            self.usingVPN = true
+                            self.networkSymbol = "lock.shield"; self.networkDescription = "VPN connected"
+                        case .cable:
+                            self.usingCable = true
+                            self.networkSymbol = "cable.connector"; self.networkDescription = "USB cable connected"
+                        case .wireless: break
+                        }
                     }
                     self.remember(target, info: info, path: control?.connection.currentPath)
                     let agreed = info.features ?? 0
@@ -535,7 +545,7 @@ final class ClientModel: ObservableObject {
         info = nil; connecting = false
         if let reason { status = reason }
         textFocus = .none; keyboardWanted = false; awaitingTextFocus = false; lastTapRect = nil; remoteCursor = nil
-        macDisplayBlanked = false; changingMacDisplay = false; usingCable = false
+        macDisplayBlanked = false; changingMacDisplay = false; usingCable = false; usingVPN = false
         pathMonitor?.cancel(); pathMonitor = nil
         UIDevice.current.isBatteryMonitoringEnabled = false
         UIApplication.shared.isIdleTimerDisabled = false
@@ -901,7 +911,7 @@ final class ClientModel: ObservableObject {
                      display: StatisticsText.total(values), details: StatisticsText.pipeline(values))
         statsTick += 1
         if statsTick % 2 == 0, (info?.features ?? 0) & StreamFeature.clientStatsLog != 0 {
-            control?.send(.clientStats(StatisticsText.logLine(values, link: usingCable ? "cable" : networkSymbol)))
+            control?.send(.clientStats(StatisticsText.logLine(values, link: usingCable ? "cable" : usingVPN ? "vpn" : networkSymbol)))
         }
         #if targetEnvironment(simulator)
         stats.metrics = "SIMULATOR (GPU completion only) · " + stats.metrics

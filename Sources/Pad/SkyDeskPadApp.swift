@@ -1,26 +1,75 @@
 import SwiftUI
 import UniformTypeIdentifiers
 
+/// UIKit owns the window (build 31) so the root view controller can keep the app in landscape; SwiftUI draws
+/// everything inside it, exactly as before.
 @main
-struct SkyDeskPadApp: App {
-    @StateObject private var client = ClientModel()
-    @Environment(\.scenePhase) private var phase
-    var body: some Scene {
-        WindowGroup {
-            PadRootView(client: client)
-                .task { client.launch() }
-                // "Open in SkyDesk" from the share sheet or Files: send the file to the Mac.
-                .onOpenURL { url in if url.isFileURL { client.sendFiles([url]) } }
-                .onChange(of: phase) { _, phase in
-                    switch phase {
-                    // Held keys and buttons are released on the Mac whenever the iPad stops being in front.
-                    case .inactive: client.releaseInput()
-                    case .background: client.enterBackground()
-                    case .active: client.enterForeground()
-                    @unknown default: break
-                    }
-                }
+final class PadAppDelegate: UIResponder, UIApplicationDelegate {
+    let client = ClientModel()
+    func application(_ application: UIApplication, configurationForConnecting session: UISceneSession,
+                     options: UIScene.ConnectionOptions) -> UISceneConfiguration {
+        let configuration = UISceneConfiguration(name: "SkyDesk", sessionRole: session.role)
+        configuration.delegateClass = PadSceneDelegate.self
+        return configuration
+    }
+    func application(_ application: UIApplication, supportedInterfaceOrientationsFor window: UIWindow?) -> UIInterfaceOrientationMask {
+        .landscape
+    }
+}
+
+final class PadSceneDelegate: UIResponder, UIWindowSceneDelegate {
+    var window: UIWindow?
+    private var client: ClientModel? { (UIApplication.shared.delegate as? PadAppDelegate)?.client }
+    func scene(_ scene: UIScene, willConnectTo session: UISceneSession, options: UIScene.ConnectionOptions) {
+        guard let scene = scene as? UIWindowScene, let client else { return }
+        let window = UIWindow(windowScene: scene)
+        window.rootViewController = LandscapeHostingController(rootView: PadRootView(client: client))
+        self.window = window
+        window.makeKeyAndVisible()
+        open(options.urlContexts)
+    }
+    /// "Open in SkyDesk" from the share sheet or Files: send the file to the Mac.
+    func scene(_ scene: UIScene, openURLContexts contexts: Set<UIOpenURLContext>) { open(contexts) }
+    private func open(_ contexts: Set<UIOpenURLContext>) {
+        let files = contexts.map(\.url).filter(\.isFileURL)
+        if !files.isEmpty { client?.sendFiles(files) }
+    }
+    func sceneDidBecomeActive(_ scene: UIScene) {
+        // The first call starts discovery and tries the most recent Mac; later calls only resume.
+        client?.launch()
+        client?.enterForeground()
+    }
+    /// Held keys and buttons are released on the Mac whenever the iPad stops being in front.
+    func sceneWillResignActive(_ scene: UIScene) { client?.releaseInput() }
+    func sceneDidEnterBackground(_ scene: UIScene) { client?.enterBackground() }
+}
+
+/// Landscape only (user request, build 31). The supported-orientation answer is enough where iPadOS honours it.
+/// If the scene is ever seen in portrait anyway, iPadOS is ignoring that answer, so from then on the controller
+/// asks for landscape and holds it with the orientation lock (iPadOS 26+).
+final class LandscapeHostingController<Content: View>: UIHostingController<Content> {
+    private var sawPortrait = false
+    private var lockWanted = false
+    private var lastRequest = Date.distantPast
+    override var supportedInterfaceOrientations: UIInterfaceOrientationMask { .landscape }
+    @available(iOS 26.0, *)
+    override var prefersInterfaceOrientationLocked: Bool { lockWanted }
+    override func viewDidAppear(_ animated: Bool) { super.viewDidAppear(animated); updateOrientation() }
+    override func viewDidLayoutSubviews() { super.viewDidLayoutSubviews(); updateOrientation() }
+    private func updateOrientation() {
+        guard let scene = view.window?.windowScene else { return }
+        let landscape = scene.effectiveGeometry.interfaceOrientation.isLandscape
+        if !landscape {
+            sawPortrait = true
+            if Date().timeIntervalSince(lastRequest) > 1 {
+                lastRequest = Date()
+                scene.requestGeometryUpdate(.iOS(interfaceOrientations: .landscape)) { _ in }
+            }
         }
+        let want = sawPortrait && landscape
+        guard want != lockWanted else { return }
+        lockWanted = want
+        if #available(iOS 26.0, *) { setNeedsUpdateOfPrefersInterfaceOrientationLocked() }
     }
 }
 

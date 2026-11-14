@@ -52,6 +52,24 @@ final class HostModel: ObservableObject {
     @Published var screenAllowed = CGPreflightScreenCaptureAccess()
     @Published var inputAllowed = AXIsProcessTrusted()
     let input = InputInjector()
+    /// Called just before the app quits to install a Mac update and reopen.
+    var willRelaunch: (() -> Void)?
+    enum Phase { case connected, waiting, standby, off, locked }
+    var phase: Phase {
+        if pairingLocked { return .locked }
+        if clientConnected { return .connected }
+        if listening { return sharing ? .waiting : .standby }
+        return .off
+    }
+    var headline: String {
+        switch phase {
+        case .connected: return "iPad connected"
+        case .waiting: return "Sharing is on"
+        case .standby: return "Ready for your iPad"
+        case .off: return "Sharing is off"
+        case .locked: return "Password locked"
+        }
+    }
     private static let passwordAccount = "host-password"
     private var key: PairingKey?
     private var listener: NWListener?
@@ -633,6 +651,7 @@ final class HostModel: ObservableObject {
         MetricsLog.shared.append("host  self-update to staged build starting")
         do {
             try SelfUpdater.replace(with: staged)
+            willRelaunch?()
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { NSApp.terminate(nil) }
         } catch { updating = false; status = "Update failed: \(error.localizedDescription)" }
     }

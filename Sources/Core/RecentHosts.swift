@@ -113,3 +113,14 @@ public enum AutoConnect {
         list.entries.first(where: hasCredential)
     }
 }
+
+/// What kind of link a session runs over, for the iPad's toolbar and the statistics log.
+public enum LinkKind: Equatable {
+    case wireless, cable, vpn
+    /// `interfaces` are the connection path's interface names, most preferred first. A tunnel (utun, ipsec, ppp)
+    /// is neither Wi-Fi nor cellular to the system, and before build 31 it was shown as a USB cable.
+    public static func of(interfaces: [String], wifi: Bool, cellular: Bool) -> LinkKind {
+        if let first = interfaces.first, ["utun", "ipsec", "ppp", "wg"].contains(where: first.hasPrefix) { return .vpn }
+        return wifi || cellular ? .wireless : .cable
+    }
+}

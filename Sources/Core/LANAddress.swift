@@ -52,13 +52,18 @@ enum LANAddressDiscovery {
     static func select(_ interfaces: [InterfaceAddress], labels: [String: String],
                        primaryInterface: String?) -> [LANAddress] {
         let required = UInt32(IFF_UP | IFF_RUNNING)
-        let excluded = UInt32(IFF_LOOPBACK | IFF_POINTOPOINT)
         let candidates = interfaces.compactMap { item -> LANAddress? in
-            guard item.flags & required == required, item.flags & excluded == 0,
-                  let label = labels[item.name], isUsableIPv4(item.address) else { return nil }
+            guard item.flags & required == required, item.flags & UInt32(IFF_LOOPBACK) == 0,
+                  isUsableIPv4(item.address) else { return nil }
+            // A VPN tunnel (WireGuard and the like) is how the iPad reaches this Mac away from home (build 31).
+            if isTunnel(item.name) { return LANAddress(interfaceName: item.name, connectionName: vpnLabel, address: item.address) }
+            guard item.flags & UInt32(IFF_POINTOPOINT) == 0, let label = labels[item.name] else { return nil }
             return LANAddress(interfaceName: item.name, connectionName: label, address: item.address)
         }
         return Set(candidates).sorted { lhs, rhs in
+            // Wi-Fi and Ethernet first: at home they are the faster way in, whatever the default route is.
+            let leftTunnel = isTunnel(lhs.interfaceName), rightTunnel = isTunnel(rhs.interfaceName)
+            if leftTunnel != rightTunnel { return rightTunnel }
             let leftPrimary = lhs.interfaceName == primaryInterface
             let rightPrimary = rhs.interfaceName == primaryInterface
             if leftPrimary != rightPrimary { return leftPrimary }
@@ -66,6 +71,9 @@ enum LANAddressDiscovery {
             return lhs.address < rhs.address
         }
     }
+
+    static let vpnLabel = "VPN"
+    static func isTunnel(_ name: String) -> Bool { ["utun", "ipsec", "ppp", "wg"].contains(where: name.hasPrefix) }
 
     private static func isUsableIPv4(_ address: String) -> Bool {
         var parsed = in_addr()

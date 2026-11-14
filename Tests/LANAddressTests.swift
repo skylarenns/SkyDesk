@@ -26,8 +26,8 @@ final class LANAddressTests: XCTestCase {
         XCTAssertTrue(LANAddressDiscovery.select([], labels: labels, primaryInterface: nil).isEmpty)
     }
 
-    func testRejectsTunnelsLoopbackInactiveAndUnusableAddresses() {
-        let entries = [entry("utun4", "100.64.1.1"), entry("awdl0", "10.1.1.1"),
+    func testRejectsLoopbackInactiveAndUnusableAddresses() {
+        let entries = [entry("utun4", "100.64.1.1", flags: UInt32(IFF_UP)), entry("utun5", "169.254.9.9"), entry("awdl0", "10.1.1.1"),
                        entry("lo0", "127.0.0.1"), entry("en0", "10.1.1.1", flags: 0),
                        entry("en0", "10.1.1.1", flags: active | UInt32(IFF_POINTOPOINT)),
                        entry("en0", "10.1.1.1", flags: active | UInt32(IFF_LOOPBACK))]
@@ -36,12 +36,27 @@ final class LANAddressTests: XCTestCase {
         XCTAssertTrue(LANAddressDiscovery.select(entries, labels: labels, primaryInterface: "utun4").isEmpty)
     }
 
-    func testVPNDefaultDoesNotHidePhysicalLANAddressOrRequireInternet() {
-        let entries = [entry("utun4", "100.64.1.1"), entry("en0", "10.240.173.132")]
-        XCTAssertEqual(LANAddressDiscovery.select(entries, labels: labels, primaryInterface: "utun4").map(\.address),
-                       ["10.240.173.132"])
-        XCTAssertEqual(LANAddressDiscovery.select(entries, labels: labels, primaryInterface: nil).map(\.address),
-                       ["10.240.173.132"])
+    func testVPNAddressIsListedAfterThePhysicalLANAddress() {
+        let tunnel = active | UInt32(IFF_POINTOPOINT)
+        let entries = [entry("utun4", "10.8.0.2", flags: tunnel), entry("en0", "10.240.173.132")]
+        for primary in ["utun4", "en0", nil] {
+            let addresses = LANAddressDiscovery.select(entries, labels: labels, primaryInterface: primary)
+            XCTAssertEqual(addresses.map(\.address), ["10.240.173.132", "10.8.0.2"])
+            XCTAssertEqual(addresses.map(\.connectionName), ["Wi-Fi", "VPN"])
+        }
+        // Away from home the tunnel can be the only way in.
+        XCTAssertEqual(LANAddressDiscovery.select([entry("utun4", "10.8.0.2", flags: tunnel)], labels: labels, primaryInterface: "utun4")
+            .map(\.address), ["10.8.0.2"])
+    }
+
+    func testLinkKindTellsATunnelFromACable() {
+        XCTAssertEqual(LinkKind.of(interfaces: ["utun3"], wifi: false, cellular: false), .vpn)
+        XCTAssertEqual(LinkKind.of(interfaces: ["utun3", "en0"], wifi: true, cellular: false), .vpn)
+        XCTAssertEqual(LinkKind.of(interfaces: ["ipsec0"], wifi: false, cellular: false), .vpn)
+        XCTAssertEqual(LinkKind.of(interfaces: ["en0"], wifi: true, cellular: false), .wireless)
+        XCTAssertEqual(LinkKind.of(interfaces: ["pdp_ip0"], wifi: false, cellular: true), .wireless)
+        XCTAssertEqual(LinkKind.of(interfaces: ["en2"], wifi: false, cellular: false), .cable)
+        XCTAssertEqual(LinkKind.of(interfaces: [], wifi: false, cellular: false), .cable)
     }
 
     private func entry(_ name: String, _ address: String, flags: UInt32? = nil) -> LANAddressDiscovery.InterfaceAddress {

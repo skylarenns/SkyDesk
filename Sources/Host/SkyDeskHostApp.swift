@@ -1,31 +1,192 @@
 import SwiftUI
 import AppKit
+import ServiceManagement
 
+/// SkyDesk Host lives in the menu bar (build 31). Its window is optional: closing it leaves sharing running, and
+/// a launch at login opens no window at all.
 @main
 struct SkyDeskHostApp: App {
-    @StateObject private var host = HostModel()
+    @NSApplicationDelegateAdaptor(HostAppDelegate.self) private var delegate
     var body: some Scene {
-        WindowGroup("SkyDesk Host") {
-            HostView(host: host)
-                .task { await host.loadPairing() }
-                .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in host.shutdown() }
-                .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.willSleepNotification)) { _ in host.sleep() }
-                .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didWakeNotification)) { _ in host.wake() }
-                .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
-                    host.refreshPermissions(); host.refreshNetworkAddresses()
-                }
-                .onReceive(NotificationCenter.default.publisher(for: NSApplication.didChangeScreenParametersNotification)) { _ in
-                    host.refreshInputGeometry()
-                }
-                .onReceive(Timer.publish(every: 2, on: .main, in: .common).autoconnect()) { _ in host.refreshNetworkAddresses() }
+        MenuBarExtra {
+            MenuBarContent(host: delegate.host, login: delegate.login) { delegate.showWindow() }
+        } label: {
+            MenuBarLabel(host: delegate.host)
         }
-        .defaultSize(width: 520, height: 640)
-        .windowResizability(.contentSize)
+    }
+}
+
+/// Owns the model for the life of the process, so sleep, wake and quit are handled with or without a window.
+@MainActor
+final class HostAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+    let host = HostModel()
+    let login = LoginItem()
+    private var window: NSWindow?
+    private var observers: [NSObjectProtocol] = []
+    private var addressTimer: Timer?
+    private static let relaunchHiddenKey = "relaunchHiddenAt"
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // Self-check for development (SKYDESK_SMOKE_PNG=<file>): builds the window without showing it, saves a picture
+        // of it and exits. No pairing, no network port, no displays touched, so it is safe beside a running host.
+        if let picture = ProcessInfo.processInfo.environment["SKYDESK_SMOKE_PNG"] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.smokeTest(picture) }
+            return
+        }
+        let quiet = Self.launchedAtLogin(loginItemOn: login.enabled) || Self.relaunchedHidden()
+        login.enableOnFirstRun()
+        let workspace = NSWorkspace.shared.notificationCenter
+        observers.append(workspace.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.host.sleep() }
+        })
+        observers.append(workspace.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.host.wake() }
+        })
+        observers.append(NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.host.refreshInputGeometry() }
+            })
+        // Kept current without a window too: the update server and the pairing card both read this list.
+        let timer = Timer(timeInterval: 2, repeats: true) { [weak self] _ in MainActor.assumeIsolated { self?.host.refreshNetworkAddresses() } }
+        RunLoop.main.add(timer, forMode: .common); addressTimer = timer
+        // The Mac update relaunches the app: come back the way it was (window open or menu bar only).
+        host.willRelaunch = { [weak self] in
+            if self?.window?.isVisible != true { UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: Self.relaunchHiddenKey) }
+        }
+        if !quiet { showWindow() }
+        Task {
+            await host.loadPairing()
+            // Something needs the user (Keychain approval or a permission): never wait for that out of sight.
+            if host.pairingLocked || !host.screenAllowed || (host.allowInput && !host.inputAllowed) { showWindow() }
+        }
+    }
+    func applicationWillTerminate(_ notification: Notification) { host.shutdown() }
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+    /// Opening SkyDesk again (Finder, Spotlight, Dock) while it runs in the menu bar shows the window.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        showWindow(); return true
+    }
+    func showWindow() {
+        // The Dock icon and app menu exist only while the window does.
+        if NSApp.activationPolicy() != .regular { NSApp.setActivationPolicy(.regular) }
+        makeWindow()
+        if window?.isMiniaturized == true { window?.deminiaturize(nil) }
+        window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        login.refresh()
+    }
+    private func makeWindow() {
+        if window == nil {
+            let controller = NSHostingController(rootView: HostView(host: host, login: login))
+            controller.sizingOptions = []
+            let window = NSWindow(contentViewController: controller)
+            window.title = "SkyDesk Host"
+            window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
+            window.isReleasedWhenClosed = false
+            window.contentMinSize = NSSize(width: 520, height: 560)
+            window.contentMaxSize = NSSize(width: 520, height: 4_000)
+            window.setContentSize(NSSize(width: 520, height: 640))
+            window.center()
+            window.setFrameAutosaveName("SkyDeskHostWindow")
+            window.delegate = self
+            self.window = window
+        }
+    }
+    private func smokeTest(_ picture: String) {
+        makeWindow()
+        guard let window, let view = window.contentView else { exit(3) }
+        window.layoutIfNeeded(); view.layoutSubtreeIfNeeded()
+        guard let image = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { exit(4) }
+        view.cacheDisplay(in: view.bounds, to: image)
+        try? image.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: picture))
+        let items = NSApp.windows.filter { $0.className.contains("StatusBar") }.count
+        let summary = "headline=\(host.headline) menuBarItems=\(items) content=\(Int(view.bounds.width))x\(Int(view.bounds.height)) "
+            + "loginStatus=\(SMAppService.mainApp.status.rawValue) policy=\(NSApp.activationPolicy().rawValue)\n"
+        try? summary.write(toFile: picture + ".txt", atomically: true, encoding: .utf8)
+        exit(0)
+    }
+    func windowWillClose(_ notification: Notification) {
+        DispatchQueue.main.async { [weak self] in
+            guard self?.window?.isVisible != true else { return }
+            NSApp.setActivationPolicy(.accessory)
+        }
+    }
+    /// macOS marks the launch event of a login item; a launch within four minutes of start-up with the login item on
+    /// counts too, in case the mark is missing.
+    private static func launchedAtLogin(loginItemOn: Bool) -> Bool {
+        if let event = NSAppleEventManager.shared().currentAppleEvent, event.eventID == kAEOpenApplication,
+           event.paramDescriptor(forKeyword: keyAEPropData)?.enumCodeValue == keyAELaunchedAsLogInItem { return true }
+        return loginItemOn && ProcessInfo.processInfo.systemUptime < 240
+    }
+    private static func relaunchedHidden() -> Bool {
+        let stamp = UserDefaults.standard.double(forKey: relaunchHiddenKey)
+        UserDefaults.standard.removeObject(forKey: relaunchHiddenKey)
+        return stamp > 0 && Date().timeIntervalSince1970 - stamp < 120
+    }
+}
+
+/// "Open at login", through macOS's own login-items list (System Settings › General › Login Items).
+@MainActor
+final class LoginItem: ObservableObject {
+    @Published private(set) var enabled = SMAppService.mainApp.status == .enabled
+    @Published private(set) var problem: String?
+    /// Only the installed copy may register itself; a development build would register its build folder.
+    private var installed: Bool { Bundle.main.bundlePath.hasPrefix("/Applications/") }
+    func set(_ on: Bool) {
+        guard installed else { problem = "Move SkyDesk Host to the Applications folder to open it at login."; return }
+        do {
+            if on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
+            problem = nil
+        } catch { problem = "Couldn't change the login item: \(error.localizedDescription)" }
+        refresh()
+        if on, SMAppService.mainApp.status == .requiresApproval {
+            problem = "Allow SkyDesk Host in System Settings › General › Login Items."
+        }
+    }
+    func refresh() {
+        let value = SMAppService.mainApp.status == .enabled
+        if value != enabled { enabled = value }
+    }
+    /// The user asked for launch at login (2026-11-13), so the first run of this build switches it on once.
+    /// Switching it off afterwards sticks.
+    func enableOnFirstRun() {
+        guard installed, !UserDefaults.standard.bool(forKey: "loginItemOffered") else { return }
+        UserDefaults.standard.set(true, forKey: "loginItemOffered")
+        if !enabled { set(true) }
+    }
+}
+
+private struct MenuBarLabel: View {
+    @ObservedObject var host: HostModel
+    var body: some View {
+        Image(systemName: host.clientConnected ? "ipad.and.arrow.forward" : "ipad.landscape")
+            .accessibilityLabel("SkyDesk: \(host.headline)")
+    }
+}
+
+private struct MenuBarContent: View {
+    @ObservedObject var host: HostModel
+    @ObservedObject var login: LoginItem
+    let openWindow: () -> Void
+    var body: some View {
+        Text(host.headline)
+        switch host.phase {
+        case .locked: Button("Unlock…") { openWindow() }
+        case .connected: Button("Disconnect iPad") { host.stopSharing() }
+        case .waiting: Button("Turn Off Sharing") { host.stopSharing() }
+        case .standby, .off: Button("Turn On Sharing") { host.startSharing() }.disabled(host.password.isEmpty)
+        }
+        Divider()
+        Button("Open SkyDesk…") { openWindow() }
+        Toggle("Open at Login", isOn: Binding(get: { login.enabled }, set: { login.set($0) }))
+        Divider()
+        Button("Quit SkyDesk") { NSApp.terminate(nil) }
     }
 }
 
 private struct HostView: View {
     @ObservedObject var host: HostModel
+    @ObservedObject var login: LoginItem
     @AppStorage("hidePassword") private var hidePassword = false
     @State private var editingPassword = false
     @State private var showSettings = false
@@ -58,6 +219,9 @@ private struct HostView: View {
         }
         .tint(.teal)
         .sheet(isPresented: $editingPassword) { PasswordSheet(host: host, isPresented: $editingPassword) }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            host.refreshPermissions(); host.refreshNetworkAddresses(); login.refresh()
+        }
     }
 
     private var header: some View {
@@ -71,13 +235,8 @@ private struct HostView: View {
         }
     }
 
-    private enum Phase { case connected, waiting, standby, off, locked }
-    private var phase: Phase {
-        if host.pairingLocked { return .locked }
-        if host.clientConnected { return .connected }
-        if host.listening { return host.sharing ? .waiting : .standby }
-        return .off
-    }
+    private var phase: HostModel.Phase { host.phase }
+    private var headline: String { host.headline }
 
     private var statusCard: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -100,6 +259,14 @@ private struct HostView: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }.toggleStyle(.switch).disabled(host.pairingLocked)
+            Toggle(isOn: Binding(get: { login.enabled }, set: { login.set($0) })) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Open SkyDesk when I log in")
+                    Text(login.problem ?? "It waits in the menu bar. Closing this window keeps it running; quit from the menu bar icon.")
+                        .font(.caption).foregroundStyle(login.problem == nil ? Color.secondary : Color.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }.toggleStyle(.switch)
             if host.clientConnected {
                 Text(host.metrics).font(.caption.monospacedDigit()).foregroundStyle(.secondary).lineLimit(2)
             }
@@ -113,15 +280,6 @@ private struct HostView: View {
         case .waiting, .standby: return .green
         case .off: return .secondary
         case .locked: return .orange
-        }
-    }
-    private var headline: String {
-        switch phase {
-        case .connected: return "iPad connected"
-        case .waiting: return "Sharing is on"
-        case .standby: return "Ready for your iPad"
-        case .off: return "Sharing is off"
-        case .locked: return "Password locked"
         }
     }
     @ViewBuilder private var primaryButton: some View {
@@ -211,6 +369,10 @@ private struct HostView: View {
                     copyButton(host.password, label: "Copy password")
                     Button("Change…") { editingPassword = true }.disabled(host.busy || host.clientConnected || host.password.isEmpty)
                 }
+            }
+            if host.lanAddresses.contains(where: { $0.connectionName == LANAddressDiscovery.vpnLabel }) {
+                Text("Away from home, with your iPad on the same VPN (WireGuard), type the VPN address.")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
             Text("Your iPad remembers it, so you only type it once. Dashes and spaces don't matter; capital letters do.")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
