@@ -94,6 +94,8 @@ public enum StreamFeature {
     public static let scrollMomentum = 128
     /// The Mac offers staged updates (`updateAvailable`) and installs them over Wi-Fi on request.
     public static let remoteUpdate = 256
+    /// The iPad sends `gesture` (pinch to zoom, rotate) and the Mac replays it as a trackpad gesture.
+    public static let gestures = 512
 }
 
 public struct Hello: Codable {
@@ -240,6 +242,8 @@ public enum ControlMessage: Codable {
     case updateReady(String)
     /// iPad → Mac: send the update certificate profile (arrives over the file channel).
     case updateCertificateRequest
+    /// iPad → Mac, only with StreamFeature.gestures.
+    case gesture(GestureEvent)
 }
 
 public struct VideoFrame {

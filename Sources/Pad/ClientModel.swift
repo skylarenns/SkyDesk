@@ -349,6 +349,7 @@ final class ClientModel: ObservableObject {
         self.videoQueue = videoQueue; self.videoGate = gate; self.decoder = decoder
         var features = StreamFeature.idleGapFlags | StreamFeature.pauseVideo | StreamFeature.liveCursorToggle
             | StreamFeature.clipboardSync | StreamFeature.fileTransfer | StreamFeature.scrollMomentum | StreamFeature.remoteUpdate
+            | StreamFeature.gestures
         if localPointer { features |= StreamFeature.localCursor }
         control.onReady = { [weak control] in
             control?.send(.hello(Hello(session: session, role: .control, display: display, features: features, appBuild: Self.ownBuild)))
@@ -666,6 +667,23 @@ final class ClientModel: ObservableObject {
         guard info?.inputEnabled == true, (info?.features ?? 0) & StreamFeature.scrollMomentum != 0 else { return }
         control?.send(.scrollMomentum(Double(velocity.x), Double(velocity.y)))
     }
+    /// Pinch and rotate. Older Macs don't know the message (and would end the session), so it is only sent when agreed.
+    func gesture(_ event: GestureEvent) {
+        guard info?.inputEnabled == true, (info?.features ?? 0) & StreamFeature.gestures != 0, event.isValid else { return }
+        control?.send(.gesture(event))
+    }
+    /// Three fingers on the screen, as on a Mac trackpad: up = Mission Control, down = the app's windows,
+    /// left and right = the next and previous desktop. Sent as the Mac's standard Control-arrow shortcuts.
+    func desktopSwipe(_ direction: DesktopSwipe) {
+        guard info?.inputEnabled == true else { return }
+        switch direction {
+        case .up: shortcut(key: 82, modifiers: 2)
+        case .down: shortcut(key: 81, modifiers: 2)
+        case .left: shortcut(key: 79, modifiers: 2)
+        case .right: shortcut(key: 80, modifiers: 2)
+        }
+    }
+    enum DesktopSwipe { case up, down, left, right }
     func sendText(_ text: String) {
         guard info?.inputEnabled == true, info?.textInputEnabled == true,
               !text.isEmpty, text.utf8.count <= 8192 else { return }

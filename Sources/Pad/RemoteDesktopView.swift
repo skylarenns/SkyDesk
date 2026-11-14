@@ -15,6 +15,8 @@ struct RemoteDesktopView: UIViewRepresentable {
         view.deleteText = { [weak client] in client?.deleteText() }
         view.keyboardDismissed = { [weak client] in client?.keyboardWanted = false }
         view.sendMomentum = { [weak client] in client?.scrollMomentum($0) }
+        view.sendGesture = { [weak client] in client?.gesture($0) }
+        view.desktopSwipe = { [weak client] in client?.desktopSwipe($0) }
         return view
     }
     func updateUIView(_ view: DesktopMetalView, context: Context) {
@@ -42,6 +44,10 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
     var keyboardDismissed: (() -> Void)?
     /// Lift-off velocity of a scroll, in points per second.
     var sendMomentum: ((CGPoint) -> Void)?
+    var sendGesture: ((GestureEvent) -> Void)?
+    var desktopSwipe: ((ClientModel.DesktopSwipe) -> Void)?
+    private var gestureSteps = GestureSteps()
+    private var activeGestures: Set<GestureEvent.Kind> = []
     var controlsFrame: CGRect = .zero
     private let keyboard = RemoteKeyboardProxy()
     private var keyboardObservers: [NSObjectProtocol] = []
@@ -130,6 +136,22 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
         let trackpadScroll = UIPanGestureRecognizer(target: self, action: #selector(scrolled(_:)))
         trackpadScroll.allowedTouchTypes = []; trackpadScroll.allowedScrollTypesMask = .all
         addGestureRecognizer(trackpadScroll)
+        // Pinch and rotate, from the trackpad (the pointer stays where it is) or with two fingers on the screen.
+        let both = [NSNumber(value: UITouch.TouchType.direct.rawValue), NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)]
+        let pinch = UIPinchGestureRecognizer(target: self, action: #selector(pinched(_:)))
+        pinch.allowedTouchTypes = both
+        addGestureRecognizer(pinch)
+        let rotation = UIRotationGestureRecognizer(target: self, action: #selector(rotated(_:)))
+        rotation.allowedTouchTypes = both
+        addGestureRecognizer(rotation)
+        // Three fingers on the screen: Mission Control, app windows and desktops. (iPadOS keeps three-finger
+        // swipes on the trackpad for itself, so those never reach an app.)
+        for direction in [UISwipeGestureRecognizer.Direction.up, .down, .left, .right] {
+            let swipe = UISwipeGestureRecognizer(target: self, action: #selector(threeFingerSwiped(_:)))
+            swipe.direction = direction; swipe.numberOfTouchesRequired = 3
+            swipe.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
+            addGestureRecognizer(swipe)
+        }
         for recognizer in gestureRecognizers ?? [] { recognizer.delegate = self }
         addInteraction(UIPointerInteraction(delegate: self))
         deactivateObserver = NotificationCenter.default.addObserver(forName: UIApplication.willResignActiveNotification,
@@ -142,6 +164,7 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
         keyboardObservers.forEach { NotificationCenter.default.removeObserver($0) }
     }
     override var canBecomeFirstResponder: Bool { true }
+    override var editingInteractionConfiguration: UIEditingInteractionConfiguration { .none }
     override func didMoveToWindow() {
         super.didMoveToWindow()
         if let window {
@@ -227,6 +250,7 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
     func releaseKeys() {
         repeatTimer?.invalidate(); repeatTimer = nil; repeatKey = nil
         heldKeys.removeAll(); modifiers = 0; dragActive = false
+        activeGestures.removeAll()
         releaseRemoteInput?()
     }
     private func point(_ location: CGPoint) -> CGPoint? {
@@ -299,8 +323,49 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
         }
         if recognizer.state == .ended { sendMomentum?(recognizer.velocity(in: self)) }
     }
+    @objc private func pinched(_ recognizer: UIPinchGestureRecognizer) {
+        transform(recognizer, kind: .magnify) { gestureSteps.magnification(scale: Double(recognizer.scale)) }
+    }
+    @objc private func rotated(_ recognizer: UIRotationGestureRecognizer) {
+        transform(recognizer, kind: .rotate) { gestureSteps.degrees(radians: Double(recognizer.rotation)) }
+    }
+    /// Began and ended always frame the gesture for the Mac app; steps in between only when something changed.
+    private func transform(_ recognizer: UIGestureRecognizer, kind: GestureEvent.Kind, step: () -> Double?) {
+        syncModifiers(recognizer)
+        switch recognizer.state {
+        case .began:
+            if dragActive { pointer(.up, at: lastPoint); dragActive = false }
+            if activeGestures.isEmpty { gestureSteps.reset() }
+            let location = recognizer.location(in: self)
+            // The Mac zooms whatever is under its pointer: for fingers on the screen, that is between them.
+            if let p = point(location) { moveCursor(to: location); pointer(.move, at: p) }
+            activeGestures.insert(kind)
+            sendGesture?(GestureEvent(kind: kind, value: step() ?? 0, phase: ScrollPhase.began))
+        case .changed:
+            guard activeGestures.contains(kind), let value = step(), value != 0 else { return }
+            sendGesture?(GestureEvent(kind: kind, value: value, phase: ScrollPhase.changed))
+        case .ended, .cancelled, .failed:
+            guard activeGestures.remove(kind) != nil else { return }
+            sendGesture?(GestureEvent(kind: kind, value: 0, phase: ScrollPhase.ended))
+        default: break
+        }
+    }
+    @objc private func threeFingerSwiped(_ recognizer: UISwipeGestureRecognizer) {
+        guard recognizer.state == .ended, point(recognizer.location(in: self)) != nil else { return }
+        if dragActive { pointer(.up, at: lastPoint); dragActive = false }
+        switch recognizer.direction {
+        case .up: desktopSwipe?(.up)
+        case .down: desktopSwipe?(.down)
+        case .left: desktopSwipe?(.left)
+        case .right: desktopSwipe?(.right)
+        default: break
+        }
+    }
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
-        gestureRecognizer is UIHoverGestureRecognizer || other is UIHoverGestureRecognizer
+        if gestureRecognizer is UIHoverGestureRecognizer || other is UIHoverGestureRecognizer { return true }
+        // Zooming and turning with the same two fingers, as on a Mac.
+        let transforms = { (r: UIGestureRecognizer) in r is UIPinchGestureRecognizer || r is UIRotationGestureRecognizer }
+        return transforms(gestureRecognizer) && transforms(other)
     }
     func pointerInteraction(_ interaction: UIPointerInteraction, styleFor region: UIPointerRegion) -> UIPointerStyle? { .hidden() }
 

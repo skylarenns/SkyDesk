@@ -15,6 +15,7 @@ final class InputInjector {
     private var momentumTimer: Timer?
     private var momentumLast = 0.0
     private var momentumStarted = false
+    private var gestures: Set<GestureEvent.Kind> = []
 
     func handle(_ input: InputEvent) {
         guard input.isValid, AXIsProcessTrusted(), displayBounds.width > 0 else { return }
@@ -72,6 +73,24 @@ final class InputInjector {
             Self.post(event)
         }
     }
+    /// A pinch or rotation from the iPad, replayed as the Mac trackpad gesture for the app under the pointer.
+    func handle(_ gesture: GestureEvent) {
+        guard gesture.isValid, AXIsProcessTrusted(), displayBounds.width > 0 else { return }
+        var gesture = gesture
+        if gesture.phase == ScrollPhase.began {
+            stopMomentum()
+            // A second "began" without an end (lost message) continues the gesture instead of restarting it.
+            if !gestures.insert(gesture.kind).inserted { gesture.phase = ScrollPhase.changed }
+        } else if gesture.phase == ScrollPhase.changed {
+            if gestures.insert(gesture.kind).inserted { postGesture(GestureEvent(kind: gesture.kind, value: 0, phase: ScrollPhase.began)) }
+        } else if gestures.remove(gesture.kind) == nil { return }
+        postGesture(gesture)
+    }
+    private func postGesture(_ gesture: GestureEvent) {
+        guard let event = GestureInjection.event(gesture, at: location) else { return }
+        RemoteInputOrigin.lastGesture = monotonicNanos()
+        event.post(tap: .cghidEventTap)
+    }
     /// Normalised y at or below which a pointer move counts as resting on the bottom edge (about 5 points).
     static let bottomEdge = 0.995
     /// Lift-off velocity from the iPad (points per second): glide on, generated here at 120 Hz.
@@ -108,6 +127,9 @@ final class InputInjector {
     private static func cgPhase(_ phase: Int) -> Int64 { phase == ScrollPhase.began ? 1 : phase == ScrollPhase.changed ? 2 : 4 }
     func releaseAll() {
         stopMomentum()
+        // An unfinished pinch or rotation would leave the Mac app waiting for its end.
+        for kind in gestures { postGesture(GestureEvent(kind: kind, value: 0, phase: ScrollPhase.ended)) }
+        gestures.removeAll()
         for code in keys {
             let event = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: false)
             event?.flags = []; Self.post(event)

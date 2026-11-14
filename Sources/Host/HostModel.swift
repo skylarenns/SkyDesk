@@ -420,6 +420,9 @@ final class HostModel: ObservableObject {
             case .scrollMomentum(let vx, let vy):
                 guard clientFeatures & StreamFeature.scrollMomentum != 0, vx.isFinite, vy.isFinite else { throw DeskError.invalid("Invalid scroll.") }
                 if allowInput, capture != nil { input.startMomentum(velocity: CGPoint(x: vx, y: vy)) }
+            case .gesture(let gesture):
+                guard clientFeatures & StreamFeature.gestures != 0, gesture.isValid else { throw DeskError.invalid("Invalid gesture.") }
+                if allowInput, capture != nil { input.handle(gesture) }
             case .updateRequest:
                 guard clientFeatures & StreamFeature.remoteUpdate != 0 else { throw DeskError.invalid("Unexpected update request.") }
                 // The user chose to update: the Mac follows the moment this iPad disconnects (user request 2026-11-13).

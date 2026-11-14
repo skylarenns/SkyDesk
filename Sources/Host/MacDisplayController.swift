@@ -131,6 +131,7 @@ final class MacDisplayController {
     }
     private func restoreForLocalActivity(_ event: NSEvent) {
         guard isEnabled, let cgEvent = event.cgEvent, RemoteInputOrigin.isLocalActivity(cgEvent) else { return }
+        if [.magnify, .rotate, .swipe, .smartMagnify, .gesture].contains(event.type), RemoteInputOrigin.gestureJustInjected() { return }
         // WindowServer relocates the pointer during a topology change. Ignore that
         // transition motion, but let a deliberate key or click cancel immediately.
         if event.type == .mouseMoved {

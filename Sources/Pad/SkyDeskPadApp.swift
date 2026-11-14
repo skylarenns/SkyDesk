@@ -376,6 +376,12 @@ private struct StreamView: View {
                     Button("Copy  ⌘C") { client.shortcut(key: 6, modifiers: 8) }
                     Button("Paste  ⌘V") { client.shortcut(key: 25, modifiers: 8) }
                     Button("Undo  ⌘Z") { client.shortcut(key: 29, modifiers: 8) }
+                    Menu("Desktops") {
+                        Button("Mission Control  ⌃↑") { client.desktopSwipe(.up) }
+                        Button("This app's windows  ⌃↓") { client.desktopSwipe(.down) }
+                        Button("Next desktop  ⌃→") { client.desktopSwipe(.left) }
+                        Button("Previous desktop  ⌃←") { client.desktopSwipe(.right) }
+                    }
                     Divider()
                     Button("Release all keys") { client.releaseInput() }
                 } label: { ToolLabel(title: "Shortcuts", icon: "command") }

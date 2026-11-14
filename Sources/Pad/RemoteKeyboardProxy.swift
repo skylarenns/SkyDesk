@@ -20,6 +20,8 @@ final class RemoteKeyboardProxy: UITextView, UITextViewDelegate {
         resetComposition()
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    /// No three-finger undo/copy/paste gestures of iPadOS's own: three-finger swipes belong to the Mac here.
+    override var editingInteractionConfiguration: UIEditingInteractionConfiguration { .none }
     func resetComposition() {
         clearing = true; text = sentinel; selectedRange = NSRange(location: sentinel.utf16.count, length: 0); clearing = false
     }
