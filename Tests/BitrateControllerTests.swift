@@ -116,6 +116,19 @@ final class BitrateControllerTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(settled.min()!, 4_000_000)
     }
 
+    func testOverUDPHeavyLossCutsTheBitrateButOrdinaryWiFiLossDoesNot() {
+        var controller = BitrateController(maximum: 25_000_000)
+        _ = controller.update(clean())
+        // 3 % of datagrams sent twice: ordinary, simply repaired.
+        var light = clean(); light.resentShare = 0.03
+        for _ in 0..<40 { XCTAssertNil(controller.update(light)) }
+        // A quarter of everything sent twice: more is being sent than the link carries.
+        var heavy = clean(20); heavy.resentShare = 0.25
+        XCTAssertNil(controller.update(heavy)); XCTAssertNil(controller.update(heavy))
+        XCTAssertEqual(controller.update(heavy), 17_000_000)
+        XCTAssertTrue(controller.reason.contains("sent twice"))
+    }
+
     func testNeverGoesBelowTheFloorAndIgnoresTheKeyframeBurst() {
         var controller = BitrateController(maximum: 25_000_000)
         controller.startGrace(1.5)

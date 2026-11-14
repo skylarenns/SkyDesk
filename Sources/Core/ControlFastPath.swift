@@ -8,6 +8,7 @@ public final class ControlFastPath {
     private var controlID: UUID?
     private weak var window: FrameWindow?
     private var roundTrip: (ms: Double, at: UInt64)?
+    private var frameAcknowledged: ((UInt64) -> Void)?
     public init() {}
     public func bind(control id: UUID?) { lock.lock(); controlID = id; roundTrip = nil; lock.unlock() }
     /// The iPad's latest reported network round trip, if it is no older than `maxAge` seconds.
@@ -17,6 +18,8 @@ public final class ControlFastPath {
         return roundTrip.ms
     }
     public func bind(window: FrameWindow?) { lock.lock(); self.window = window; lock.unlock() }
+    /// Also told about each acknowledged frame (the UDP sender drops its copy of the frame then).
+    public func bind(frameAcknowledged handler: ((UInt64) -> Void)?) { lock.lock(); frameAcknowledged = handler; lock.unlock() }
     /// Keeps the round trip from one of the iPad's statistics lines (separate from `handle` so tests never write
     /// to the real log).
     func note(statistics text: String, now: UInt64 = monotonicNanos()) {
@@ -25,10 +28,10 @@ public final class ControlFastPath {
     }
     /// Only the established control channel is served here; everything else takes the validated main path.
     public func handle(_ message: ControlMessage, channel id: UUID, reply: (ControlMessage) -> Void) -> Outcome {
-        lock.lock(); let isControl = controlID == id; let window = self.window; lock.unlock()
+        lock.lock(); let isControl = controlID == id; let window = self.window; let acknowledged = frameAcknowledged; lock.unlock()
         guard isControl else { return .pass }
         switch message {
-        case .frameAck(let sequence): window?.acknowledge(sequence); return .handled
+        case .frameAck(let sequence): window?.acknowledge(sequence); acknowledged?(sequence); return .handled
         case .ping(let value): reply(.pong(value)); return .pongSent
         case .clientStats(let text):
             if text.utf8.count <= 512 {

@@ -107,6 +107,18 @@ final class ClientModel: ObservableObject {
     @Published var presentOnArrival = UserDefaults.standard.object(forKey: "presentOnArrival") as? Bool ?? true {
         didSet { UserDefaults.standard.set(presentOnArrival, forKey: "presentOnArrival") }
     }
+    /// Receive video as UDP datagrams when the Mac offers it (build 38): a lost packet is asked for again at once
+    /// instead of holding up everything behind it. TCP is used until UDP is up and whenever it stops working.
+    /// Applies from the next connection.
+    @Published var datagramVideo = UserDefaults.standard.object(forKey: "datagramVideo") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(datagramVideo, forKey: "datagramVideo")
+            if oldValue != datagramVideo, info != nil { notice = "Applies the next time you connect." }
+        }
+    }
+    /// "udp" while video is arriving as datagrams in this session, otherwise "tcp" (for the log and statistics).
+    private var videoPath = "tcp"
+    private var videoOrder: VideoDatagramReceiver?
     /// Ask the Mac for full colour detail (HEVC 4:4:4, build 36). Off by default: it uses more bitrate. Applies
     /// from the next connection.
     @Published var sharperColour = UserDefaults.standard.bool(forKey: "sharperColour") {
@@ -491,10 +503,14 @@ final class ClientModel: ObservableObject {
         #endif
         let gate = VideoGate()
         self.videoQueue = videoQueue; self.videoGate = gate; self.decoder = decoder
+        // Every frame passes through here in sequence order, whether it came whole over TCP or in pieces over UDP.
+        let order = VideoDatagramReceiver(queue: videoQueue)
+        videoOrder = order; videoPath = "tcp"
         var features = StreamFeature.idleGapFlags | StreamFeature.pauseVideo | StreamFeature.liveCursorToggle
             | StreamFeature.clipboardSync | StreamFeature.fileTransfer | StreamFeature.scrollMomentum | StreamFeature.remoteUpdate
             | StreamFeature.gestures | StreamFeature.audio | StreamFeature.deviceKeys
         if localPointer { features |= StreamFeature.localCursor }
+        if datagramVideo { features |= StreamFeature.datagramVideo }
         if sharperColour, Self.canDecodeFullColour, !UserDefaults.standard.bool(forKey: Self.colourFailedKey) { features |= StreamFeature.chroma444 }
         control.onReady = { [weak control] in
             control?.send(.hello(Hello(session: session, role: .control, display: display, features: features, appBuild: Self.ownBuild,
@@ -526,7 +542,7 @@ final class ClientModel: ObservableObject {
                             self.networkSymbol = "lock.shield"; self.networkDescription = "VPN connected"
                         case .cable:
                             self.usingCable = true
-                            self.networkSymbol = "cable.connector"; self.networkDescription = "USB cable connected"
+                            self.networkSymbol = "cable.connector"; self.networkDescription = "Cable connected"
                         case .wireless: break
                         }
                     }
@@ -544,6 +560,12 @@ final class ClientModel: ObservableObject {
                     }
                     if agreed & StreamFeature.fileTransfer != 0 { self.openFiles(endpoint: endpoint, credential: credential, session: session) }
                     if agreed & StreamFeature.audio != 0, self.playMacSound { self.openAudio(endpoint: endpoint, credential: credential, session: session) }
+                    // The Mac agreed to video over UDP: open the flow to the address this session is already using.
+                    if agreed & StreamFeature.datagramVideo != 0, let remote = control?.connection.currentPath?.remoteEndpoint,
+                       case .hostPort(let host, _) = remote, let port = NWEndpoint.Port(rawValue: DeskNetwork.datagramPort) {
+                        let flow = NWConnection(host: host, port: port, using: DeskNetwork.datagramParameters(credentials: [credential]))
+                        videoQueue.async { [weak order] in order?.attach(flow, session: session) }
+                    }
                     // No key of this iPad's own for that Mac yet (or the Mac no longer accepts it): ask for one.
                     if agreed & StreamFeature.deviceKeys != 0, let host = info.hostID,
                        self.deviceKeyRefused || Self.deviceCredential(host: host) == nil {
@@ -600,11 +622,23 @@ final class ClientModel: ObservableObject {
             } catch { self.endSession(reason: error.localizedDescription) }
             }
         }
-        video.onPacket = { [weak video, weak control] packet in
+        video.onPacket = { [weak video, weak order] packet in
+            guard packet.kind == .video, packet.payload.count >= 8 else { video?.close(reason: "Expected a video frame."); return }
+            order?.insertReliable(frame: packet.payload.integer(at: 0, as: UInt64.self), bytes: packet.payload)
+        }
+        order.onReady = { [weak self] in
+            DispatchQueue.main.async { guard let self, self.token == session else { return }; self.videoPath = "udp" }
+        }
+        order.onStopped = { [weak self, weak control] reason in
+            // UDP did not come up, or stopped: the Mac sends everything outstanding over TCP and carries on there.
+            control?.send(.datagramVideoStopped)
+            control?.send(.clientStats("video over UDP stopped: " + String((reason ?? "closed").prefix(200))))
+            DispatchQueue.main.async { guard let self, self.token == session else { return }; self.videoPath = "tcp" }
+        }
+        order.onFrame = { [weak video, weak control] _, payload in
             do {
-                guard packet.kind == .video else { throw DeskError.invalid("Expected a video frame.") }
                 let received = monotonicNanos()
-                let frame = try VideoFrame(data: packet.payload)
+                let frame = try VideoFrame(data: payload)
                 // Hidden in the background (no decoding allowed), or waiting for the keyframe after resuming.
                 if gate.paused || (gate.needKeyframe && !frame.keyframe) { control?.send(.frameAck(frame.sequence)); return }
                 gate.needKeyframe = false
@@ -612,8 +646,9 @@ final class ClientModel: ObservableObject {
                     switch result {
                     case .success(let image):
                         let macMS = frame.encodeTime >= frame.captureTime ? Double(frame.encodeTime - frame.captureTime) / 1_000_000 : nil
-                        mailbox.put(DecodedImage(pixels: image, sequence: frame.sequence, receivedAt: received, afterIdle: frame.afterIdle, macMS: macMS),
-                                    bytes: packet.payload.count, decodeMS: Double(monotonicNanos() - received) / 1_000_000)
+                        mailbox.put(DecodedImage(pixels: image, sequence: frame.sequence, receivedAt: received, afterIdle: frame.afterIdle, macMS: macMS,
+                                                 captureTime: frame.captureTime),
+                                    bytes: payload.count, decodeMS: Double(monotonicNanos() - received) / 1_000_000)
                         control?.send(.frameAck(frame.sequence))
                     case .failure(let error): video?.close(reason: error.localizedDescription)
                     }
@@ -711,6 +746,8 @@ final class ClientModel: ObservableObject {
         if !keepDeadline, autoDeadline != nil { clearAutoDeadline() }
         heartbeat?.invalidate(); heartbeat = nil
         pinger?.cancel(); pinger = nil
+        if let order = videoOrder, let queue = videoQueue { queue.async { order.onStopped = nil; order.detach() } }
+        videoOrder = nil; videoPath = "tcp"
         control?.close(); video?.close(); control = nil; video = nil
         videoQueue = nil; videoGate = nil; decoder = nil; activeTarget = nil; activeCredential = nil
         clipboard = nil; localCursorActive = false
@@ -1147,7 +1184,7 @@ final class ClientModel: ObservableObject {
         if statsTick % 2 == 0, (info?.features ?? 0) & StreamFeature.clientStatsLog != 0 {
             let note = drawNote?() ?? ""
             control?.send(.clientStats(StatisticsText.logLine(values, link: usingCable ? "cable" : usingVPN ? "vpn" : networkSymbol)
-                                       + (note.isEmpty ? "" : " " + note)))
+                                       + " video=" + videoPath + (note.isEmpty ? "" : " " + note)))
         }
         #if targetEnvironment(simulator)
         stats.metrics = "SIMULATOR (GPU completion only) · " + stats.metrics

@@ -3,7 +3,8 @@ import CoreGraphics
 import CoreVideo
 import Metal
 
-/// Draws a decoded 4:2:0 video-range BT.709 frame straight to a Metal target: one textured quad, no intermediate images.
+/// Draws a decoded two-plane video-range BT.709 frame (4:2:0, or 4:4:4 with a full-size colour plane) straight to a
+/// Metal target: one textured quad, no intermediate images.
 /// The previous Core Image path cost roughly 20 ms per frame on the iPad's main thread, which capped the stream near 50 FPS.
 public final class YUVMetalRenderer {
     private let pipeline: MTLRenderPipelineState

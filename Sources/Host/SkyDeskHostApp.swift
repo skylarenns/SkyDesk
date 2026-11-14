@@ -286,7 +286,7 @@ private struct HostView: View {
             Toggle(isOn: $host.autoAccept) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Turn on automatically when my iPad connects")
-                    Text("Only an iPad with the password below can do this. Works whenever SkyDesk is open.")
+                    Text("Only a paired iPad, or one with the password below, can do this. Works whenever SkyDesk is open.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }.toggleStyle(.switch).disabled(host.pairingLocked)
@@ -499,8 +499,10 @@ private struct HostView: View {
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 Toggle("Low-latency rate control (experimental)", isOn: $host.lowLatencyRateControl)
                 Text("Changes apply the next time the iPad connects.").font(.caption).foregroundStyle(.secondary)
-                Toggle("Keep this Mac awake while SkyDesk is ready (it won't sleep on its own)", isOn: $host.keepAwake)
             }.padding(.top, 8).disabled(host.clientConnected || host.busy)
+            // Applies at once, so it is not part of the group that waits for the next connection.
+            Toggle("Keep this Mac awake while SkyDesk is ready (it won't sleep on its own)", isOn: $host.keepAwake)
+                .frame(maxWidth: .infinity, alignment: .leading).padding(.top, 10)
         } label: { Text("Display & quality").font(.headline) }
     }
 }
@@ -513,7 +515,7 @@ private struct PasswordSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text("Change password").font(.title2.bold())
-            Text("Your iPad will ask for the new password once. Use at least \(PairingPassword.minimumLength) characters; longer and random is safer.")
+            Text("Paired iPads keep working with their own key. An iPad that has not paired yet needs the new password. Use at least \(PairingPassword.minimumLength) characters; longer and random is safer.")
                 .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             TextField("New password", text: $text).textFieldStyle(.roundedBorder)
                 .font(.system(.title3, design: .monospaced)).onSubmit(save)

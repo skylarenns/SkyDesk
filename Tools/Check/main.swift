@@ -105,7 +105,9 @@ final class SmokeCheck {
         let result: [String: Any] = [
             "result": "passed", "frames": count, "width": width, "height": height,
             "hardwareEncode": encoder.hardwareAccelerated, "hardwareDecode": decoder.hardwareAccelerated,
-            "tls": "TLS 1.2 PSK AES-128-GCM loopback", "lowLatencyRateControl": lowLatency,
+            "tls": client?.negotiatedSuite == DeskNetwork.forwardSecretSuite ? "TLS 1.2 ECDHE-PSK ChaCha20-Poly1305 loopback (forward secret)"
+                                                                               : "TLS 1.2 PSK AES-128-GCM loopback",
+            "lowLatencyRateControl": lowLatency,
             "encodeP50MS": percentile(encodeTimes, 0.5), "encodeP95MS": percentile(encodeTimes, 0.95),
             "decodeP50MS": percentile(decodeTimes, 0.5), "decodeP95MS": percentile(decodeTimes, 0.95),
             "encodeTransportDecodeP95MS": percentile(roundTripTimes, 0.95),

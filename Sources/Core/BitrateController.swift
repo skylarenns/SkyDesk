@@ -23,9 +23,13 @@ public struct BitrateController: Equatable {
         public var deliveredBytes: Int
         /// The network round trip the iPad last measured with its own small pings, if known.
         public var roundTripMS: Double?
-        public init(seconds: Double, transitMS: Double, acknowledged: Int, backlogBytes: Int, deliveredBytes: Int, roundTripMS: Double? = nil) {
+        /// Video over UDP only: the share of datagrams that had to be sent again in the interval.
+        public var resentShare: Double?
+        public init(seconds: Double, transitMS: Double, acknowledged: Int, backlogBytes: Int, deliveredBytes: Int, roundTripMS: Double? = nil,
+                    resentShare: Double? = nil) {
             self.seconds = seconds; self.transitMS = transitMS; self.acknowledged = acknowledged
             self.backlogBytes = backlogBytes; self.deliveredBytes = deliveredBytes; self.roundTripMS = roundTripMS
+            self.resentShare = resentShare
         }
     }
     public static let floor = 1_500_000
@@ -49,6 +53,7 @@ public struct BitrateController: Equatable {
     /// path that has just become slow looks like queueing for a moment; real queueing lasts.
     private var lateFor = 0.0
     public static let lateBeforeCutting = 1.5
+    public static let heavyLoss = 0.12
     private var grace = 0.0
 
     public init(maximum: Int) {
@@ -75,7 +80,10 @@ public struct BitrateController: Equatable {
                 baseline = min(queued, usual * (1 + 0.01 * seconds))
             } else { baseline = queued }
         }
-        lateFor = late ? lateFor + seconds : 0
+        // Over UDP nothing holds the sender back, so a link that drops a large share of what is sent is itself the
+        // sign that too much is being sent. (A few percent is ordinary Wi-Fi and is simply repaired.)
+        let lossy = (sample.resentShare ?? 0) >= Self.heavyLoss
+        lateFor = late || lossy ? lateFor + seconds : 0
         let delayed = lateFor >= Self.lateBeforeCutting
         let backlogSeconds = Double(max(0, sample.backlogBytes)) * 8 / Double(target)
         // One reading above a quarter second can be a single large frame caught mid-send; two in a row cannot.
@@ -94,7 +102,8 @@ public struct BitrateController: Equatable {
             sinceTrouble = 0
             guard next < target else { return nil }
             reason = backedUp ? String(format: "%.1f s of video waiting to be sent", backlogSeconds)
-                              : String(format: "frames queueing %.0f ms instead of the usual %.0f ms", queued, baseline ?? 0)
+                : lossy && !late ? String(format: "%.0f%% of the video had to be sent twice", (sample.resentShare ?? 0) * 100)
+                : String(format: "frames queueing %.0f ms instead of the usual %.0f ms", queued, baseline ?? 0)
             target = next; sinceCut = 0
             return target
         }

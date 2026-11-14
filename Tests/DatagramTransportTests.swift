@@ -1,5 +1,7 @@
 import XCTest
 import Network
+import CoreVideo
+import CoreMedia
 @testable import SkyDeskCore
 
 /// Forwards UDP between the iPad side and the Mac side of a test, losing a share of the datagrams on the way.
@@ -143,6 +145,103 @@ final class DatagramTransportTests: XCTestCase {
         XCTAssertEqual(result.frames, Array(1...200))
         XCTAssertGreaterThan(result.viaFallback, 100)
     }
+
+    #if os(macOS)
+    /// The real thing on one Mac: hardware-encoded video at the iPad's resolution, 120 frames a second, through
+    /// encrypted UDP that loses 2 % of its datagrams, reassembled and hardware-decoded. Includes a megabyte
+    /// keyframe sent over UDP mid-stream (what happens when the iPad returns from the background).
+    func testRealEncodedVideoSurvivesLossyUDPAndDecodes() throws {
+        let width = 2_752, height = 2_064, total: UInt64 = 300
+        let encoder: HEVCEncoder
+        do { encoder = try HEVCEncoder(width: width, height: height, fps: 120, bitrate: 25_000_000) }
+        catch { throw XCTSkip("Hardware HEVC encoding is unavailable here: \(error.localizedDescription)") }
+        // Scrolling text-like stripes: every frame differs from the last.
+        let images: [CVPixelBuffer] = (0..<8).map { step in
+            var buffer: CVPixelBuffer?
+            CVPixelBufferCreate(nil, width, height, kCVPixelFormatType_32BGRA, [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &buffer)
+            let pixels = buffer!
+            CVPixelBufferLockBaseAddress(pixels, [])
+            let base = CVPixelBufferGetBaseAddress(pixels)!.assumingMemoryBound(to: UInt8.self), stride = CVPixelBufferGetBytesPerRow(pixels)
+            for row in 0..<height {
+                let dark = ((row + step * 6) / 12) % 2 == 0
+                memset(base + row * stride, dark ? 40 : 235, stride)
+                if dark { var x = (row * 7) % 40; while x < width - 12 { memset(base + row * stride + x * 4, 235, 24); x += 40 } }
+            }
+            CVPixelBufferUnlockBaseAddress(pixels, [])
+            return pixels
+        }
+        let credential = PairingCredential.password(try PairingKey())
+        let session = UUID()
+        let macQueue = DispatchQueue(label: "skydesk.test.mac.video"), padQueue = DispatchQueue(label: "skydesk.test.pad.video")
+        let parameters = DeskNetwork.datagramParameters(credentials: [credential])
+        parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: .any)
+        let listener = try NWListener(using: parameters)
+        let listening = expectation(description: "listening"), active = expectation(description: "UDP accepted")
+        let finished = expectation(description: "all frames decoded")
+        listener.stateUpdateHandler = { if case .ready = $0 { listening.fulfill() } }
+        var sender: VideoDatagramSender?
+        let receiver = VideoDatagramReceiver(queue: padQueue)
+        let decoder = HEVCDecoder()
+        let relay = LossyRelay(); relay.loss = 0.02
+        let lock = NSLock()
+        var decoded: [UInt64] = [], problems: [String] = [], sentAt: [UInt64: UInt64] = [:], transit: [Double] = [], largest = 0
+        listener.newConnectionHandler = { connection in
+            let made = VideoDatagramSender(connection: connection, queue: macQueue)
+            made.onHello = { $0 == session }
+            made.onActive = { active.fulfill() }
+            made.onStopped = { reason, unsent in if reason != nil || !unsent.isEmpty { lock.withLock { problems.append("UDP stopped: \(reason ?? "?")") } } }
+            sender = made; made.start()
+        }
+        listener.start(queue: macQueue)
+        wait(for: [listening], timeout: 5)
+        let relayPort = try relay.start(towards: try XCTUnwrap(listener.port))
+        receiver.onFrame = { sequence, payload in
+            let arrived = monotonicNanos()
+            do {
+                let frame = try VideoFrame(data: payload)
+                try decoder.decode(frame) { result in
+                    lock.lock()
+                    if case .failure(let error) = result { problems.append("frame \(sequence): \(error.localizedDescription)") }
+                    decoded.append(sequence)
+                    if let sent = sentAt[sequence], sequence > 1 { transit.append(Double(arrived - sent) / 1_000_000) }
+                    let done = sequence == total
+                    lock.unlock()
+                    macQueue.async { sender?.acknowledge(sequence) }
+                    if done { finished.fulfill() }
+                }
+            } catch { lock.withLock { problems.append("frame \(sequence): \(error.localizedDescription)") }; if sequence == total { finished.fulfill() } }
+        }
+        padQueue.async {
+            receiver.attach(NWConnection(host: "127.0.0.1", port: relayPort, using: DeskNetwork.datagramParameters(credentials: [credential])), session: session)
+        }
+        wait(for: [active], timeout: 8)
+        for index in 1...total {
+            let moment = monotonicNanos()
+            encoder.encode(images[Int(index) % images.count], sequence: index, captureTime: moment, timestamp: CMTime(value: Int64(index), timescale: 120),
+                           forceKeyframe: index == 150) { result in
+                guard case .success(let frame) = result, let payload = try? frame.encoded() else { lock.withLock { problems.append("encode \(index)") }; return }
+                lock.withLock { sentAt[index] = monotonicNanos(); largest = max(largest, payload.count) }
+                // The opening keyframe travels over TCP in a real session; everything after it over UDP.
+                if index == 1 { padQueue.async { receiver.insertReliable(frame: 1, bytes: payload) } }
+                else { sender?.send(frame: index, bytes: payload) }
+            }
+            Thread.sleep(forTimeInterval: 1.0 / 120)
+        }
+        encoder.flush()
+        wait(for: [finished], timeout: 30)
+        decoder.flush()
+        padQueue.sync { receiver.detach() }
+        sender?.close(); listener.cancel(); relay.stop()
+        lock.lock(); defer { lock.unlock() }
+        XCTAssertEqual(problems, [])
+        XCTAssertEqual(decoded, Array(1...total), "every frame decoded, in order")
+        XCTAssertGreaterThan(relay.dropped, 20)
+        XCTAssertGreaterThan(largest, 200_000, "the forced keyframe should be large")
+        let sorted = transit.sorted()
+        print(String(format: "Real HEVC over lossy encrypted UDP (2%% loss, loopback): %d frames, %d datagrams dropped, largest frame %d kB, encoded→reassembled median %.1f ms, 99th %.1f ms, worst %.1f ms",
+                     decoded.count, relay.dropped, largest / 1_000, sorted[sorted.count / 2], sorted[Int(Double(sorted.count) * 0.99)], sorted.last ?? 0))
+    }
+    #endif
 
     func testTheWrongKeyNeverGetsAUDPFlow() throws {
         let parameters = DeskNetwork.datagramParameters(credentials: [.password(try PairingKey())])

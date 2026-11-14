@@ -72,6 +72,9 @@ public final class StreamStatistics {
         public var totalAverageMS: Double?
         public var totalHigh1MS: Double?
         public var pictureAverageMS: Double?
+        /// How much later than its spacing on the Mac a frame appeared (see `recordPresented`).
+        public var lateAverageMS: Double?
+        public var lateHigh1MS: Double?
         public var decodeAverageMS: Double?
         /// Frames that finished arriving in the last second, whether or not they reached the screen.
         public var arrivedFPS = 0.0
@@ -85,6 +88,8 @@ public final class StreamStatistics {
     private var display = RollingSamples(span: StreamStatistics.tailSpan)
     private var total = RollingSamples(span: StreamStatistics.tailSpan)
     private var picture = RollingSamples(span: StreamStatistics.averageSpan)
+    private var lateness = RollingSamples(span: StreamStatistics.tailSpan)
+    private var lastCapture: UInt64?
     private var rtt = RollingSamples(span: StreamStatistics.tailSpan)
     private var lastPresented: UInt64?
     private var lastPong: UInt64?
@@ -96,8 +101,19 @@ public final class StreamStatistics {
     }
     /// `time` is when the frame reached the screen; `afterIdle` marks a frame that followed a pause in Mac screen updates.
     /// `macMS`: the frame's capture→encoded time on the Mac, when known; it feeds the total estimate.
-    public func recordPresented(at time: UInt64, receivedAt: UInt64, afterIdle: Bool, macMS: Double? = nil) {
+    /// `captureTime`: when the Mac captured the frame, on the Mac's clock. Only differences between two frames'
+    /// capture times are used, so the two clocks never need to agree. If the Mac captured two frames 25 ms apart
+    /// and they appear 60 ms apart, the second was delivered 35 ms late: that is delivery stutter, whatever the
+    /// screen content was doing. (The 1% low cannot tell that from a screen that simply changed slowly.)
+    public func recordPresented(at time: UInt64, receivedAt: UInt64, afterIdle: Bool, macMS: Double? = nil, captureTime: UInt64? = nil) {
         lock.lock(); defer { lock.unlock() }
+        if let captureTime {
+            if let lastCapture, let lastPresented, captureTime > lastCapture, time > lastPresented {
+                let late = (Double(time - lastPresented) - Double(captureTime - lastCapture)) / 1_000_000
+                lateness.add(max(0, late), at: time)
+            }
+            lastCapture = captureTime
+        }
         presented.add(1, at: time)
         if time >= receivedAt {
             let local = Double(time - receivedAt) / 1_000_000
@@ -138,6 +154,8 @@ public final class StreamStatistics {
         value.totalAverageMS = total.mean(last: Self.averageSpan, now: now)
         value.totalHigh1MS = total.percentile(0.99, now: now, minimumSamples: minimum)
         value.pictureAverageMS = picture.mean(now: now)
+        value.lateAverageMS = lateness.mean(last: Self.averageSpan, now: now)
+        value.lateHigh1MS = lateness.percentile(0.99, now: now, minimumSamples: minimum)
         value.decodeAverageMS = decode.mean(now: now)
         value.arrivedFPS = Double(received.recent(now: now).count) / (Double(Self.rateSpan) / 1_000_000_000)
         return value
@@ -159,8 +177,8 @@ public enum StatisticsText {
         "Picture delay  avg \(milliseconds(s.pictureAverageMS)) · Click to screen  avg \(milliseconds(s.totalAverageMS)) · 1% high \(milliseconds(s.totalHigh1MS))"
     }
     public static func pipeline(_ s: StreamStatistics.Snapshot) -> String {
-        String(format: "Arrived %.0f FPS · Decode avg %@ · Local display avg %@", s.arrivedFPS, milliseconds(s.decodeAverageMS),
-               milliseconds(s.displayAverageMS))
+        String(format: "Arrived %.0f FPS · Decode avg %@ · Local display avg %@ · Late avg %@ · 1%% high %@", s.arrivedFPS,
+               milliseconds(s.decodeAverageMS), milliseconds(s.displayAverageMS), milliseconds(s.lateAverageMS), milliseconds(s.lateHigh1MS))
     }
     /// The small fixed readout in the corner of the stream: bitrate received, click-to-screen delay, build.
     public static func corner(_ s: StreamStatistics.Snapshot, build: Int) -> String {
@@ -170,9 +188,10 @@ public enum StatisticsText {
     /// One compact line for the host's diagnostic log.
     public static func logLine(_ s: StreamStatistics.Snapshot, link: String) -> String {
         func n(_ v: Double?) -> String { v.map { String(format: "%.1f", $0) } ?? "-" }
-        return String(format: "shown=%.0f low1=%@ arrived=%.0f mbps=%.1f rtt=%@/%@ display=%@/%@ total=%@/%@ decode=%@ link=%@",
+        return String(format: "shown=%.0f low1=%@ arrived=%.0f mbps=%.1f rtt=%@/%@ display=%@/%@ total=%@/%@ decode=%@ late=%@/%@ link=%@",
                       s.fps, n(s.fpsLow1), s.arrivedFPS, s.megabitsPerSecond, n(s.rttAverageMS), n(s.rttHigh1MS),
-                      n(s.displayAverageMS), n(s.displayHigh1MS), n(s.totalAverageMS), n(s.totalHigh1MS), n(s.decodeAverageMS), link)
+                      n(s.displayAverageMS), n(s.displayHigh1MS), n(s.totalAverageMS), n(s.totalHigh1MS), n(s.decodeAverageMS),
+                      n(s.lateAverageMS), n(s.lateHigh1MS), link)
     }
     /// The average round trip (ms) from a `logLine`; nil when the line has none yet. The Mac's bitrate control
     /// reads it to tell a slow network path from video queueing up behind a slow link.
@@ -184,7 +203,9 @@ public enum StatisticsText {
     public static let explanation = "Avg: last 2 s. 1% high/low: 99th percentile of the last 10 s, shown once 100 samples exist. "
         + "1% low skips pauses where the Mac screen was not changing. RTT: network round trip, 20 samples/s. "
         + "Picture delay: Mac capture and encoding + half the round trip (a frame travels one way) + iPad display. "
-        + "Click to screen adds the other half, for your input travelling to the Mac first."
+        + "Click to screen adds the other half, for your input travelling to the Mac first. "
+        + "Late: how much later a frame appeared than its spacing on the Mac; this is delivery stutter, unlike the 1% low, "
+        + "which also counts a screen that simply changed slowly."
 }
 
 /// Append-only diagnostic log (~/Library/Logs/SkyDesk/stream-metrics.log on the Mac). Numbers only, no screen content.

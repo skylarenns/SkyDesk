@@ -105,6 +105,9 @@ public enum StreamFeature {
     public static let chroma444 = 2_048
     /// The Mac issues each iPad its own key (`deviceKeyRequest` / `deviceKey`) and lists paired iPads.
     public static let deviceKeys = 4_096
+    /// Video may travel as encrypted UDP datagrams (DatagramVideo.swift) once the iPad's UDP flow is accepted;
+    /// TCP carries it until then and again if UDP stops getting through.
+    public static let datagramVideo = 8_192
 }
 
 public struct Hello: Codable {
@@ -263,6 +266,8 @@ public enum ControlMessage: Codable {
     /// iPad → Mac, only with StreamFeature.deviceKeys, answered by `deviceKey`.
     case deviceKeyRequest(DeviceKeyRequest)
     case deviceKey(DeviceKeyGrant)
+    /// iPad → Mac, only with StreamFeature.datagramVideo: the iPad's UDP flow has stopped; send video over TCP.
+    case datagramVideoStopped
     /// Audio channel only, Mac → iPad: how the sound that follows is encoded.
     case audioFormat(AudioStreamInfo)
     /// Audio channel only, iPad → Mac: whether the iPad is playing the Mac's sound right now. The Mac silences

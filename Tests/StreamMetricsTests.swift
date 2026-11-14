@@ -179,7 +179,7 @@ final class TotalLatencyTests: XCTestCase {
         // The picture itself only made the one-way trip: 12 + 4 + 16.
         XCTAssertEqual(value.pictureAverageMS ?? 0, 32, accuracy: 0.01)
         XCTAssertEqual(StatisticsText.total(value), "Picture delay  avg 32.0 ms · Click to screen  avg 36.0 ms · 1% high 36.0 ms")
-        XCTAssertTrue(StatisticsText.pipeline(value).hasSuffix("Local display avg 16.0 ms"))
+        XCTAssertTrue(StatisticsText.pipeline(value).contains("Local display avg 16.0 ms · Late avg"))
         // No RTT yet or no Mac timing: no total sample rather than a misleading one.
         let fresh = StreamStatistics()
         fresh.recordPresented(at: 20 * ms, receivedAt: 4 * ms, afterIdle: false, macMS: 12)
@@ -215,5 +215,46 @@ final class CornerReadoutTests: XCTestCase {
         XCTAssertEqual(StatisticsText.corner(values, build: 34), "1.5 mb/s · 40 ms · v34")
         values.megabitsPerSecond = 23.96; values.totalAverageMS = nil
         XCTAssertEqual(StatisticsText.corner(values, build: 35), "24.0 mb/s · — ms · v35")
+    }
+}
+
+final class DeliveryLatenessTests: XCTestCase {
+    private let ms: UInt64 = 1_000_000
+
+    func testFramesShownWithTheirMacSpacingAreNotLateHoweverSlowlyTheScreenChanged() {
+        let stats = StreamStatistics()
+        // The Mac's screen changed every 90 ms (a slow animation). The 1% low calls that 11 FPS; nothing was late.
+        var capture: UInt64 = 5_000 * ms, shown: UInt64 = 9_000 * ms       // two unrelated clocks
+        for _ in 0..<150 {
+            stats.recordPresented(at: shown, receivedAt: shown - 10 * ms, afterIdle: false, captureTime: capture)
+            capture += 90 * ms; shown += 90 * ms
+        }
+        let value = stats.snapshot(now: shown)
+        XCTAssertEqual(value.lateAverageMS ?? -1, 0, accuracy: 0.001)
+        XCTAssertEqual(value.lateHigh1MS ?? -1, 0, accuracy: 0.001)
+        XCTAssertEqual(value.fpsLow1 ?? 0, 1_000.0 / 90, accuracy: 0.01)
+    }
+
+    func testAStalledDeliveryShowsAsLatenessOfThatSize() {
+        let stats = StreamStatistics()
+        var capture: UInt64 = 5_000 * ms, shown: UInt64 = 9_000 * ms
+        for index in 0..<300 {
+            // Every 100th frame is held up 70 ms on the way; the following frames catch up.
+            let held: UInt64 = index % 100 == 50 ? 70 * ms : 0
+            stats.recordPresented(at: shown + held, receivedAt: shown, afterIdle: false, captureTime: capture)
+            capture += 25 * ms; shown += 25 * ms
+        }
+        let value = stats.snapshot(now: shown)
+        XCTAssertEqual(value.lateHigh1MS ?? 0, 70, accuracy: 0.5)
+        // A frame shown early after a late one is not "negative lateness".
+        XCTAssertGreaterThanOrEqual(value.lateAverageMS ?? -1, 0)
+        XCTAssertTrue(StatisticsText.logLine(value, link: "wifi").contains(" late="))
+        XCTAssertNotNil(StatisticsText.roundTrip(fromLogLine: "x" + StatisticsText.logLine({ var v = value; v.rttAverageMS = 6; return v }(), link: "wifi")))
+    }
+
+    func testWithoutCaptureTimesNothingIsClaimed() {
+        let stats = StreamStatistics()
+        for index in 0..<120 { stats.recordPresented(at: UInt64(1_000 + index * 20) * ms, receivedAt: UInt64(990 + index * 20) * ms, afterIdle: false) }
+        XCTAssertNil(stats.snapshot(now: 4_000 * ms).lateAverageMS)
     }
 }

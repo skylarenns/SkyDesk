@@ -461,6 +461,7 @@ private struct StreamView: View {
                             Toggle("Sharpen text", isOn: $client.sharpenText)
                             Toggle("Sharper colour (4:4:4, more data)", isOn: $client.sharperColour)
                             Toggle("Show frames sooner (less delay)", isOn: $client.presentOnArrival)
+                            Toggle("Video over UDP (faster recovery)", isOn: $client.datagramVideo)
                             Toggle("Use USB cable when plugged in", isOn: $client.preferCable)
                             Section("SkyDesk build \(ClientModel.ownBuild)") { EmptyView() }
                         } label: { Label("Settings", systemImage: "gearshape") }

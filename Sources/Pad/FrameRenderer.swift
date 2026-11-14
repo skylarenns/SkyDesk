@@ -8,6 +8,8 @@ struct DecodedImage {
     var afterIdle = false
     /// Mac capture→encoded milliseconds for this frame (Mac clock), for the total estimate.
     var macMS: Double? = nil
+    /// When the Mac captured it (Mac clock): only compared with other frames' capture times.
+    var captureTime: UInt64? = nil
 }
 
 final class FrameMailbox {
@@ -37,7 +39,8 @@ final class FrameMailbox {
     }
     /// `time` shares the monotonic clock of `receivedAt` (mach absolute time).
     func didPresent(_ image: DecodedImage, at time: UInt64 = monotonicNanos()) {
-        statistics.recordPresented(at: time, receivedAt: image.receivedAt, afterIdle: image.afterIdle, macMS: image.macMS)
+        statistics.recordPresented(at: time, receivedAt: image.receivedAt, afterIdle: image.afterIdle, macMS: image.macMS,
+                                   captureTime: image.captureTime)
     }
 }
 

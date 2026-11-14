@@ -17,12 +17,31 @@ final class HostModel: ObservableObject {
     }
     @Published var busy = false
     @Published var displays: [SCDisplay] = []
-    @Published var displayID: UInt32 = 0
-    @Published var longestEdge = 2560
-    @Published var useiPadDesktop = true
-    @Published var fps = 120
-    @Published var bitrateMbps = 25
-    @Published var allowInput = true
+    // "Display & quality" choices are kept between launches (build 38): the host now starts at login and restarts
+    // itself after updates, and used to come back with the defaults every time.
+    @Published var displayID = UInt32(clamping: UserDefaults.standard.integer(forKey: "displayID")) {
+        didSet { UserDefaults.standard.set(Int(displayID), forKey: "displayID") }
+    }
+    @Published var longestEdge = HostModel.saved("longestEdge", among: [1920, 2560, 4096], default: 2560) {
+        didSet { UserDefaults.standard.set(longestEdge, forKey: "longestEdge") }
+    }
+    @Published var useiPadDesktop = UserDefaults.standard.object(forKey: "useiPadDesktop") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(useiPadDesktop, forKey: "useiPadDesktop") }
+    }
+    @Published var fps = HostModel.saved("fps", among: [30, 60, 120], default: 120) {
+        didSet { UserDefaults.standard.set(fps, forKey: "fps") }
+    }
+    @Published var bitrateMbps = HostModel.saved("bitrateMbps", among: [15, 25, 40, 60, 80], default: 25) {
+        didSet { UserDefaults.standard.set(bitrateMbps, forKey: "bitrateMbps") }
+    }
+    @Published var allowInput = UserDefaults.standard.object(forKey: "allowInput") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(allowInput, forKey: "allowInput") }
+    }
+    /// A saved number is only used if it is still one of the choices offered.
+    private static func saved(_ key: String, among choices: [Int], default fallback: Int) -> Int {
+        let value = UserDefaults.standard.integer(forKey: key)
+        return choices.contains(value) ? value : fallback
+    }
     @Published var allowClipboard = UserDefaults.standard.object(forKey: "allowClipboard") as? Bool ?? true {
         didSet { UserDefaults.standard.set(allowClipboard, forKey: "allowClipboard") }
     }
@@ -35,6 +54,12 @@ final class HostModel: ObservableObject {
     }
     private var audioChannel: SecureChannel?
     private var audio: HostAudio?
+    // MARK: Video over UDP (build 38)
+    private let router = VideoRouter()
+    private var datagramListener: NWListener?
+    private let datagramQueue = DispatchQueue(label: "skydesk.host.datagram", qos: .userInteractive)
+    /// UDP flows that have connected; one of them becomes the session's video path when it says hello.
+    private var datagramFlows: [ObjectIdentifier: VideoDatagramSender] = [:]
     // MARK: Paired iPads (build 37)
     /// iPads with their own key, most recently seen first.
     @Published private(set) var devices = PairedDeviceList.load(from: .standard)
@@ -75,7 +100,9 @@ final class HostModel: ObservableObject {
     private var knownPadBuild = UserDefaults.standard.integer(forKey: "knownPadBuild") {
         didSet { UserDefaults.standard.set(knownPadBuild, forKey: "knownPadBuild") }
     }
-    @Published var lowLatencyRateControl = false
+    @Published var lowLatencyRateControl = UserDefaults.standard.bool(forKey: "lowLatencyRateControl") {
+        didSet { UserDefaults.standard.set(lowLatencyRateControl, forKey: "lowLatencyRateControl") }
+    }
     /// Lower the bitrate when the network falls behind, back up to the Bitrate setting when it recovers (build 33).
     @Published var adaptiveBitrate = UserDefaults.standard.object(forKey: "adaptiveBitrate") as? Bool ?? true {
         didSet { UserDefaults.standard.set(adaptiveBitrate, forKey: "adaptiveBitrate") }
@@ -316,13 +343,49 @@ final class HostModel: ObservableObject {
         listenerGeneration = UUID()
         listenerRetry?.cancel(); listenerRetry = nil
         listener?.cancel(); listener = nil
+        datagramListener?.cancel(); datagramListener = nil
         listening = false
         updateAwake()
     }
+    /// The UDP twin of the listener: same port number, same credentials. If it cannot open, video simply stays on TCP.
+    private func openDatagramListener() {
+        guard datagramListener == nil, let port = NWEndpoint.Port(rawValue: DeskNetwork.datagramPort),
+              let listener = try? NWListener(using: DeskNetwork.datagramParameters(credentials: listenerCredentials), on: port) else { return }
+        listener.newConnectionHandler = { [weak self, weak listener] connection in
+            MainActor.assumeIsolated {
+                guard let self, let listener, self.datagramListener === listener else { connection.cancel(); return }
+                self.acceptDatagram(connection)
+            }
+        }
+        listener.stateUpdateHandler = { [weak self, weak listener] state in
+            guard case .failed(let error) = state else { return }
+            MainActor.assumeIsolated {
+                guard let self, let listener, self.datagramListener === listener else { return }
+                self.datagramListener = nil
+                MetricsLog.shared.append("host  UDP port unavailable (\(error.localizedDescription)); video stays on TCP")
+            }
+        }
+        datagramListener = listener
+        listener.start(queue: .main)
+    }
+    private func acceptDatagram(_ connection: NWConnection) {
+        guard datagramFlows.count < 6 else { connection.cancel(); return }
+        let sender = VideoDatagramSender(connection: connection, queue: datagramQueue)
+        let id = ObjectIdentifier(sender)
+        let router = router
+        sender.bitrate = { router.bitrate }
+        sender.onHello = { router.accepts($0) }
+        sender.onActive = { [weak sender] in if let sender { router.activate(sender) } }
+        sender.onStopped = { [weak self, weak sender] reason, unsent in
+            if let sender { router.stopped(sender, reason: reason, unsent: unsent) }
+            DispatchQueue.main.async { MainActor.assumeIsolated { self?.datagramFlows[id] = nil } }
+        }
+        datagramFlows[id] = sender
+        sender.start()
+    }
     private func openListener() {
-        guard listener == nil, let key else { return }
+        guard listener == nil, key != nil else { return }
         do {
-            _ = key
             listenerStale = false
             let listener = try NWListener(using: DeskNetwork.parameters(credentials: listenerCredentials), on: NWEndpoint.Port(rawValue: DeskNetwork.port)!)
             listener.service = NWListener.Service(name: Host.current().localizedName ?? "SkyDesk Mac", type: DeskNetwork.serviceType)
@@ -350,6 +413,7 @@ final class HostModel: ObservableObject {
             }
             self.listener = listener
             listener.start(queue: .main)
+            openDatagramListener()
         } catch { status = error.localizedDescription }
     }
     private func startTimer() {
@@ -378,6 +442,9 @@ final class HostModel: ObservableObject {
         cursorMonitor?.stop(); cursorMonitor = nil
         clipboardTimer?.invalidate(); clipboardTimer = nil; clipboard = nil
         bitrateTimer?.invalidate(); bitrateTimer = nil; bitrateController = nil
+        fastPath.bind(frameAcknowledged: nil)
+        router.end()
+        datagramFlows.values.forEach { $0.close() }
         audio?.stop(); audio = nil; audioChannel = nil
         fileRoute.set(nil, engine: nil)
         fileEngine?.close(reason: "The iPad disconnected."); fileEngine = nil; files = nil; filesReady = false
@@ -563,6 +630,9 @@ final class HostModel: ObservableObject {
                 // With password pairing off, an iPad may only renew its own key, never add another device.
                 guard passwordPairingActive || request.device == currentDevice else { return }
                 issueDeviceKey(request)
+            case .datagramVideoStopped:
+                guard clientFeatures & StreamFeature.datagramVideo != 0 else { throw DeskError.invalid("Unexpected transport message.") }
+                router.giveUp()
             case .gesture(let gesture):
                 guard clientFeatures & StreamFeature.gestures != 0, gesture.isValid else { throw DeskError.invalid("Invalid gesture.") }
                 if allowInput, capture != nil { input.handle(gesture) }
@@ -644,10 +714,15 @@ final class HostModel: ObservableObject {
                     if wants444 { MetricsLog.shared.append("host  4:4:4 is not available on this Mac's encoder; using 4:2:0") }
                     pipeline = try makePipeline(chroma444: false)
                 }
-                pipeline.onFrame = { [weak video] frame in
-                    do { video?.send(WirePacket(kind: .video, payload: try frame.encoded())) }
-                    catch { video?.close(reason: error.localizedDescription) }
+                // UDP only for the session that agreed to it; the router starts every session on TCP.
+                let datagrams = (pipeline.info.features ?? 0) & StreamFeature.datagramVideo != 0 && datagramListener != nil
+                router.onPathChange = { usingUDP, reason in
+                    MetricsLog.shared.append(usingUDP ? "host  video now over UDP" : "host  video back on TCP" + (reason.map { ": \($0)" } ?? ""))
                 }
+                router.begin(session: datagrams ? sessionID : nil, tcp: video, bitrate: pipeline.info.bitrate)
+                let router = router
+                fastPath.bind(frameAcknowledged: { router.acknowledge($0) })
+                pipeline.onFrame = { frame in router.send(frame) }
                 pipeline.onFailure = { [weak self] reason in
                     Task { @MainActor in
                         guard let self, self.generation == token, self.sessionID == sessionID else { return }
@@ -717,10 +792,12 @@ final class HostModel: ObservableObject {
         let before = controller.target
         let changed = controller.update(.init(seconds: seconds, transitMS: transit.meanMS, acknowledged: transit.count,
                                               backlogBytes: video?.backlogBytes ?? 0, deliveredBytes: transit.bytes,
-                                              roundTripMS: fastPath.roundTripMS()))
+                                              roundTripMS: fastPath.roundTripMS(), resentShare: router.resentShare))
+        router.measure()
         bitrateController = controller
         guard let changed else { return }
         capture.setBitrate(changed)
+        router.bitrate = changed
         // Every real cut is logged with its cause; the climb back only when it reaches the setting again.
         if Double(changed) < Double(before) * 0.95 {
             MetricsLog.shared.append(String(format: "host  bitrate %.1f → %.1f Mbps (%@)", Double(before) / 1e6, Double(changed) / 1e6, controller.reason))
@@ -876,6 +953,12 @@ final class HostModel: ObservableObject {
             host = "\(ip)".components(separatedBy: "%").first
         }
         guard let host else { control?.send(.failure("Wireless updates need a Wi-Fi (IPv4) connection.")); return }
+        // The update certificate only covers private addresses; on any other (some VPNs) the iPad would be sent
+        // to a server it can never trust and go round in circles asking for the certificate.
+        guard UpdateCertificates.allowed(host) else {
+            control?.send(.failure("Updates can't be installed over this connection (\(host) is not a private network address). Connect over your home network to update."))
+            return
+        }
         let addresses = Array(Set([host] + lanAddresses.map(\.address)))
         let session = sessionID
         // A second tap reuses the running server (opening the port twice failed with "address already in use").
@@ -959,6 +1042,9 @@ final class HostModel: ObservableObject {
         metrics = String(format: "%.0f capture / %.0f encoded FPS · %.0f skipped/s · %.1f ms encode · %.1f ms feedback · %d in-flight limit",
                          Double(stats.captured) / elapsed, Double(stats.frames) / elapsed, Double(stats.skipped) / elapsed, stats.encodeMS,
                          capture.window.feedbackMilliseconds, capture.window.currentLimit)
+        if router.usingUDP {
+            metrics += " · video over UDP" + (router.resentShare.map { $0 >= 0.005 ? String(format: " (%.1f%% sent twice)", $0 * 100) : "" } ?? "")
+        }
         if let controller = bitrateController, controller.target < controller.maximum {
             metrics += String(format: " · bitrate limited to %.1f Mbps by the network", Double(controller.target) / 1e6)
         }
