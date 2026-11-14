@@ -2,6 +2,7 @@ import AppKit
 import Combine
 import Network
 import ScreenCaptureKit
+import IOKit.pwr_mgt
 
 @MainActor
 final class HostModel: ObservableObject {
@@ -34,6 +35,30 @@ final class HostModel: ObservableObject {
     }
     private var audioChannel: SecureChannel?
     private var audio: HostAudio?
+    // MARK: Paired iPads (build 37)
+    /// iPads with their own key, most recently seen first.
+    @Published private(set) var devices = PairedDeviceList.load(from: .standard)
+    /// Off = only iPads already paired can connect; the password opens nothing. Needs at least one paired iPad.
+    @Published var allowPasswordPairing = UserDefaults.standard.object(forKey: "allowPasswordPairing") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(allowPasswordPairing, forKey: "allowPasswordPairing")
+            if oldValue != allowPasswordPairing { rebuildListener() }
+        }
+    }
+    /// Keep the Mac from going to sleep on its own while it is ready for the iPad (for use away from home).
+    @Published var keepAwake = UserDefaults.standard.bool(forKey: "keepAwake") {
+        didSet { UserDefaults.standard.set(keepAwake, forKey: "keepAwake"); updateAwake() }
+    }
+    private var awakeAssertion: IOPMAssertionID = 0
+    private var deviceKeys: [UUID: PairingKey] = [:]
+    private var listenerStale = false
+    /// The paired iPad in the current session, if it said who it is.
+    private var currentDevice: UUID?
+    /// Identifies this Mac to its paired iPads across all its addresses.
+    private let hostID: UUID = {
+        if let text = UserDefaults.standard.string(forKey: "hostID"), let id = UUID(uuidString: text) { return id }
+        let id = UUID(); UserDefaults.standard.set(id.uuidString, forKey: "hostID"); return id
+    }()
     /// Newest first; finished transfers stay listed until the next session.
     @Published var transfers: [FileTransferEngine.Progress] = []
     @Published var filesReady = false
@@ -128,7 +153,8 @@ final class HostModel: ObservableObject {
         guard !busy, key == nil else { return }
         busy = true
         let account = Self.passwordAccount
-        let result = await Task.detached(priority: .userInitiated) { () -> Result<(String, PairingKey), Error> in
+        let paired = devices.devices
+        let result = await Task.detached(priority: .userInitiated) { () -> Result<(String, PairingKey, [UUID: PairingKey]), Error> in
             do {
                 var text = try PairingStore.loadText(account: account, allowInteraction: allowInteraction)
                 if text == nil {
@@ -136,12 +162,17 @@ final class HostModel: ObservableObject {
                     try PairingStore.saveText(created, account: account, allowInteraction: allowInteraction)
                     text = created
                 }
-                return .success((text!, try PairingPassword.deriveKey(text!)))
+                var keys: [UUID: PairingKey] = [:]
+                for device in paired {
+                    if let key = (try? PairingStore.load(account: device.keychainAccount, allowInteraction: allowInteraction)) ?? nil { keys[device.id] = key }
+                }
+                return .success((text!, try PairingPassword.deriveKey(text!), keys))
             } catch { return .failure(error) }
         }.value
         busy = false
         switch result {
-        case .success(let (text, key)):
+        case .success(let (text, key, keys)):
+            deviceKeys = keys
             self.key = key; password = text; pairingLocked = false
             startTimer(); updateListener()
         case .failure:
@@ -213,6 +244,67 @@ final class HostModel: ObservableObject {
     func sleep() { asleep = true; shutdown() }
     func wake() { asleep = false; updateListener() }
     private var wantsListener: Bool { key != nil && !asleep && (sharing || autoAccept) }
+    /// Everything the listener accepts: each paired iPad's own key, and the password unless that is switched off.
+    /// With no paired iPad the password always works, so the Mac can never be left with no way in.
+    private var listenerCredentials: [PairingCredential] {
+        let own = devices.devices.compactMap { device in deviceKeys[device.id].map { PairingCredential.device(device.id, key: $0) } }
+        guard let key else { return own }
+        return (allowPasswordPairing || own.isEmpty ? [.password(key)] : []) + own
+    }
+    var passwordPairingActive: Bool { allowPasswordPairing || devices.devices.allSatisfy { deviceKeys[$0.id] == nil } }
+    /// A change to who may connect: the port reopens with the new set. A running session is not interrupted.
+    private func rebuildListener() {
+        guard listener != nil else { return }
+        closeListener(); updateListener()
+    }
+    /// Removes one paired iPad. It can only come back by pairing with the password again (if that is allowed).
+    func removeDevice(_ id: UUID) {
+        guard let removed = devices.remove(id) else { return }
+        devices.save(to: .standard)
+        deviceKeys[id] = nil
+        let account = removed.keychainAccount
+        Task.detached(priority: .utility) { PairingStore.delete(account: account) }
+        MetricsLog.shared.append("host  paired iPad removed")
+        if currentDevice == id, clientConnected { disconnect(); status = "\(removed.name) was removed and disconnected." }
+        rebuildListener()
+    }
+    private func issueDeviceKey(_ request: DeviceKeyRequest) {
+        guard let fresh = try? PairingKey() else { return }
+        let dropped = devices.record(request.device, name: request.name, at: Date())
+        devices.save(to: .standard)
+        dropped.forEach { deviceKeys[$0.id] = nil }
+        deviceKeys[request.device] = fresh
+        currentDevice = request.device
+        let account = PairedDevice(id: request.device, name: "", added: Date(), lastSeen: Date()).keychainAccount
+        let stale = dropped.map(\.keychainAccount)
+        let session = sessionID
+        Task {
+            let saved = await Task.detached(priority: .userInitiated) { () -> Bool in
+                stale.forEach { PairingStore.delete(account: $0) }
+                return (try? PairingStore.save(fresh, account: account)) != nil
+            }.value
+            guard saved else {
+                // Not stored, so not usable after a restart: forget it rather than hand out a key that will stop working.
+                deviceKeys[request.device] = nil; _ = devices.remove(request.device); devices.save(to: .standard)
+                MetricsLog.shared.append("host  could not store a key for the iPad; it keeps using the password")
+                return
+            }
+            // The new key is accepted from the next time the port reopens (when this session ends).
+            listenerStale = true
+            if sessionID == session { control?.send(.deviceKey(DeviceKeyGrant(device: request.device, host: hostID, key: fresh.data))) }
+            MetricsLog.shared.append("host  issued this iPad its own key")
+        }
+    }
+    private func updateAwake() {
+        let wanted = keepAwake && listening
+        if wanted, awakeAssertion == 0 {
+            var id: IOPMAssertionID = 0
+            if IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleSystemSleep as CFString, IOPMAssertionLevel(kIOPMAssertionLevelOn),
+                                           "SkyDesk is ready for the iPad" as CFString, &id) == kIOReturnSuccess { awakeAssertion = id }
+        } else if !wanted, awakeAssertion != 0 {
+            IOPMAssertionRelease(awakeAssertion); awakeAssertion = 0
+        }
+    }
     private func updateListener() {
         if wantsListener { openListener() } else { closeListener() }
         refreshStatus()
@@ -225,11 +317,14 @@ final class HostModel: ObservableObject {
         listenerRetry?.cancel(); listenerRetry = nil
         listener?.cancel(); listener = nil
         listening = false
+        updateAwake()
     }
     private func openListener() {
         guard listener == nil, let key else { return }
         do {
-            let listener = try NWListener(using: DeskNetwork.parameters(key: key), on: NWEndpoint.Port(rawValue: DeskNetwork.port)!)
+            _ = key
+            listenerStale = false
+            let listener = try NWListener(using: DeskNetwork.parameters(credentials: listenerCredentials), on: NWEndpoint.Port(rawValue: DeskNetwork.port)!)
             listener.service = NWListener.Service(name: Host.current().localizedName ?? "SkyDesk Mac", type: DeskNetwork.serviceType)
             let token = UUID(); listenerGeneration = token
             listener.newConnectionHandler = { [weak self] connection in
@@ -242,7 +337,7 @@ final class HostModel: ObservableObject {
                 Task { @MainActor in
                     guard let self, self.listenerGeneration == token else { return }
                     switch state {
-                    case .ready: self.listening = true; self.refreshStatus()
+                    case .ready: self.listening = true; self.refreshStatus(); self.updateAwake()
                     case .failed(let error):
                         // Usually the port is briefly busy after a relaunch: try again shortly.
                         self.closeListener(); self.status = "Couldn't open the network port (\(error.localizedDescription)). Retrying…"
@@ -301,6 +396,9 @@ final class HostModel: ObservableObject {
         }
         clientBuild = nil; offeredBuild = nil
         clientConnected = false
+        currentDevice = nil
+        // A key issued during the session starts working now.
+        if listenerStale { rebuildListener() }
         refreshStatus()
     }
     private func accept(_ connection: NWConnection) {
@@ -381,6 +479,10 @@ final class HostModel: ObservableObject {
                         knownPadBuild = build
                         MetricsLog.shared.append("host  iPad connected (build \(build))")
                     }
+                    if let device = hello.device, devices.contains(device), deviceKeys[device] != nil {
+                        devices.record(device, name: hello.deviceName, at: Date()); devices.save(to: .standard)
+                        currentDevice = device
+                    }
                     control = channel
                     fastPath.bind(control: channel.id)
                 case .video:
@@ -456,6 +558,11 @@ final class HostModel: ObservableObject {
             case .scrollMomentum(let vx, let vy):
                 guard clientFeatures & StreamFeature.scrollMomentum != 0, vx.isFinite, vy.isFinite else { throw DeskError.invalid("Invalid scroll.") }
                 if allowInput, capture != nil { input.startMomentum(velocity: CGPoint(x: vx, y: vy)) }
+            case .deviceKeyRequest(let request):
+                guard clientFeatures & StreamFeature.deviceKeys != 0 else { throw DeskError.invalid("Unexpected key request.") }
+                // With password pairing off, an iPad may only renew its own key, never add another device.
+                guard passwordPairingActive || request.device == currentDevice else { return }
+                issueDeviceKey(request)
             case .gesture(let gesture):
                 guard clientFeatures & StreamFeature.gestures != 0, gesture.isValid else { throw DeskError.invalid("Invalid gesture.") }
                 if allowInput, capture != nil { input.handle(gesture) }
@@ -550,7 +657,12 @@ final class HostModel: ObservableObject {
                 capture = pipeline
                 fastPath.bind(window: pipeline.window)
                 input.displayBounds = CGDisplayBounds(display.displayID)
-                control.send(.welcome(pipeline.info))
+                var welcome = pipeline.info
+                if (welcome.features ?? 0) & StreamFeature.deviceKeys != 0 { welcome.hostID = hostID }
+                control.send(.welcome(welcome))
+                if let suite = control.negotiatedSuite {
+                    MetricsLog.shared.append("host  connection secured with " + (suite == DeskNetwork.forwardSecretSuite ? "forward secrecy" : "the pre-37 key exchange"))
+                }
                 ContinuityLink.suspend()
                 try await pipeline.start()
                 guard generation == token, self.sessionID == sessionID else { await pipeline.stop(); return }

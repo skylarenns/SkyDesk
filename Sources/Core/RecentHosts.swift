@@ -8,9 +8,14 @@ public struct RecentHost: Codable, Equatable, Identifiable, Sendable {
     /// Bonjour service name, when the Mac was found nearby; survives DHCP address changes.
     public var serviceName: String?
     public var lastConnected: Date
-    public init(id: UUID = UUID(), address: String, name: String, serviceName: String? = nil, lastConnected: Date) {
+    /// Which Mac this address belongs to (build 37): the iPad's own key for that Mac is stored under it, so
+    /// every address of the same Mac uses the same key.
+    public var hostID: UUID?
+    public init(id: UUID = UUID(), address: String, name: String, serviceName: String? = nil, lastConnected: Date, hostID: UUID? = nil) {
         self.id = id; self.address = address; self.name = name; self.serviceName = serviceName; self.lastConnected = lastConnected
+        self.hostID = hostID
     }
+    public static func deviceKeyAccount(host: UUID) -> String { "pad-device:" + host.uuidString }
     /// Stores the derived 256-bit key, never the typed password.
     public var keychainAccount: String { "pad-v2:" + id.uuidString }
 }
@@ -30,7 +35,7 @@ public struct RecentHostList: Codable, Equatable, Sendable {
     /// Records a successful connection. Returns the stored entry and any entries pushed off the end
     /// (whose Keychain items the caller deletes).
     @discardableResult
-    public mutating func record(address: String, name: String, serviceName: String?, at date: Date) -> (entry: RecentHost, removed: [RecentHost]) {
+    public mutating func record(address: String, name: String, serviceName: String?, at date: Date, hostID: UUID? = nil) -> (entry: RecentHost, removed: [RecentHost]) {
         let clean = address.trimmingCharacters(in: .whitespacesAndNewlines)
         var entry: RecentHost
         if let index = entries.firstIndex(where: { Self.key($0.address) == Self.key(clean) }) {
@@ -39,8 +44,9 @@ public struct RecentHostList: Codable, Equatable, Sendable {
             entry.name = name.isEmpty ? entry.name : name
             entry.serviceName = serviceName ?? entry.serviceName
             entry.lastConnected = date
+            entry.hostID = hostID ?? entry.hostID
         } else {
-            entry = RecentHost(address: clean, name: name.isEmpty ? clean : name, serviceName: serviceName, lastConnected: date)
+            entry = RecentHost(address: clean, name: name.isEmpty ? clean : name, serviceName: serviceName, lastConnected: date, hostID: hostID)
         }
         entries.insert(entry, at: 0)
         let removed = Array(entries.dropFirst(Self.limit))

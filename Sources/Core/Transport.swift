@@ -97,15 +97,29 @@ public enum PairingStore {
 public enum DeskNetwork {
     public static let serviceType = "_skydesk._tcp"
     public static let port: UInt16 = 48772
-    public static func parameters(key: PairingKey) -> NWParameters {
+    /// TLS_ECDHE_PSK_WITH_CHACHA20_POLY1305_SHA256: the same pre-shared key proves who is connecting, and a fresh
+    /// Diffie-Hellman exchange per connection supplies the session keys, so a key that leaks later cannot decrypt
+    /// sessions recorded earlier (forward secrecy; build 37). Not in the SDK's named list; Apple's TLS accepts it
+    /// (Tests/PairedDeviceTests.swift connects with it).
+    public static let forwardSecretSuite: UInt16 = 0xCCAC
+    /// The suite of builds before 37, kept so either side can still talk to an older build.
+    public static let legacySuite = UInt16(TLS_PSK_WITH_AES_128_GCM_SHA256)
+    public static func parameters(key: PairingKey) -> NWParameters { parameters(credentials: [.password(key)]) }
+    /// A listener passes every credential it accepts; a connection passes the one it wants to use.
+    public static func parameters(credentials: [PairingCredential]) -> NWParameters {
         let tls = NWProtocolTLS.Options()
         let options = tls.securityProtocolOptions
         sec_protocol_options_set_min_tls_protocol_version(options, .TLSv12)
         sec_protocol_options_set_max_tls_protocol_version(options, .TLSv12)
-        sec_protocol_options_append_tls_ciphersuite(options, tls_ciphersuite_t(rawValue: UInt16(TLS_PSK_WITH_AES_128_GCM_SHA256))!)
-        let secret = key.data.withUnsafeBytes { DispatchData(bytes: $0) }
-        let identity = Data(PairingPassword.pskIdentity.utf8).withUnsafeBytes { DispatchData(bytes: $0) }
-        sec_protocol_options_add_pre_shared_key(options, secret as __DispatchData, identity as __DispatchData)
+        // Preference order: both sides on build 37+ agree on the forward-secret suite.
+        for suite in [forwardSecretSuite, legacySuite] {
+            if let value = tls_ciphersuite_t(rawValue: suite) { sec_protocol_options_append_tls_ciphersuite(options, value) }
+        }
+        for credential in credentials {
+            let secret = credential.key.data.withUnsafeBytes { DispatchData(bytes: $0) }
+            let identity = Data(credential.identity.utf8).withUnsafeBytes { DispatchData(bytes: $0) }
+            sec_protocol_options_add_pre_shared_key(options, secret as __DispatchData, identity as __DispatchData)
+        }
         let tcp = NWProtocolTCP.Options()
         tcp.noDelay = true
         tcp.enableKeepalive = true
@@ -117,8 +131,8 @@ public enum DeskNetwork {
         return parameters
     }
     /// Same security, restricted to a cable link (USB or Ethernet): never Wi-Fi or cellular.
-    public static func wiredParameters(key: PairingKey) -> NWParameters {
-        let parameters = parameters(key: key)
+    public static func wiredParameters(credential: PairingCredential) -> NWParameters {
+        let parameters = parameters(credentials: [credential])
         parameters.prohibitedInterfaceTypes = [.wifi, .cellular, .loopback]
         return parameters
     }
@@ -132,6 +146,11 @@ public final class SecureChannel {
     public var onReady: (() -> Void)?
     public var onPacket: ((WirePacket) -> Void)?
     public var onClose: ((String?) -> Void)?
+    /// The TLS cipher suite in use once the channel is ready (for the log and tests).
+    public var negotiatedSuite: UInt16? {
+        guard let metadata = connection.metadata(definition: NWProtocolTLS.definition) as? NWProtocolTLS.Metadata else { return nil }
+        return sec_protocol_metadata_get_negotiated_tls_ciphersuite(metadata.securityProtocolMetadata).rawValue
+    }
     private var parser = WireParser()
     private var closed = false
     private var ready = false

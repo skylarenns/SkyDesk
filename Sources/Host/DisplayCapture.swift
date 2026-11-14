@@ -77,6 +77,7 @@ final class DisplayCapture: NSObject, SCStreamOutput, SCStreamDelegate {
         if files, client & StreamFeature.fileTransfer != 0 { value |= StreamFeature.fileTransfer }
         if audio, client & StreamFeature.audio != 0 { value |= StreamFeature.audio }
         if chroma444, client & StreamFeature.chroma444 != 0 { value |= StreamFeature.chroma444 }
+        if client & StreamFeature.deviceKeys != 0 { value |= StreamFeature.deviceKeys }
         return value == 0 ? nil : value
     }
     func start() async throws { try await stream?.startCapture() }

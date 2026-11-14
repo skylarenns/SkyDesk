@@ -17,6 +17,12 @@ public final class ControlFastPath {
         return roundTrip.ms
     }
     public func bind(window: FrameWindow?) { lock.lock(); self.window = window; lock.unlock() }
+    /// Keeps the round trip from one of the iPad's statistics lines (separate from `handle` so tests never write
+    /// to the real log).
+    func note(statistics text: String, now: UInt64 = monotonicNanos()) {
+        guard let ms = StatisticsText.roundTrip(fromLogLine: text) else { return }
+        lock.lock(); roundTrip = (ms, now); lock.unlock()
+    }
     /// Only the established control channel is served here; everything else takes the validated main path.
     public func handle(_ message: ControlMessage, channel id: UUID, reply: (ControlMessage) -> Void) -> Outcome {
         lock.lock(); let isControl = controlID == id; let window = self.window; lock.unlock()
@@ -27,7 +33,7 @@ public final class ControlFastPath {
         case .clientStats(let text):
             if text.utf8.count <= 512 {
                 MetricsLog.shared.append("ipad  " + text)
-                if let ms = StatisticsText.roundTrip(fromLogLine: text) { lock.lock(); roundTrip = (ms, monotonicNanos()); lock.unlock() }
+                note(statistics: text)
             }
             return .handled
         default: return .pass

@@ -19,6 +19,8 @@ struct ConnectTarget {
     let key: PairingKey
     /// Only for nearby (Bonjour) Macs: try a USB/Ethernet route first.
     var cableFirst = false
+    /// This iPad's own key for that Mac, if it has been issued one (build 37). Preferred over the password key.
+    var device: PairingCredential? = nil
 }
 
 /// Asks several addresses at once whether SkyDesk answers there: a plain TCP connection to its port, closed at
@@ -164,7 +166,9 @@ final class ClientModel: ObservableObject {
             UserDefaults.standard.set(playMacSound, forKey: "playMacSound")
             guard oldValue != playMacSound, info != nil else { return }
             if playMacSound {
-                if soundOffered, let target = activeTarget { openAudio(endpoint: target.endpoint, key: target.key, session: token) }
+                if soundOffered, let target = activeTarget {
+                    openAudio(endpoint: target.endpoint, credential: activeCredential ?? .password(target.key), session: token)
+                }
                 else { notice = "This Mac isn't sending sound. Update SkyDesk on the Mac, or switch sound on in its Display & quality settings." }
             } else { closeAudio() }
         }
@@ -298,8 +302,22 @@ final class ClientModel: ObservableObject {
 
     private func target(for recent: RecentHost) -> ConnectTarget? {
         guard let key = credential(for: recent) ?? lastCredential, let endpoint = Self.endpoint(recent.address) else { return nil }
-        return ConnectTarget(endpoint: endpoint, label: recent.name, address: recent.address, serviceName: recent.serviceName, key: key)
+        return ConnectTarget(endpoint: endpoint, label: recent.name, address: recent.address, serviceName: recent.serviceName, key: key,
+                             device: recent.hostID.flatMap(Self.deviceCredential(host:)))
     }
+    /// This iPad's identifier in every Mac's list of paired iPads.
+    static let deviceID: UUID = {
+        if let text = UserDefaults.standard.string(forKey: "deviceID"), let id = UUID(uuidString: text) { return id }
+        let id = UUID(); UserDefaults.standard.set(id.uuidString, forKey: "deviceID"); return id
+    }()
+    private static func deviceCredential(host: UUID) -> PairingCredential? {
+        guard let key = (try? PairingStore.load(account: RecentHost.deviceKeyAccount(host: host))) ?? nil else { return nil }
+        return .device(deviceID, key: key)
+    }
+    /// What the current session's connections authenticate with.
+    private var activeCredential: PairingCredential?
+    /// The session had to fall back to the password although this iPad holds a key for that Mac: ask for a new one.
+    private var deviceKeyRefused = false
     static func endpoint(_ text: String) -> NWEndpoint? {
         var host = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !host.isEmpty else { return nil }
@@ -319,7 +337,8 @@ final class ClientModel: ObservableObject {
         if var target = target(for: recent) {
             // Prefer the Bonjour name when the Mac is visible nearby: it survives DHCP address changes.
             if let name = recent.serviceName, let nearby = hosts.first(where: { $0.name == name }) {
-                target = ConnectTarget(endpoint: nearby.endpoint, label: recent.name, address: recent.address, serviceName: name, key: target.key)
+                target = ConnectTarget(endpoint: nearby.endpoint, label: recent.name, address: recent.address, serviceName: name, key: target.key,
+                                       device: target.device)
             }
             start(target, automatic: false)
         } else {
@@ -329,9 +348,11 @@ final class ClientModel: ObservableObject {
     /// One tap on a nearby Mac.
     func connect(discovered host: DiscoveredHost) {
         guard !connecting, info == nil else { return }
-        let saved = recents.entry(serviceName: host.name).flatMap(credential(for:)) ?? lastCredential
+        let known = recents.entry(serviceName: host.name)
+        let saved = known.flatMap(credential(for:)) ?? lastCredential
         if let saved {
             var target = ConnectTarget(endpoint: host.endpoint, label: host.name, address: nil, serviceName: host.name, key: saved)
+            target.device = known?.hostID.flatMap(Self.deviceCredential(host:))
             target.cableFirst = preferCable
             start(target, automatic: false)
         } else {
@@ -373,7 +394,13 @@ final class ClientModel: ObservableObject {
     }
     func forget(_ recent: RecentHost) {
         var list = recents
-        if let removed = list.remove(id: recent.id) { PairingStore.delete(account: removed.keychainAccount) }
+        if let removed = list.remove(id: recent.id) {
+            PairingStore.delete(account: removed.keychainAccount)
+            // The iPad's own key for that Mac goes with its last remembered address.
+            if let host = removed.hostID, !list.entries.contains(where: { $0.hostID == host }) {
+                PairingStore.delete(account: RecentHost.deviceKeyAccount(host: host))
+            }
+        }
         recents = list; list.save(to: .standard)
     }
     /// Leaves the "Connecting" screen for the full connection screen.
@@ -420,17 +447,22 @@ final class ClientModel: ObservableObject {
     }
 
     /// A USB cable between the iPad and the Mac is a sub-millisecond link, so it is tried before Wi-Fi when enabled.
-    private func open(_ target: ConnectTarget, cableFirst: Bool) {
-        let key = target.key
+    private func open(_ target: ConnectTarget, cableFirst: Bool, passwordOnly: Bool = false) {
+        // This iPad's own key when it has one; the password key otherwise, or when the Mac refused the own key.
+        let credential = (passwordOnly ? nil : target.device) ?? .password(target.key)
+        let usingDeviceKey = credential.identity != PairingPassword.pskIdentity
+        activeCredential = credential
+        deviceKeyRefused = passwordOnly && target.device != nil
         let endpoint = target.endpoint
         let cableAttempt = cableFirst && target.serviceName != nil
-        let parameters = { cableAttempt ? DeskNetwork.wiredParameters(key: key) : DeskNetwork.parameters(key: key) }
+        let parameters = { cableAttempt ? DeskNetwork.wiredParameters(credential: credential) : DeskNetwork.parameters(credentials: [credential]) }
         let session = UUID(); token = session
         activeTarget = target
         // Time the app spent suspended is not a hang: restart the watchdog's clock for the new session
         // (it reported "29211 s" after a night asleep, 2026-11-13 08:40).
         Breadcrumb.heartbeat()
         let display = Self.currentDisplay()
+        let deviceName = UIDevice.current.name
         connecting = true; passwordNeeded = false; status = "Connecting to \(target.label)…"; notice = nil
         UIDevice.current.isBatteryMonitoringEnabled = true
         let monitor = NWPathMonitor()
@@ -461,11 +493,12 @@ final class ClientModel: ObservableObject {
         self.videoQueue = videoQueue; self.videoGate = gate; self.decoder = decoder
         var features = StreamFeature.idleGapFlags | StreamFeature.pauseVideo | StreamFeature.liveCursorToggle
             | StreamFeature.clipboardSync | StreamFeature.fileTransfer | StreamFeature.scrollMomentum | StreamFeature.remoteUpdate
-            | StreamFeature.gestures | StreamFeature.audio
+            | StreamFeature.gestures | StreamFeature.audio | StreamFeature.deviceKeys
         if localPointer { features |= StreamFeature.localCursor }
         if sharperColour, Self.canDecodeFullColour, !UserDefaults.standard.bool(forKey: Self.colourFailedKey) { features |= StreamFeature.chroma444 }
         control.onReady = { [weak control] in
-            control?.send(.hello(Hello(session: session, role: .control, display: display, features: features, appBuild: Self.ownBuild)))
+            control?.send(.hello(Hello(session: session, role: .control, display: display, features: features, appBuild: Self.ownBuild,
+                                       device: Self.deviceID, deviceName: deviceName)))
         }
         video.onReady = { [weak video] in video?.send(.hello(Hello(session: session, role: .video))) }
         let statistics = mailbox.statistics
@@ -509,8 +542,13 @@ final class ClientModel: ObservableObject {
                         self.pasteboardCountWhenLeft = nil
                         self.checkClipboard()
                     }
-                    if agreed & StreamFeature.fileTransfer != 0 { self.openFiles(endpoint: endpoint, key: key, session: session) }
-                    if agreed & StreamFeature.audio != 0, self.playMacSound { self.openAudio(endpoint: endpoint, key: key, session: session) }
+                    if agreed & StreamFeature.fileTransfer != 0 { self.openFiles(endpoint: endpoint, credential: credential, session: session) }
+                    if agreed & StreamFeature.audio != 0, self.playMacSound { self.openAudio(endpoint: endpoint, credential: credential, session: session) }
+                    // No key of this iPad's own for that Mac yet (or the Mac no longer accepts it): ask for one.
+                    if agreed & StreamFeature.deviceKeys != 0, let host = info.hostID,
+                       self.deviceKeyRefused || Self.deviceCredential(host: host) == nil {
+                        control?.send(.deviceKeyRequest(DeviceKeyRequest(device: Self.deviceID, name: deviceName)))
+                    }
                     UIApplication.shared.isIdleTimerDisabled = true
                     if AutoPadOnly.shouldStart(setting: self.startIPadOnly, supported: info.displayBlankingSupported == true) {
                         // A moment for the new iPad desktop to settle before it becomes the only display.
@@ -540,6 +578,12 @@ final class ClientModel: ObservableObject {
                 case .cursor(let cursor):
                     guard cursor.isValid else { throw DeskError.invalid("Invalid pointer image.") }
                     self.remoteCursor = cursor
+                case .deviceKey(let grant):
+                    guard grant.isValid, grant.device == Self.deviceID, let host = self.info?.hostID, grant.host == host else {
+                        throw DeskError.invalid("Unexpected key from the Mac.")
+                    }
+                    // Used from the next connection on; the password key stays saved as a fallback.
+                    try PairingStore.save(PairingKey(data: grant.key), account: RecentHost.deviceKeyAccount(host: host))
                 case .macDisplayBlanked(let blanked):
                     self.macDisplayBlanked = blanked; self.changingMacDisplay = false
                 case .updateAvailable(let build):
@@ -582,6 +626,12 @@ final class ClientModel: ObservableObject {
                 let neverConnected = self.info == nil
                 let fallBack = cableAttempt && neverConnected
                 let wrongPassword = reason == PairingPassword.mismatchMessage
+                // The Mac refused this iPad's own key (removed there, or not active yet): the password key is next.
+                if usingDeviceKey, neverConnected, wrongPassword {
+                    self.endSession(reason: nil, keepDeadline: true)
+                    self.open(target, cableFirst: false, passwordOnly: true)
+                    return
+                }
                 // An automatic attempt keeps trying until its deadline: Wi-Fi is often still waking up.
                 let retryDeadline = self.autoDeadline.flatMap { deadline in
                     neverConnected && !wrongPassword && Date() < deadline.addingTimeInterval(-0.8) ? deadline : nil
@@ -633,7 +683,7 @@ final class ClientModel: ObservableObject {
         guard let address, !address.isEmpty else { return }
         var list = recents
         let (entry, removed) = list.record(address: address, name: info.hostName ?? target.label,
-                                          serviceName: target.serviceName, at: Date())
+                                          serviceName: target.serviceName, at: Date(), hostID: info.hostID)
         removed.forEach { PairingStore.delete(account: $0.keychainAccount) }
         recents = list; list.save(to: .standard)
         UserDefaults.standard.set(address, forKey: "lastManualHost")
@@ -662,7 +712,7 @@ final class ClientModel: ObservableObject {
         heartbeat?.invalidate(); heartbeat = nil
         pinger?.cancel(); pinger = nil
         control?.close(); video?.close(); control = nil; video = nil
-        videoQueue = nil; videoGate = nil; decoder = nil; activeTarget = nil
+        videoQueue = nil; videoGate = nil; decoder = nil; activeTarget = nil; activeCredential = nil
         clipboard = nil; localCursorActive = false
         fileEngine?.close(reason: "Disconnected from the Mac."); fileEngine = nil
         files?.close(); files = nil; filesReady = false
@@ -968,10 +1018,10 @@ final class ClientModel: ObservableObject {
     // MARK: Sound
 
     /// A fourth connection that only carries the Mac's sound, so it never waits behind video or files.
-    private func openAudio(endpoint: NWEndpoint, key: PairingKey, session: UUID) {
+    private func openAudio(endpoint: NWEndpoint, credential: PairingCredential, session: UUID) {
         guard audioChannel == nil else { return }
         let queue = DispatchQueue(label: "skydesk.audio.net", qos: .userInteractive)
-        let channel = SecureChannel(connection: NWConnection(to: endpoint, using: DeskNetwork.parameters(key: key)), queue: queue,
+        let channel = SecureChannel(connection: NWConnection(to: endpoint, using: DeskNetwork.parameters(credentials: [credential])), queue: queue,
                                     maxPendingBytes: 64 * 1_024)
         let player = AudioPlayer()
         player.onPlaying = { [weak channel] in channel?.send(.audioPlaying($0)) }
@@ -1005,9 +1055,9 @@ final class ClientModel: ObservableObject {
 
     // MARK: Files
 
-    private func openFiles(endpoint: NWEndpoint, key: PairingKey, session: UUID) {
+    private func openFiles(endpoint: NWEndpoint, credential: PairingCredential, session: UUID) {
         let queue = DispatchQueue(label: "skydesk.files", qos: .utility)
-        let channel = SecureChannel(connection: NWConnection(to: endpoint, using: DeskNetwork.parameters(key: key)), queue: queue)
+        let channel = SecureChannel(connection: NWConnection(to: endpoint, using: DeskNetwork.parameters(credentials: [credential])), queue: queue)
         let engine = FileTransferEngine(directory: Self.documents, queue: DispatchQueue(label: "skydesk.files.engine", qos: .utility))
         engine.sendMessage = { [weak channel] in channel?.send($0) }
         engine.sendPacket = { [weak channel] packet, done in

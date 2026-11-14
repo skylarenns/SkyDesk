@@ -200,7 +200,7 @@ final class RoundTripReportTests: XCTestCase {
         let control = UUID()
         path.bind(control: control)
         XCTAssertNil(path.roundTripMS())
-        XCTAssertEqual(path.handle(.clientStats("shown=1 low1=- arrived=1 mbps=0.1 rtt=42.0/- display=1/-"), channel: control, reply: { _ in }), .handled)
+        path.note(statistics: "shown=1 low1=- arrived=1 mbps=0.1 rtt=42.0/- display=1/-")
         XCTAssertEqual(path.roundTripMS(), 42)
         XCTAssertNil(path.roundTripMS(maxAge: 3, now: monotonicNanos() + 4_000_000_000))
         path.bind(control: UUID())

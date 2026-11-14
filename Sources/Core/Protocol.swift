@@ -103,6 +103,8 @@ public enum StreamFeature {
     /// Full colour detail (HEVC 4:4:4 instead of 4:2:0): coloured text and thin coloured lines stay sharp.
     /// Offered by an iPad whose hardware can decode it, used by a Mac whose hardware can encode it.
     public static let chroma444 = 2_048
+    /// The Mac issues each iPad its own key (`deviceKeyRequest` / `deviceKey`) and lists paired iPads.
+    public static let deviceKeys = 4_096
 }
 
 public struct Hello: Codable {
@@ -113,8 +115,13 @@ public struct Hello: Codable {
     public let features: Int?
     /// The iPad app's build number (CFBundleVersion), so the Mac knows whether its staged update is newer.
     public let appBuild: Int?
-    public init(session: UUID, role: Role, display: ClientDisplay? = nil, features: Int? = nil, appBuild: Int? = nil) {
+    /// This iPad's own identifier and name, for the Mac's list of paired iPads. Absent from older builds.
+    public let device: UUID?
+    public let deviceName: String?
+    public init(session: UUID, role: Role, display: ClientDisplay? = nil, features: Int? = nil, appBuild: Int? = nil,
+                device: UUID? = nil, deviceName: String? = nil) {
         self.session = session; self.role = role; self.display = display; self.features = features; self.appBuild = appBuild
+        self.device = device; self.deviceName = deviceName.map { String($0.prefix(64)) }
     }
 }
 
@@ -174,6 +181,8 @@ public struct StreamInfo: Codable {
     public let features: Int?
     /// The Mac's name, shown in the iPad's recent list. Absent from older hosts.
     public let hostName: String?
+    /// Identifies this Mac across its addresses (build 37), so one device key serves them all.
+    public var hostID: UUID?
     public init(width: Int, height: Int, fps: Int, bitrate: Int, displayName: String, inputEnabled: Bool,
                 textInputEnabled: Bool? = nil, displayBlankingSupported: Bool? = nil, features: Int? = nil, hostName: String? = nil) {
         self.width = width; self.height = height; self.fps = fps; self.bitrate = bitrate
@@ -251,6 +260,9 @@ public enum ControlMessage: Codable {
     case updateCertificateRequest
     /// iPad → Mac, only with StreamFeature.gestures.
     case gesture(GestureEvent)
+    /// iPad → Mac, only with StreamFeature.deviceKeys, answered by `deviceKey`.
+    case deviceKeyRequest(DeviceKeyRequest)
+    case deviceKey(DeviceKeyGrant)
     /// Audio channel only, Mac → iPad: how the sound that follows is encoded.
     case audioFormat(AudioStreamInfo)
     /// Audio channel only, iPad → Mac: whether the iPad is playing the Mac's sound right now. The Mac silences

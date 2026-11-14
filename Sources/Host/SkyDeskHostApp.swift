@@ -230,6 +230,7 @@ private struct HostView: View {
                 statusCard
                 if host.clientConnected { filesCard }
                 pairingCard
+                devicesCard
                 settings
             }.padding(22)
         }
@@ -410,6 +411,37 @@ private struct HostView: View {
         .padding(16).frame(maxWidth: .infinity, alignment: .leading)
         .background(RoundedRectangle(cornerRadius: 14).stroke(.quaternary))
     }
+    private var devicesCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Paired iPads").font(.headline)
+            if host.devices.devices.isEmpty {
+                Text("None yet. An iPad gets its own key the first time it connects with the password (SkyDesk build 37 or later on the iPad).")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+            ForEach(host.devices.devices) { device in
+                HStack {
+                    Image(systemName: "ipad.landscape").foregroundStyle(.teal)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(device.name)
+                        Text("Last connected \(device.lastSeen.formatted(.relative(presentation: .named)))").font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("Remove", role: .destructive) { host.removeDevice(device.id) }
+                }
+            }
+            Toggle(isOn: $host.allowPasswordPairing) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Let new iPads pair with the password")
+                    Text(host.allowPasswordPairing
+                         ? "Paired iPads keep working if you change the password or switch this off. A removed iPad can pair again while this is on: change the password too if it shouldn't."
+                         : "Only the iPads listed above can connect. The password opens nothing.")
+                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+            }.toggleStyle(.switch).disabled(host.devices.devices.isEmpty || host.pairingLocked)
+        }
+        .padding(16).frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 14).stroke(.quaternary))
+    }
     private func copyButton(_ text: String, label: String) -> some View {
         Button {
             NSPasteboard.general.clearContents(); NSPasteboard.general.setString(text, forType: .string)
@@ -467,6 +499,7 @@ private struct HostView: View {
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 Toggle("Low-latency rate control (experimental)", isOn: $host.lowLatencyRateControl)
                 Text("Changes apply the next time the iPad connects.").font(.caption).foregroundStyle(.secondary)
+                Toggle("Keep this Mac awake while SkyDesk is ready (it won't sleep on its own)", isOn: $host.keepAwake)
             }.padding(.top, 8).disabled(host.clientConnected || host.busy)
         } label: { Text("Display & quality").font(.headline) }
     }
