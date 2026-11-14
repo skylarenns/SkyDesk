@@ -179,6 +179,88 @@ final class DatagramVideoTests: XCTestCase {
         XCTAssertEqual(send.piecesResent, 1)
     }
 
+    func testOneLostPieceOfAGroupIsRebuiltFromParityWithoutAsking() {
+        var send = DatagramSendBuffer()
+        send.parityGroup = 4
+        // 6 pieces: groups of 4 and 2; the last piece is short.
+        let bytes = Data((0..<(5 * DatagramPacket.payloadSize + 333)).map { UInt8(truncatingIfNeeded: $0 &* 31 &+ 7) })
+        XCTAssertTrue(send.add(frame: 1, bytes: bytes, now: 0))
+        var packets: [DatagramPacket] = []
+        while let packet = send.next(budget: 100_000, now: 0) { packets.append(packet) }
+        XCTAssertEqual(packets.count, 8)                                       // 6 pieces + 2 parity
+        XCTAssertEqual(send.piecesParity, 2)
+        for packet in packets { XCTAssertEqual(DatagramPacket(packet.encoded()), packet); XCTAssertLessThanOrEqual(packet.encoded().count, 1_200) }
+        // Lose one piece from each group, in turn the short last one and a full one: both come back from parity.
+        for lost in [[1, 5], [3, 4], [0, 5]] {
+            var receive = DatagramReceiveBuffer(first: 1)
+            var out: [(frame: UInt64, bytes: Data)] = []
+            for packet in packets {
+                switch packet {
+                case .data(let frame, let index, let count, let payload) where !lost.contains(index):
+                    out += receive.insert(frame: frame, index: index, count: count, payload: payload, now: 0)
+                case .parity(let frame, let group, let count, let groupSize, let lastLength, let payload):
+                    out += receive.insertParity(frame: frame, group: group, count: count, groupSize: groupSize, lastLength: lastLength, payload: payload, now: 0)
+                default: break
+                }
+            }
+            XCTAssertEqual(out.map(\.frame), [1]); XCTAssertEqual(out.first?.bytes, bytes, "lost \(lost)")
+            XCTAssertEqual(receive.piecesRebuilt, 2)
+            XCTAssertTrue(receive.missing(now: 1).isEmpty)
+        }
+        // Two pieces of the same group lost: parity cannot help, and the usual question is asked.
+        var receive = DatagramReceiveBuffer(first: 1)
+        for packet in packets {
+            switch packet {
+            case .data(let frame, let index, let count, let payload) where index != 1 && index != 2:
+                _ = receive.insert(frame: frame, index: index, count: count, payload: payload, now: 0)
+            case .parity(let frame, let group, let count, let groupSize, let lastLength, let payload):
+                _ = receive.insertParity(frame: frame, group: group, count: count, groupSize: groupSize, lastLength: lastLength, payload: payload, now: 0)
+            default: break
+            }
+        }
+        XCTAssertEqual(receive.piecesRebuilt, 0)
+        XCTAssertEqual(receive.missing(now: 0.01), [.init(frame: 1, range: 1...2)])
+        // Parity arriving before any piece of its frame, and a one-piece frame whose only piece is lost.
+        var tiny = DatagramSendBuffer(); tiny.parityGroup = 8
+        XCTAssertTrue(tiny.add(frame: 1, bytes: Data([9, 8, 7]), now: 0))
+        _ = tiny.next(budget: 10_000, now: 0)                                  // the piece itself: lost
+        guard case .parity(let frame, let group, let count, let groupSize, let lastLength, let payload)? = tiny.next(budget: 10_000, now: 0) else { return XCTFail("no parity") }
+        var alone = DatagramReceiveBuffer(first: 1)
+        XCTAssertEqual(alone.insertParity(frame: frame, group: group, count: count, groupSize: groupSize, lastLength: lastLength, payload: payload, now: 0).first?.bytes, Data([9, 8, 7]))
+        XCTAssertNil(DatagramPacket(Data([5, 0, 0, 0, 0, 0, 0, 0, 1, 0, 9, 0, 2, 4, 0, 5, 1])))     // group 9 of a 2-piece frame
+    }
+
+    func testParityIsOnlySentWhereAskingAgainIsSlow() {
+        var policy = ParityPolicy()
+        XCTAssertNil(policy.update(acknowledgeTime: nil, resentShare: 0))
+        // Home Wi-Fi: an answer comes back in a few milliseconds; asking again is as good.
+        XCTAssertNil(policy.update(acknowledgeTime: 0.012, resentShare: 0.02))
+        // Through the VPN (about 55 ms): one parity packet per 8 pieces, per 4 when a lot is being lost.
+        XCTAssertEqual(policy.update(acknowledgeTime: 0.055, resentShare: 0), 8)
+        XCTAssertEqual(policy.update(acknowledgeTime: 0.055, resentShare: 0.05), 4)
+        XCTAssertEqual(policy.update(acknowledgeTime: 0.055, resentShare: 0.02), 4, "stays until loss is clearly lower")
+        XCTAssertEqual(policy.update(acknowledgeTime: 0.055, resentShare: 0.01), 8)
+        // A link near the line does not flap: on above 40 ms, off below 28 ms.
+        XCTAssertEqual(policy.update(acknowledgeTime: 0.033, resentShare: 0), 8)
+        XCTAssertNil(policy.update(acknowledgeTime: 0.020, resentShare: 0))
+        XCTAssertNil(policy.update(acknowledgeTime: 0.033, resentShare: 0))
+    }
+
+    func testThroughAVPNParityHidesMostLossesAtASmallCost() {
+        var plain = (sent: 0, resent: 0, parity: 0, rebuilt: 0), protected = plain
+        let without = simulate(loss: 0.02, oneWay: 0.023, counts: &plain)
+        let with8 = simulate(loss: 0.02, oneWay: 0.023, parity: 8, counts: &protected)
+        func line(_ name: String, _ values: [Double], _ c: (sent: Int, resent: Int, parity: Int, rebuilt: Int)) {
+            print(String(format: "UDP simulation, 2%% loss, 46 ms round trip, %@: median %.1f ms, 99th %.1f ms, worst %.1f ms | asked again for %d pieces, rebuilt %d, parity overhead %.0f%%",
+                         name, percentile(values, 0.5), percentile(values, 0.99), values.max()!, c.resent, c.rebuilt, Double(c.parity) / Double(max(1, c.sent)) * 100))
+        }
+        line("no parity", without, plain); line("parity per 8", with8, protected)
+        XCTAssertEqual(plain.parity, 0)
+        XCTAssertGreaterThan(protected.rebuilt, protected.resent * 2, "most losses should be rebuilt, not asked for")
+        XCTAssertLessThan(percentile(with8, 0.5), percentile(without, 0.5) * 0.7)
+        XCTAssertLessThan(Double(protected.parity) / Double(protected.sent), 0.22)
+    }
+
     func testPacingSpreadsAKeyframeButNotAnOrdinaryFrame() {
         var pacer = DatagramPacer()
         XCTAssertEqual(DatagramPacer.rate(forBitrate: 25_000_000), 150_000_000)
@@ -197,9 +279,10 @@ final class DatagramVideoTests: XCTestCase {
     /// (plus jitter) and loses it with `loss` probability (and everything during `outage`). Returns how long each
     /// frame took from "encoded" to "ready for the decoder", in milliseconds.
     private func simulate(loss: Double, oneWay: Double = 0.0025, outage: ClosedRange<Double>? = nil, seconds: Double = 8, seed: UInt64 = 42,
-                          keyframeAt: UInt64? = nil, nackEvery: Double = 0.002) -> [Double] {
+                          keyframeAt: UInt64? = nil, nackEvery: Double = 0.002, parity: Int? = nil, counts: UnsafeMutablePointer<(sent: Int, resent: Int, parity: Int, rebuilt: Int)>? = nil) -> [Double] {
         var lottery = Lottery(state: seed)
         var send = DatagramSendBuffer(), receive = DatagramReceiveBuffer(first: 1), pacer = DatagramPacer()
+        send.parityGroup = parity
         var toReceiver: [(at: Double, packet: DatagramPacket)] = [], toSender: [(at: Double, packet: DatagramPacket)] = []
         var acks: [(at: Double, frame: UInt64)] = []
         var encodedAt: [UInt64: Double] = [:], latency: [Double] = []
@@ -227,10 +310,18 @@ final class DatagramVideoTests: XCTestCase {
                 if !lost(now, &lottery) { toReceiver.append((now + oneWay + Double(lottery.next() % 1_000) / 1_000_000, packet)) }
             }
             for item in toReceiver where item.at <= now {
-                guard case .data(let frame, let index, let count, let payload) = item.packet else { continue }
-                for ready in receive.insert(frame: frame, index: index, count: count, payload: payload, now: now) {
+                let ready: [(frame: UInt64, bytes: Data)]
+                switch item.packet {
+                case .data(let frame, let index, let count, let payload):
+                    ready = receive.insert(frame: frame, index: index, count: count, payload: payload, now: now)
+                case .parity(let frame, let group, let count, let groupSize, let lastLength, let payload):
+                    ready = receive.insertParity(frame: frame, group: group, count: count, groupSize: groupSize, lastLength: lastLength, payload: payload, now: now)
+                default: continue
+                }
+                for ready in ready {
                     delivered.append(ready.frame)
                     XCTAssertEqual(ready.bytes.first, UInt8(truncatingIfNeeded: ready.frame))
+                    XCTAssertEqual(ready.bytes.last, UInt8(truncatingIfNeeded: ready.frame))
                     latency.append((now - encodedAt[ready.frame]!) * 1_000)
                     acks.append((now + oneWay, ready.frame))              // acknowledgements travel on the TCP control channel
                 }
@@ -245,6 +336,7 @@ final class DatagramVideoTests: XCTestCase {
         }
         XCTAssertEqual(delivered, Array(1..<nextFrame), "every frame must arrive, once, in order")
         XCTAssertTrue(send.isEmpty)
+        counts?.pointee = (send.piecesSent, send.piecesResent, send.piecesParity, receive.piecesRebuilt)
         return latency
     }
     private func percentile(_ values: [Double], _ fraction: Double) -> Double {

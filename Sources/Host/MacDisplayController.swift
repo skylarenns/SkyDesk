@@ -7,6 +7,8 @@ final class MacDisplayController {
     private(set) var isEnabled = false
     var onChange: ((Bool) -> Void)?
     var onLayoutChange: (() -> Void)?
+    /// The switch to iPad only has to wait (seconds) because the Mac's display was switched a moment ago.
+    var onWaiting: ((Double) -> Void)?
     private var snapshot: DisplayLayoutSnapshot?
     private var recovery: DisplayRecoveryGuard?
     private var globalMonitor: Any?
@@ -32,6 +34,7 @@ final class MacDisplayController {
         if wait > 0 {
             let before = generation
             DisplayLog.write("enable: waiting \(String(format: "%.1f", wait)) s (Mac display was just switched)")
+            onWaiting?(wait)
             try await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
             // A restore, a new session or another request during the wait cancels this one.
             guard generation == before, !isEnabled else { return }

@@ -17,6 +17,10 @@ public enum DatagramPacket: Equatable {
     case hello(UUID)
     /// Mac → iPad: the session is accepted; video may arrive here from now on.
     case ready(UUID)
+    /// Mac → iPad (build 41): the XOR of one group of a frame's pieces (each padded with zeros to full size), so
+    /// that one lost piece of the group can be rebuilt without asking. `lastLength` is the size of the frame's
+    /// final piece, which is the only one that may be short. Builds before 41 ignore this packet.
+    case parity(frame: UInt64, group: Int, count: Int, groupSize: Int, lastLength: Int, payload: Data)
 
     public struct Missing: Equatable {
         public let frame: UInt64
@@ -29,6 +33,7 @@ public enum DatagramPacket: Equatable {
     public static let payloadSize = 1_180
     public static let maximumPieces = 16_384
     public static let maximumNacks = 120
+    public static let largestParityGroup = 32
 
     public func encoded() -> Data {
         var data = Data()
@@ -43,6 +48,9 @@ public enum DatagramPacket: Equatable {
             }
         case .hello(let session): data.append(3); withUnsafeBytes(of: session.uuid) { data.append(contentsOf: $0) }
         case .ready(let session): data.append(4); withUnsafeBytes(of: session.uuid) { data.append(contentsOf: $0) }
+        case .parity(let frame, let group, let count, let groupSize, let lastLength, let payload):
+            data.append(5); data.appendInteger(frame); data.appendInteger(UInt16(group)); data.appendInteger(UInt16(count))
+            data.append(UInt8(groupSize)); data.appendInteger(UInt16(lastLength)); data.append(payload)
         }
         return data
     }
@@ -76,6 +84,15 @@ public enum DatagramPacket: Equatable {
             self = .nack(missing)
         case 3: guard let id = session() else { return nil }; self = .hello(id)
         case 4: guard let id = session() else { return nil }; self = .ready(id)
+        case 5:
+            guard body.count > 15 else { return nil }
+            let bytes = Data(body)
+            let group = Int(bytes.integer(at: 8, as: UInt16.self)), count = Int(bytes.integer(at: 10, as: UInt16.self))
+            let groupSize = Int(bytes[bytes.startIndex + 12]), lastLength = Int(bytes.integer(at: 13, as: UInt16.self))
+            guard count >= 1, count <= Self.maximumPieces, groupSize >= 1, groupSize <= Self.largestParityGroup, group * groupSize < count,
+                  lastLength >= 1, lastLength <= Self.payloadSize, bytes.count - 15 <= Self.payloadSize else { return nil }
+            self = .parity(frame: bytes.integer(at: 0, as: UInt64.self), group: group, count: count, groupSize: groupSize,
+                           lastLength: lastLength, payload: bytes.subdata(in: 15..<bytes.count))
         default: return nil
         }
     }
@@ -87,6 +104,8 @@ public struct DatagramSendBuffer {
     public struct Piece: Equatable { public let frame: UInt64; public let index: Int }
     private struct Entry {
         let pieces: [Data]
+        /// Pieces per parity packet for this frame; nil = none.
+        let parityGroup: Int?
         let sentAt: Double
         var lastSent: [Double]
         var lastProbe: Double
@@ -107,6 +126,10 @@ public struct DatagramSendBuffer {
     public private(set) var piecesResent = 0
     /// Pieces sent again because nothing had been heard about their frame. Not a sign of loss on its own.
     public private(set) var piecesProbed = 0
+    /// Parity packets sent.
+    public private(set) var piecesParity = 0
+    /// Send one parity packet after every this many pieces of each new frame; nil = none (see ParityPolicy).
+    public var parityGroup: Int?
     /// How long the iPad usually takes to acknowledge a frame (network both ways plus decoding), learned from the
     /// acknowledgements themselves. Build 39 used fixed times tuned on a 5 ms home network; through a VPN, where
     /// an acknowledgement takes about 55 ms, every frame was probed after 35 ms, the probes were counted as loss,
@@ -144,9 +167,16 @@ public struct DatagramSendBuffer {
             pieces.append(bytes.subdata(in: offset..<end)); offset = end
         }
         guard pieces.count <= DatagramPacket.maximumPieces else { return false }
-        frames[frame] = Entry(pieces: pieces, sentAt: now, lastSent: Array(repeating: -1, count: pieces.count), lastProbe: now)
+        let group = parityGroup.map { max(1, min(DatagramPacket.largestParityGroup, $0)) }
+        frames[frame] = Entry(pieces: pieces, parityGroup: group, sentAt: now, lastSent: Array(repeating: -1, count: pieces.count), lastProbe: now)
         bytesHeld += bytes.count
-        queued.append(contentsOf: pieces.indices.map { Piece(frame: frame, index: $0) })
+        if let group {
+            // Each group's pieces, then its parity: an index past the last piece stands for "parity of group n".
+            for start in stride(from: 0, to: pieces.count, by: group) {
+                queued.append(contentsOf: (start..<min(pieces.count, start + group)).map { Piece(frame: frame, index: $0) })
+                queued.append(Piece(frame: frame, index: pieces.count + start / group))
+            }
+        } else { queued.append(contentsOf: pieces.indices.map { Piece(frame: frame, index: $0) }) }
         return true
     }
     /// The iPad decoded the frame: nothing of it is needed any more.
@@ -200,6 +230,18 @@ public struct DatagramSendBuffer {
                 if resend, let probe = probing.firstIndex(of: piece) { probing.remove(at: probe) }
                 drop(resend); continue
             }
+            if piece.index >= entry.pieces.count {
+                // Parity: built when its turn comes. Never resent; a group that loses two pieces falls back to asking.
+                guard let size = entry.parityGroup else { drop(resend); continue }
+                let group = piece.index - entry.pieces.count
+                let members = entry.pieces[(group * size)..<min(entry.pieces.count, (group + 1) * size)]
+                let parity = Self.xor(members)
+                guard parity.count <= budget else { return nil }
+                drop(resend)
+                piecesParity += 1
+                return .parity(frame: piece.frame, group: group, count: entry.pieces.count, groupSize: size,
+                               lastLength: entry.pieces[entry.pieces.count - 1].count, payload: parity)
+            }
             let payload = entry.pieces[piece.index]
             guard payload.count <= budget else { return nil }
             drop(resend)
@@ -211,6 +253,15 @@ public struct DatagramSendBuffer {
         }
     }
     private mutating func drop(_ resend: Bool) { if resend { urgent.removeFirst() } else { queuedHead += 1 } }
+    /// XOR of the given pieces, the shorter ones counted as padded with zeros.
+    static func xor<S: Sequence>(_ pieces: S) -> Data where S.Element == Data {
+        var result = [UInt8]()
+        for piece in pieces {
+            if piece.count > result.count { result.append(contentsOf: repeatElement(0, count: piece.count - result.count)) }
+            piece.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) in for index in 0..<bytes.count { result[index] ^= bytes[index] } }
+        }
+        return Data(result)
+    }
     private mutating func compact() { if queuedHead > 0 { queued.removeAll(keepingCapacity: true); queuedHead = 0 } }
     /// Everything not yet acknowledged, whole and in order (to resend over TCP when UDP stops working).
     public func unacknowledged() -> [(frame: UInt64, bytes: Data)] {
@@ -231,6 +282,10 @@ public struct DatagramReceiveBuffer {
         /// Highest piece index received, and since when a piece below it has been missing.
         var top = -1
         var gapSince: Double?
+        /// Parity packets received, by group, with what they say about the frame's layout.
+        var parity: [Int: Data] = [:]
+        var parityGroup: Int?
+        var lastLength: Int?
     }
     private var partial: [UInt64: Partial] = [:]
     private var complete: [UInt64: Data] = [:]
@@ -254,6 +309,8 @@ public struct DatagramReceiveBuffer {
     public private(set) var piecesReceived = 0
     public private(set) var duplicates = 0
     public private(set) var nacksSent = 0
+    /// Pieces rebuilt from parity instead of being asked for again.
+    public private(set) var piecesRebuilt = 0
     public static let maximumWaiting = 256
     public init(first: UInt64? = nil) { next = first }
 
@@ -277,11 +334,49 @@ public struct DatagramReceiveBuffer {
         if entry.have == entry.top + 1 { entry.gapSince = nil }
         piecesReceived += 1
         unknownNack[frame] = nil
-        if entry.have == count {
+        if let size = entry.parityGroup { rebuild(&entry, group: index / size, now: now) }
+        return store(entry, frame: frame)
+    }
+    /// A parity packet from UDP: if exactly one piece of its group is missing, that piece is rebuilt at once.
+    public mutating func insertParity(frame: UInt64, group: Int, count: Int, groupSize: Int, lastLength: Int, payload: Data,
+                                      now: Double) -> [(frame: UInt64, bytes: Data)] {
+        if let next, frame < next { return [] }
+        if highest == nil || frame > highest! { highest = frame; highestSeenAt = now }
+        guard complete[frame] == nil else { return [] }
+        var entry = partial[frame] ?? Partial(pieces: Array(repeating: nil, count: count), lastProgress: now)
+        guard entry.pieces.count == count, groupSize >= 1, group * groupSize < count,
+              entry.parityGroup == nil || entry.parityGroup == groupSize else { return [] }       // inconsistent: ignore
+        guard partial[frame] != nil || waiting < Self.maximumWaiting else { return [] }
+        entry.parityGroup = groupSize; entry.lastLength = lastLength
+        entry.parity[group] = payload
+        entry.lastProgress = now
+        unknownNack[frame] = nil
+        rebuild(&entry, group: group, now: now)
+        return store(entry, frame: frame)
+    }
+    private mutating func store(_ entry: Partial, frame: UInt64) -> [(frame: UInt64, bytes: Data)] {
+        if entry.have == entry.pieces.count {
             partial[frame] = nil
             complete[frame] = entry.pieces.reduce(into: Data()) { $0.append($1!) }
         } else { partial[frame] = entry }
         return release()
+    }
+    /// Rebuilds the one missing piece of a group from its parity, if exactly one is missing.
+    private mutating func rebuild(_ entry: inout Partial, group: Int, now: Double) {
+        guard let size = entry.parityGroup, let parity = entry.parity[group], let lastLength = entry.lastLength else { return }
+        let range = (group * size)..<min(entry.pieces.count, (group + 1) * size)
+        let absent = range.filter { entry.pieces[$0] == nil }
+        guard absent.count == 1, let index = absent.first else { return }
+        // Parity XOR every piece that did arrive leaves the one that did not, padded with zeros.
+        let rebuilt = DatagramSendBuffer.xor([parity] + range.compactMap { entry.pieces[$0] })
+        let length = index == entry.pieces.count - 1 ? lastLength : DatagramPacket.payloadSize
+        guard length <= DatagramPacket.payloadSize else { return }
+        var piece = rebuilt.prefix(length)
+        if piece.count < length { piece.append(contentsOf: repeatElement(0, count: length - piece.count)) }
+        entry.pieces[index] = Data(piece); entry.have += 1
+        entry.top = max(entry.top, index)
+        if entry.have == entry.top + 1 { entry.gapSince = nil }
+        piecesRebuilt += 1
     }
     /// A whole frame from TCP.
     public mutating func insert(frame: UInt64, bytes: Data) -> [(frame: UInt64, bytes: Data)] {
@@ -375,5 +470,25 @@ public struct VideoPathPolicy: Equatable {
         if available, startedOnTCP, bytes <= Self.largestDatagramFrame { return true }
         startedOnTCP = true
         return false
+    }
+}
+
+/// When parity is worth sending. A rebuilt piece saves one round trip, so on a home network (a few milliseconds)
+/// asking again is as good and costs nothing extra, while through a VPN (tens of milliseconds) one parity packet
+/// per group is cheaper than the wait. Decided on the Mac from how long acknowledgements take and how much is
+/// actually being lost.
+public struct ParityPolicy: Equatable {
+    public private(set) var groupSize: Int?
+    public init() {}
+    /// `acknowledgeTime` in seconds (DatagramSendBuffer.acknowledgeTime); `resentShare` = pieces the iPad had to
+    /// ask for again, as a share of pieces sent, over the last few seconds.
+    public mutating func update(acknowledgeTime: Double?, resentShare: Double) -> Int? {
+        guard let time = acknowledgeTime else { return groupSize }
+        // On above 40 ms, off again below 28 ms, so a link near the line does not flap.
+        if groupSize == nil ? time > 0.040 : time >= 0.028 {
+            // 8 pieces per parity packet (12 % more data) normally; 4 (25 %) when one in thirty or more is being lost.
+            groupSize = resentShare >= 0.03 ? 4 : (resentShare < 0.015 || groupSize == nil ? 8 : groupSize)
+        } else { groupSize = nil }
+        return groupSize
     }
 }

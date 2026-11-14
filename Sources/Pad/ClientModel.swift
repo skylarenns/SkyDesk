@@ -87,6 +87,9 @@ final class ClientModel: ObservableObject {
     /// Set while an automatic connection runs (launch or return from background): shows the "Connecting" screen.
     @Published var autoConnectLabel: String?
     @Published var passwordNeeded = false
+    /// The Mac refused this iPad's own key. The name of that Mac, while "pair again" is on offer.
+    @Published var pairAgainOffer: String?
+    private var pairAgainTarget: ConnectTarget?
     @Published var info: StreamInfo?
     /// Twice-a-second statistics live in their own object: publishing them from here re-rendered the whole toolbar,
     /// and an open More menu re-laid out under the pointer ("jumps around", 2026-11-13).
@@ -418,6 +421,13 @@ final class ClientModel: ObservableObject {
         }
         recents = list; list.save(to: .standard)
     }
+    /// The user chose to pair again after the Mac refused this iPad's key: connect with the saved password key
+    /// (the Mac then issues a new key). Without a saved password the form asks for it.
+    func pairAgain() {
+        guard let target = pairAgainTarget, !connecting, info == nil else { return }
+        pairAgainOffer = nil; pairAgainTarget = nil
+        open(target, cableFirst: false, passwordOnly: true)
+    }
     /// Leaves the "Connecting" screen for the full connection screen.
     func cancelConnecting() {
         resumeTarget = nil
@@ -428,6 +438,7 @@ final class ClientModel: ObservableObject {
 
     private func start(_ target: ConnectTarget, automatic: Bool) {
         guard info == nil else { return }
+        pairAgainOffer = nil; pairAgainTarget = nil
         probe?.cancel(); probe = nil
         if connecting { endSession(reason: nil) }
         if automatic {
@@ -664,10 +675,14 @@ final class ClientModel: ObservableObject {
                 let neverConnected = self.info == nil
                 let fallBack = cableAttempt && neverConnected
                 let wrongPassword = reason == PairingPassword.mismatchMessage
-                // The Mac refused this iPad's own key (removed there, or not active yet): the password key is next.
+                // The Mac refused this iPad's own key. Build 40 then tried the saved password key by itself. It no
+                // longer does: the password key is the only one that can be guessed from a captured handshake, and
+                // someone posing as the Mac could refuse the iPad's key precisely to be offered it. So the iPad
+                // stops and says what happened, and the saved password is used only if the user chooses to.
                 if usingDeviceKey, neverConnected, wrongPassword {
-                    self.endSession(reason: nil, keepDeadline: true)
-                    self.open(target, cableFirst: false, passwordOnly: true)
+                    self.resumeTarget = nil
+                    self.endSession(reason: "\(target.label) didn't accept this iPad's key. If the iPad was removed on the Mac, or SkyDesk was reinstalled there, pair again.")
+                    self.pairAgainTarget = target; self.pairAgainOffer = target.label
                     return
                 }
                 // An automatic attempt keeps trying until its deadline: Wi-Fi is often still waking up.
@@ -1187,7 +1202,7 @@ final class ClientModel: ObservableObject {
         if statsTick % 2 == 0, (info?.features ?? 0) & StreamFeature.clientStatsLog != 0 {
             let note = drawNote?() ?? ""
             control?.send(.clientStats(StatisticsText.logLine(values, link: usingCable ? "cable" : usingVPN ? "vpn" : networkSymbol)
-                                       + " video=" + videoPath + (note.isEmpty ? "" : " " + note)))
+                                       + " video=" + videoPath + (videoOrder.map { " rebuilt=\($0.rebuilt)" } ?? "") + (note.isEmpty ? "" : " " + note)))
         }
         #if targetEnvironment(simulator)
         stats.metrics = "SIMULATOR (GPU completion only) · " + stats.metrics

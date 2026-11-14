@@ -11,7 +11,7 @@ extension DeskNetwork {
         let options = tls.securityProtocolOptions
         sec_protocol_options_set_min_tls_protocol_version(options, .DTLSv12)
         sec_protocol_options_set_max_tls_protocol_version(options, .DTLSv12)
-        for suite in [forwardSecretSuite, legacySuite] {
+        for suite in acceptedSuites {
             if let value = tls_ciphersuite_t(rawValue: suite) { sec_protocol_options_append_tls_ciphersuite(options, value) }
         }
         for credential in credentials {
@@ -29,7 +29,7 @@ private func seconds() -> Double { Double(monotonicNanos()) / 1_000_000_000 }
 
 /// Mac side of video over UDP. Thread-safe: everything runs on `queue`.
 public final class VideoDatagramSender {
-    public struct Counters: Equatable { public var sent = 0, resent = 0, probed = 0 }
+    public struct Counters: Equatable { public var sent = 0, resent = 0, probed = 0, parity = 0 }
     private let connection: NWConnection
     private let queue: DispatchQueue
     private var buffer = DatagramSendBuffer()
@@ -40,6 +40,13 @@ public final class VideoDatagramSender {
     private var accepted: UUID?
     private var finished = false
     private var reported = Counters()
+    private var parityPolicy = ParityPolicy()
+    private var policyTick = 0
+    private var policyMark = Counters()
+    /// For tests: always send parity in groups of this size, whatever the link looks like.
+    public var forcedParityGroup: Int?
+    /// Whether parity is being sent right now (for the log).
+    public private(set) var parityOn = false
     /// The video bitrate currently aimed for, in bits per second: sets the pace.
     public var bitrate: () -> Int = { 25_000_000 }
     /// Is this the session we are serving? Called on `queue` for each hello.
@@ -58,7 +65,9 @@ public final class VideoDatagramSender {
         connection.stateUpdateHandler = { [weak self] state in
             guard let self, !self.finished else { return }
             switch state {
-            case .ready: self.receive()
+            case .ready:
+                guard DeskNetwork.isForwardSecret(self.connection) else { self.stop(DeskNetwork.weakExchangeMessage); return }
+                self.receive()
             case .failed(let error): self.stop(error.localizedDescription)
             case .cancelled: self.stop(nil)
             default: break
@@ -85,8 +94,9 @@ public final class VideoDatagramSender {
     /// Pieces sent and resent since the last call (for the log and the bitrate control).
     public func drainCounters(_ handler: @escaping (Counters) -> Void) {
         queue.async { [self] in
-            let total = Counters(sent: buffer.piecesSent, resent: buffer.piecesResent, probed: buffer.piecesProbed)
-            handler(Counters(sent: total.sent - reported.sent, resent: total.resent - reported.resent, probed: total.probed - reported.probed))
+            let total = Counters(sent: buffer.piecesSent, resent: buffer.piecesResent, probed: buffer.piecesProbed, parity: buffer.piecesParity)
+            handler(Counters(sent: total.sent - reported.sent, resent: total.resent - reported.resent, probed: total.probed - reported.probed,
+                             parity: total.parity - reported.parity))
             reported = total
         }
     }
@@ -109,6 +119,7 @@ public final class VideoDatagramSender {
         }
     }
     private func begin() {
+        buffer.parityGroup = forcedParityGroup
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + .milliseconds(5), repeating: .milliseconds(5), leeway: .milliseconds(1))
         timer.setEventHandler { [weak self] in
@@ -116,6 +127,15 @@ public final class VideoDatagramSender {
             let now = seconds()
             if let age = self.buffer.oldestAge(now: now), age > self.stallLimit { self.stop("Video over UDP stopped being acknowledged."); return }
             self.buffer.probe(now: now)
+            // Once a second: is parity worth sending on this link?
+            self.policyTick += 1
+            if self.policyTick % 200 == 0 {
+                let sent = self.buffer.piecesSent - self.policyMark.sent, resent = self.buffer.piecesResent - self.policyMark.resent
+                self.policyMark = Counters(sent: self.buffer.piecesSent, resent: self.buffer.piecesResent)
+                let share = sent >= 50 ? Double(resent) / Double(sent) : 0
+                self.buffer.parityGroup = self.forcedParityGroup ?? self.parityPolicy.update(acknowledgeTime: self.buffer.acknowledgeTime, resentShare: share)
+                self.parityOn = self.buffer.parityGroup != nil
+            }
             self.pump()
         }
         self.timer = timer; timer.resume()
@@ -170,6 +190,10 @@ public final class VideoDatagramReceiver {
     private var hellos = 0
     private var ready = false
     private var orphanedSince: Double?
+    private let rebuiltLock = NSLock()
+    private var rebuiltCount = 0
+    /// Pieces rebuilt from parity so far in this session; readable from any thread.
+    public var rebuilt: Int { rebuiltLock.lock(); defer { rebuiltLock.unlock() }; return rebuiltCount }
     /// Complete frames, in order (the bytes of an encoded VideoFrame).
     public var onFrame: ((UInt64, Data) -> Void)?
     /// The Mac accepted the UDP flow; `onStopped` if it never does or the flow fails later.
@@ -190,7 +214,9 @@ public final class VideoDatagramReceiver {
         connection.stateUpdateHandler = { [weak self, weak connection] state in
             guard let self, let connection, self.connection === connection else { return }
             switch state {
-            case .ready: self.receive(connection); self.greet(connection)
+            case .ready:
+                guard DeskNetwork.isForwardSecret(connection) else { self.stop(DeskNetwork.weakExchangeMessage); return }
+                self.receive(connection); self.greet(connection)
             case .failed(let error): self.stop(error.localizedDescription)
             case .waiting(let error): if case .tls = error { self.stop(error.localizedDescription) }
             default: break
@@ -230,6 +256,10 @@ public final class VideoDatagramReceiver {
                 switch packet {
                 case .data(let frame, let index, let count, let payload):
                     self.deliver(self.buffer.insert(frame: frame, index: index, count: count, payload: payload, now: seconds()))
+                case .parity(let frame, let group, let count, let groupSize, let lastLength, let payload):
+                    self.deliver(self.buffer.insertParity(frame: frame, group: group, count: count, groupSize: groupSize,
+                                                          lastLength: lastLength, payload: payload, now: seconds()))
+                    self.rebuiltLock.lock(); self.rebuiltCount = self.buffer.piecesRebuilt; self.rebuiltLock.unlock()
                 case .ready(let session) where session == self.session:
                     if !self.ready { self.ready = true; self.startAsking(connection); self.onReady?() }
                 default: break

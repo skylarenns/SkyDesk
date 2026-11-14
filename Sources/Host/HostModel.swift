@@ -171,6 +171,9 @@ final class HostModel: ObservableObject {
         let blanker = MacDisplayController()
         blanker.onChange = { [weak self] blanked in self?.control?.send(.macDisplayBlanked(blanked)) }
         blanker.onLayoutChange = { [weak self] in self?.refreshInputGeometry() }
+        // The switch can be held back for up to about fifteen seconds; the Dock need not wait with it (user request
+        // 2026-11-14): bring it to the iPad's desktop straight away.
+        blanker.onWaiting = { [weak self] _ in self?.pullDockToSession() }
         return blanker
     }()
     private var timer: Timer?
@@ -497,6 +500,11 @@ final class HostModel: ObservableObject {
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
                     guard let self, let channel, self.channels.removeValue(forKey: channel.id) != nil else { return }
+                    // A connection that was never accepted into a session and did not simply close: record it.
+                    // (The iPad's own "which address answers?" probes close cleanly, with no reason, and are not counted.)
+                    if self.control !== channel, self.video !== channel, self.files !== channel, self.audioChannel !== channel, let reason {
+                        self.noteRefused(channel.connection, reason: reason == PairingPassword.mismatchMessage ? "wrong key or an unsupported key exchange" : reason)
+                    }
                     if self.control === channel || self.video === channel {
                         self.disconnect()
                         if let reason { self.status = reason }
@@ -776,6 +784,33 @@ final class HostModel: ObservableObject {
             }
         }
     }
+    /// Brings the Dock onto the streamed desktop the way "Show Dock here" does from the iPad: macOS moves the Dock
+    /// to a display when the pointer pushes down against that display's bottom edge, and the injector turns pointer
+    /// moves along the bottom row into that push.
+    private func pullDockToSession() {
+        guard allowInput, capture != nil else { return }
+        let session = sessionID
+        for step in 0..<12 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + Double(step) * 0.03) { [weak self] in
+                guard let self, self.sessionID == session, self.capture != nil, self.allowInput else { return }
+                self.input.handle(InputEvent(kind: .move, x: 0.5, y: 1))
+            }
+        }
+        MetricsLog.shared.append("host  Dock brought to the iPad's desktop while the display switch waits")
+    }
+    /// Connections that never became part of a session, for the log: a wrong key, or a handshake never finished.
+    private var refusedAttempts: [Date] = []
+    private var lastRefusalNote = Date.distantPast
+    private func noteRefused(_ connection: NWConnection, reason: String) {
+        let now = Date()
+        refusedAttempts = refusedAttempts.filter { now.timeIntervalSince($0) < 60 } + [now]
+        guard now.timeIntervalSince(lastRefusalNote) >= 10 else { return }
+        lastRefusalNote = now
+        var from = "unknown address"
+        if case .hostPort(let host, _) = connection.endpoint { from = "\(host)".components(separatedBy: "%").first ?? from }
+        MetricsLog.shared.append("host  refused a connection from \(from) (\(reason)); \(refusedAttempts.count) refused in the last minute")
+    }
+
     // MARK: Adaptive bitrate
 
     private func startBitrateControl(maximum: Int) {
@@ -1049,6 +1084,7 @@ final class HostModel: ObservableObject {
                          capture.window.feedbackMilliseconds, capture.window.currentLimit)
         if router.usingUDP {
             metrics += " · video over UDP" + (router.resentShare.map { $0 >= 0.005 ? String(format: " (%.1f%% sent twice)", $0 * 100) : "" } ?? "")
+                + (router.parityOn ? " + parity" : "")
         }
         if let controller = bitrateController, controller.target < controller.maximum {
             metrics += String(format: " · bitrate limited to %.1f Mbps by the network", Double(controller.target) / 1e6)

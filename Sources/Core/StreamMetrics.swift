@@ -226,7 +226,10 @@ public final class MetricsLog {
                 try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
                 // Start over above 4 MB so the log cannot grow without bound.
                 if let size = try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int, size > 4_000_000 {
-                    try? FileManager.default.removeItem(at: url)
+                    // The previous log is kept once (build 41): evidence from the last few hours used to vanish here.
+                    let previous = url.deletingPathExtension().appendingPathExtension("previous.log")
+                    try? FileManager.default.removeItem(at: previous)
+                    try? FileManager.default.moveItem(at: url, to: previous)
                 }
                 if !FileManager.default.fileExists(atPath: url.path) { FileManager.default.createFile(atPath: url.path, contents: nil) }
                 handle = try? FileHandle(forWritingTo: url); _ = try? handle?.seekToEnd()

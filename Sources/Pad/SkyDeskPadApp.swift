@@ -173,6 +173,11 @@ private struct ConnectionView: View {
                         .font(.callout).padding(14).frame(maxWidth: .infinity, alignment: .leading)
                         .background(RoundedRectangle(cornerRadius: 14).fill(client.passwordNeeded ? Color.orange.opacity(0.15) : Color(.secondarySystemGroupedBackground)))
                 }
+                if let name = client.pairAgainOffer {
+                    Button { client.pairAgain() } label: {
+                        Label("Pair again with \(name)", systemImage: "key.fill").font(.headline).frame(maxWidth: .infinity, minHeight: 50)
+                    }.buttonStyle(.borderedProminent)
+                }
                 if !client.recents.entries.isEmpty {
                     section("Recent") {
                         ForEach(client.recents.entries) { recent in

@@ -11,6 +11,7 @@ final class VideoRouter: @unchecked Sendable {
     private var session: UUID?
     private var bitrateTarget = 25_000_000
     private var resent: Double?
+    private var parity = false
     private var gaveUp = false
     private var policy = VideoPathPolicy()
     /// Called (on any thread) when the path changes: true = UDP, with the reason when it went back to TCP.
@@ -31,6 +32,8 @@ final class VideoRouter: @unchecked Sendable {
     var usingUDP: Bool { lock.withLock { udp != nil } }
     /// Share of datagrams sent twice in the last measured interval; nil on TCP.
     var resentShare: Double? { lock.withLock { udp == nil ? nil : resent } }
+    /// Parity packets are being added (a link where asking again is slow).
+    var parityOn: Bool { lock.withLock { udp != nil && parity } }
 
     /// A UDP flow said hello with this session: is it ours, and is UDP still wanted?
     func accepts(_ candidate: UUID) -> Bool { lock.withLock { session == candidate && udp == nil && !gaveUp } }
@@ -77,6 +80,7 @@ final class VideoRouter: @unchecked Sendable {
             self.lock.withLock {
                 guard self.udp === sender else { return }
                 self.resent = counters.sent + counters.resent >= 20 ? Double(counters.resent) / Double(counters.sent + counters.resent) : 0
+                self.parity = counters.parity > 0 || (self.parity && counters.sent == 0)
             }
         }
     }

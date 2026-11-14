@@ -102,8 +102,23 @@ public enum DeskNetwork {
     /// sessions recorded earlier (forward secrecy; build 37). Not in the SDK's named list; Apple's TLS accepts it
     /// (Tests/PairedDeviceTests.swift connects with it).
     public static let forwardSecretSuite: UInt16 = 0xCCAC
-    /// The suite of builds before 37, kept so either side can still talk to an older build.
+    /// The suite of builds before 37 (no forward secrecy).
+    ///
+    /// It cannot be switched off in the handshake: Apple's TLS offers and accepts it whenever a pre-shared key is
+    /// set, whatever suites are listed (probed 2026-11-14: a side that lists only the new suite still connects
+    /// to a side that lists only this one, using this one). What SkyDesk can do, and does from build 41, is refuse
+    /// to use a connection that ended up on it (`requireForwardSecrecy`). So no session runs without forward
+    /// secrecy, and a build before 37 can no longer connect. What that cannot prevent: someone in the middle of a
+    /// connection can still force a handshake onto this suite and collect one handshake's worth of material for
+    /// guessing a password. It is useless against an iPad's own random key, which is why the iPad no longer offers
+    /// the password key by itself once it has one (see ClientModel).
     public static let legacySuite = UInt16(TLS_PSK_WITH_AES_128_GCM_SHA256)
+    public static let acceptedSuites = [forwardSecretSuite]
+    public static let weakExchangeMessage = "This connection could not use the forward-secret key exchange, so it was refused. Update SkyDesk on both devices."
+    static func isForwardSecret(_ connection: NWConnection) -> Bool {
+        guard let metadata = connection.metadata(definition: NWProtocolTLS.definition) as? NWProtocolTLS.Metadata else { return false }
+        return sec_protocol_metadata_get_negotiated_tls_ciphersuite(metadata.securityProtocolMetadata).rawValue == forwardSecretSuite
+    }
     public static func parameters(key: PairingKey) -> NWParameters { parameters(credentials: [.password(key)]) }
     /// A listener passes every credential it accepts; a connection passes the one it wants to use.
     public static func parameters(credentials: [PairingCredential]) -> NWParameters {
@@ -111,8 +126,7 @@ public enum DeskNetwork {
         let options = tls.securityProtocolOptions
         sec_protocol_options_set_min_tls_protocol_version(options, .TLSv12)
         sec_protocol_options_set_max_tls_protocol_version(options, .TLSv12)
-        // Preference order: both sides on build 37+ agree on the forward-secret suite.
-        for suite in [forwardSecretSuite, legacySuite] {
+        for suite in acceptedSuites {
             if let value = tls_ciphersuite_t(rawValue: suite) { sec_protocol_options_append_tls_ciphersuite(options, value) }
         }
         for credential in credentials {
@@ -172,7 +186,9 @@ public final class SecureChannel {
         connection.stateUpdateHandler = { [weak self] state in
             guard let self, !self.closed else { return }
             switch state {
-            case .ready: self.ready = true; self.receive(); self.onReady?()
+            case .ready:
+                guard DeskNetwork.isForwardSecret(self.connection) else { self.finish(DeskNetwork.weakExchangeMessage); return }
+                self.ready = true; self.receive(); self.onReady?()
             case .failed(let error):
                 if case .tls = error { self.finish(PairingPassword.mismatchMessage) } else { self.finish(error.localizedDescription) }
             case .waiting(let error):

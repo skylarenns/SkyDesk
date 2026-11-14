@@ -60,7 +60,7 @@ final class DatagramTransportTests: XCTestCase {
     }
 
     /// Streams `count` frames from a sender to a receiver through the relay and returns what the receiver released.
-    private func stream(count: UInt64, loss: Double, blackoutAfter: UInt64? = nil) throws -> (frames: [UInt64], resent: Int, dropped: Int, viaFallback: Int) {
+    private func stream(count: UInt64, loss: Double, blackoutAfter: UInt64? = nil, parity: Int? = nil) throws -> (frames: [UInt64], resent: Int, dropped: Int, viaFallback: Int, parity: Int, rebuilt: Int) {
         let credential = PairingCredential.device(UUID(), key: try PairingKey())
         let session = UUID()
         let macQueue = DispatchQueue(label: "skydesk.test.mac"), padQueue = DispatchQueue(label: "skydesk.test.pad")
@@ -80,6 +80,7 @@ final class DatagramTransportTests: XCTestCase {
         listener.newConnectionHandler = { connection in
             let made = VideoDatagramSender(connection: connection, queue: macQueue)
             made.stallLimit = 0.5
+            made.forcedParityGroup = parity
             made.onHello = { $0 == session }
             made.onActive = { active.fulfill() }
             // UDP gave up: what was not acknowledged goes over "TCP" (straight into the receiver here).
@@ -116,14 +117,14 @@ final class DatagramTransportTests: XCTestCase {
         }
         feeder.resume()
         wait(for: [finished], timeout: 30)
-        var resent = 0
+        var resent = 0, paritySent = 0
         let counted = expectation(description: "counters")
-        if let sender { sender.drainCounters { resent = $0.resent; counted.fulfill() } } else { counted.fulfill() }
+        if let sender { sender.drainCounters { resent = $0.resent; paritySent = $0.parity; counted.fulfill() } } else { counted.fulfill() }
         wait(for: [counted], timeout: 3)
         padQueue.sync { receiver.detach() }
         sender?.close(); listener.cancel(); relay.stop()
         XCTAssertTrue(intact, "a frame arrived with the wrong bytes")
-        return (padQueue.sync { released }, resent, relay.dropped, padQueue.sync { fallback })
+        return (padQueue.sync { released }, resent, relay.dropped, padQueue.sync { fallback }, paritySent, receiver.rebuilt)
     }
 
     func testEncryptedUDPCarriesTheStreamInOrder() throws {
@@ -138,6 +139,18 @@ final class DatagramTransportTests: XCTestCase {
         XCTAssertGreaterThan(result.dropped, 100, "the relay should really have dropped datagrams")
         XCTAssertGreaterThan(result.resent, 50)
         XCTAssertEqual(result.viaFallback, 0, "5 % loss must be repaired on UDP itself")
+    }
+
+    func testParityOverRealSocketsRebuildsLostPiecesAndTheStreamStaysWhole() throws {
+        let plain = try stream(count: 360, loss: 0.05)
+        let protected = try stream(count: 360, loss: 0.05, parity: 8)
+        XCTAssertEqual(protected.frames, Array(1...360))
+        XCTAssertEqual(protected.viaFallback, 0)
+        XCTAssertGreaterThan(protected.parity, 300)
+        XCTAssertGreaterThan(protected.rebuilt, 100)
+        // The same loss with far fewer round trips spent on asking again.
+        XCTAssertLessThan(protected.resent, plain.resent / 2)
+        print("Real sockets, 5% loss: asked again for \(plain.resent) pieces without parity, \(protected.resent) with it (\(protected.rebuilt) rebuilt from \(protected.parity) parity packets)")
     }
 
     func testWhenUDPStopsGettingThroughTheStreamContinuesOverTCPWithoutAGap() throws {

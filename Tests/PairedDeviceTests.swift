@@ -45,9 +45,10 @@ final class PairedDeviceTests: XCTestCase {
         XCTAssertEqual(suite, DeskNetwork.forwardSecretSuite)
     }
 
-    func testAnOlderBuildStillConnectsWithItsOwnSuite() throws {
+    func testTheOldKeyExchangeIsRefusedEvenWithTheRightKey() throws {
         let key = try PairingKey()
-        // What builds before 37 send: the password identity and only the old suite.
+        // What builds before 37 send (and what someone forcing a downgrade would make a newer build send): the right
+        // key, but only the suite without forward secrecy.
         let tls = NWProtocolTLS.Options()
         let options = tls.securityProtocolOptions
         sec_protocol_options_set_min_tls_protocol_version(options, .TLSv12)
@@ -57,7 +58,8 @@ final class PairedDeviceTests: XCTestCase {
         let identity = Data(PairingPassword.pskIdentity.utf8).withUnsafeBytes { DispatchData(bytes: $0) }
         sec_protocol_options_add_pre_shared_key(options, secret as __DispatchData, identity as __DispatchData)
         let old = NWParameters(tls: tls, tcp: NWProtocolTCP.Options())
-        XCTAssertEqual(try connect(accepted: [.password(key)], using: old), DeskNetwork.legacySuite)
+        XCTAssertNil(try connect(accepted: [.password(key)], using: old))
+        XCTAssertEqual(DeskNetwork.acceptedSuites, [DeskNetwork.forwardSecretSuite])
     }
 
     func testEachPairedIPadConnectsWithItsOwnKeyBesideThePassword() throws {

@@ -2,7 +2,7 @@
 
 A native Apple remote desktop for one person's own devices. **SkyDesk Host** runs in the Mac's menu bar, captures a display and streams it as hardware-encoded HEVC. **SkyDesk** on the iPad decodes it in hardware, draws it with Metal and sends back keyboard, trackpad, touch and gesture input. The same link carries clipboard text, files in both directions, the Mac's sound, and updates of both apps. The two devices talk to each other directly: there is no account, relay or server.
 
-This file describes the code at **build 40** (`CURRENT_PROJECT_VERSION` in `project.yml`). [VERIFICATION.md](VERIFICATION.md) is the dated record of the first builds and does not describe the current state.
+This file describes the code at **build 41** (`CURRENT_PROJECT_VERSION` in `project.yml`). [VERIFICATION.md](VERIFICATION.md) is the dated record of the first builds and does not describe the current state.
 
 **No end-to-end performance figure has been measured.** 120 FPS is the default target frame rate, not a verified result. The delays the iPad shows are estimates added up from parts (see [Statistics](#statistics)); nobody has yet filmed an input and its response to check them.
 
@@ -14,14 +14,15 @@ This file describes the code at **build 40** (`CURRENT_PROJECT_VERSION` in `proj
 | 36 and 37 | Installed on 2026-11-13. Build 37's log shows the forward-secret exchange in use and the iPad issued its own key. The 4:4:4 option has not been switched on yet. |
 | 38 (video over encrypted UDP, the "Late" figure, host settings saved) | Installed on 2026-11-13. **Video over UDP failed on the real devices**: the UDP flow came up 36 ms after connecting, but the session's first frame (about 200 kB on a quiet desktop) was sent over UDP, the iPad was waiting for it on TCP, nothing was shown for 1.5 s, and the fallback then carried the session on TCP. No frame has yet been displayed from UDP on the real devices. |
 | 39 (first frame always over TCP, the iPad reports a stream that started on the wrong path within half a second, faster encoder mode) | Installed and used on 2026-11-14. Video stayed on UDP for a 62-minute session on home Wi-Fi (Late: average 2.3 ms, 1% high 12.2 ms). The Mac's sound was heard on the iPad and the log shows the Mac's speakers silenced. Encoding took 13.9 ms at 10 to 29 frames a second against 17.0 ms in build 38, and click-to-screen 37.3 ms against 41.1. A session through WireGuard worked (46 ms round trip, video on UDP), but the Mac re-sent a piece of every frame after a fixed 35 ms without an acknowledgement, counted those as loss, and cut the bitrate to its 1.5 Mbps floor within a minute. |
-| 40 (the Mac learns how long acknowledgements take; its own probes no longer count as loss) | Built and unit-tested. Not yet run on the real devices. |
+| 40 (the Mac learns how long acknowledgements take; its own probes no longer count as loss) | Installed on 2026-11-14 and used on home Wi-Fi (video on UDP, no bitrate cuts). Not yet used through the VPN, which is where its fix matters. |
+| 41 (parity packets on slow links, connections without forward secrecy refused, no automatic use of the saved password, Dock brought over while iPad only waits, refused connections logged) | Built and unit-tested. Not yet run on the real devices. |
 
 Not yet confirmed on real hardware, even in the installed builds:
 
 - that the Mac's speakers really are silent while the iPad plays its sound (the log says the Mac asked for that; nobody has yet confirmed it by ear);
 - pinch and rotate actually reaching Mac apps (a unit test shows AppKit reads the injected events as magnify and rotate events, nothing more).
 
-`swift test` runs 152 tests with no failures (last run 2026-11-14 on the build 40 sources). Tests use the Mac's hardware encoder and loopback connections; they never capture the screen.
+`swift test` runs 156 tests with no failures (last run 2026-11-14 on the build 41 sources). Tests use the Mac's hardware encoder and loopback connections; they never capture the screen.
 
 ## Requirements
 
@@ -225,7 +226,7 @@ The Mac's displays and arrangement come back when you tap **Restore Mac**, when 
 Safeguards:
 
 - A separate helper process (`SkyDeskRestore`, inside the app bundle) gets a heartbeat every second and restores the saved layout if the host quits, crashes or stalls for six seconds.
-- The Mac's display stays off for at least 5 seconds and on for at least 20 before it is switched again, because switching the built-in panel in quick succession once left it dark (2026-11-13). The toolbar shows **Switching…** while the Mac waits.
+- The Mac's display stays off for at least 5 seconds and on for at least 20 before it is switched again, because switching the built-in panel in quick succession once left it dark (2026-11-13). The toolbar shows **Switching…** while the Mac waits, and since build 41 the Dock is brought onto the iPad's desktop straight away during that wait, the same way "Show Dock here" does it (not yet seen on the real devices).
 - Only which displays are enabled and where they sit is changed; never resolution, brightness or mirroring. Display sleep is held off while the mode is on.
 
 This uses the private `SLSConfigureDisplayEnabled` call, behind an availability check. It is a convenience, not a security lock.
@@ -275,6 +276,7 @@ Every message has a 12-byte header (`SKYD`, version, kind, length). The length i
 - Frames are still handed to the decoder complete and in order, because each one builds on the one before. The stream therefore stays lossless and still needs no periodic keyframes. What changes is how long a loss costs.
 - Frames carry their sequence number on both paths and the iPad orders them by it, so switching paths needs no keyframe. TCP always carries the first frame of a session, whatever its size (build 39; build 38 chose by size alone and failed on a small first frame), and any frame over 256 kB (a keyframe is a megabyte or two; as datagrams one measured 2 MB frame took 110 ms and delayed the frames behind it).
 - If the UDP flow never comes up (a network that blocks it), or the Mac gets no acknowledgement for a second while frames are outstanding, or the iPad's flow fails or receives video before the stream has started, everything outstanding is re-sent over TCP and the session carries on there. It does not return to UDP until the next connection.
+- **Parity (build 41).** A lost piece normally costs a round trip: a few milliseconds at home, about 50 through a VPN. When acknowledgements take longer than 40 ms the Mac adds one parity packet after every 8 pieces of a frame (after every 4 when 3% or more of the pieces are being asked for again): the XOR of the group, from which the iPad rebuilds one missing piece of that group without asking. Two losses in one group still go the asking route. It switches off again below 28 ms, so home Wi-Fi does not pay for it. Simulated with 2% loss and a 46 ms round trip: median 24 ms from "encoded" to "ready to decode" instead of 66, 99th percentile 74.5 instead of 101.5, for 14% more data. Over real sockets on one Mac with 5% loss the iPad side asked again for 115 pieces instead of 371.
 - Nothing slows a UDP sender down by itself, so the Mac paces its datagrams (six times the video bitrate, at least 30 Mbps) and the bitrate control treats a link on which 12% or more of the datagrams have to be sent twice as congested.
 
 What has been tested, all on one Mac: the logic against a simulated link (120 frames a second at about 25 Mbps; with 1% loss and a 5 ms round trip, median 3.5 ms and 99th percentile 23 ms from "encoded" to "ready to decode"; 5% loss, 12.5 and 34.5 ms; 2% loss with a 40 ms round trip, 56.5 and 80.5 ms; every frame delivered in order each time); the real sockets on loopback through a relay that drops datagrams (5% loss repaired on UDP, a blocked UDP path continuing over TCP without a missing frame, a wrong key refused); and real hardware-encoded video at 2752 × 2064 and 120 frames a second through 2% loss, all 300 frames decoded in order. For comparison, the usual estimate of what TCP can carry under loss (1.22 × segment size ÷ (round trip × √loss)) gives about 28 Mbps at 1% loss and 5 ms, and about 2.5 Mbps at 2% loss and 40 ms; that is a formula, not a measurement of this code. **Whether UDP improves anything on a real network has not been measured.** Compare the Late figure with "Video over UDP" off and on.
@@ -319,12 +321,14 @@ A fourth connection, so sound never waits behind video or files. Opus packets ca
 
 **Paired iPads.** The Mac lists up to twelve. **Remove** deletes one iPad's key and disconnects it if it is connected; the others are untouched. Changing the password does not affect iPads that already have their own key. With "Let new iPads pair with the password" off, the Mac accepts only the listed iPads' keys and the password opens nothing. If no iPad has a key, the password always works, so the Mac cannot be left with no way in. A removed iPad still knows the password: while password pairing is on it can pair again, so change the password as well if it should stay out.
 
-**Forward secrecy (build 37).** Both sides prefer `TLS_ECDHE_PSK_WITH_CHACHA20_POLY1305_SHA256`: the pre-shared key proves who is connecting, and a fresh Diffie-Hellman exchange supplies each connection's keys, so a key that leaks later cannot decrypt sessions recorded earlier. If either side is older than build 37 the connection falls back to `TLS_PSK_WITH_AES_128_GCM_SHA256`, which has no forward secrecy. The Mac's log records which was used. So far this has only been exercised by a unit test connecting to itself on the Mac, not between the real devices.
+**Forward secrecy (build 37, required since build 41).** Both sides list `TLS_ECDHE_PSK_WITH_CHACHA20_POLY1305_SHA256`: the pre-shared key proves who is connecting, and a fresh Diffie-Hellman exchange supplies each connection's keys, so a key that leaks later cannot decrypt sessions recorded earlier. The real devices have used it since build 37 (the Mac's log says so for each session). From build 41 a connection that ends up on the older `TLS_PSK_WITH_AES_128_GCM_SHA256`, which has no forward secrecy, is closed as soon as its handshake completes, on TCP and on the UDP flow alike; a device still on a build before 37 can therefore no longer connect and has to be updated by cable.
+
+That refusal happens after the handshake because it cannot happen in it: Apple's TLS offers and accepts the older suite whenever a pre-shared key is set, whatever suites the app lists (probed on 2026-11-14: a side listing only the new suite still connects to a side listing only the old one, on the old one).
 
 **What is weak, plainly.**
 
-- TLS with a pre-shared key is not a password-authenticated key exchange. The note in `PairingPassword.swift` assumes that anyone who records one handshake made with the password key, or who connects once to the Mac, can test password guesses offline. That note was written before build 37's forward-secret suite. By the rules of TLS 1.2 that suite should stop someone who only records a handshake from testing guesses, because the session keys then also depend on a Diffie-Hellman secret the recorder does not have. It does not stop someone the iPad can be made to connect to in place of the Mac, and because the older suite is still accepted for compatibility, someone in the middle of the connection could force its use. This is reasoning from the protocol, not something tested here; treat the note's assumption as still standing. The only defences are the password's own strength (a generated one has about 39.6 bits) and the cost of a guess (about 0.14 s on an M4 Max core). The salt is shared by all installations, so precomputed tables are possible in principle. A paired iPad's own key is not derived from a password and cannot be guessed this way.
-- The Mac does not limit or record failed attempts.
+- TLS with a pre-shared key is not a password-authenticated key exchange. The note in `PairingPassword.swift` assumes that anyone who records one handshake made with the password key, or who connects once to the Mac, can test password guesses offline. That note was written before build 37's forward-secret suite. By the rules of TLS 1.2 that suite should stop someone who only records a handshake from testing guesses, because the session keys then also depend on a Diffie-Hellman secret the recorder does not have. It does not stop someone the iPad can be made to connect to in place of the Mac, and because the older suite cannot be removed from the handshake (see above), someone in the middle of a connection can still force one handshake onto it and collect what is needed to test guesses, even though SkyDesk then drops that connection. This is reasoning from the protocol, not something tested here; treat the note's assumption as still standing for the password key. The practical defence since build 41: an iPad that has its own key uses only that key. If the Mac refuses it, the iPad stops and offers **Pair again**; it does not try the saved password key by itself, so the password key crosses the network only when someone pairs on purpose. The only defences are the password's own strength (a generated one has about 39.6 bits) and the cost of a guess (about 0.14 s on an M4 Max core). The salt is shared by all installations, so precomputed tables are possible in principle. A paired iPad's own key is not derived from a password and cannot be guessed this way.
+- The Mac does not limit failed attempts. Since build 41 it records them in its log (the address, the reason, and how many in the last minute, at most one line every ten seconds).
 - While password pairing is on, anyone who connects with the password can ask for a key under any iPad's identifier, which replaces that iPad's key (it then falls back to the password and is issued a new one). With password pairing off, an iPad can only renew its own.
 - The UDP video flow is DTLS 1.2 with the same keys and suites, so everything above applies to it equally.
 - Whoever holds a valid key gets everything the settings allow: the display, input, clipboard text, files into Downloads, the Mac's sound, and switching off the Mac's displays.
@@ -351,7 +355,7 @@ A fourth connection, so sound never waits behind video or files. Opus packets ca
 ## Tests and checks
 
 ```sh
-swift test                                  # 152 tests at build 40 (about 20 s; a few open loopback sockets)
+swift test                                  # 156 tests at build 41 (about 30 s; several open loopback sockets) (about 20 s; a few open loopback sockets)
 swift run skydesk-check --frames 120        # synthetic frames, hardware HEVC, encrypted loopback
 swift run skydesk-check --width 1920 --height 1200 --frames 240 --low-latency
 ```
@@ -362,7 +366,7 @@ The tests cover message framing and hostile input, HEVC framing, 4:4:4 colour, g
 
 Two self-checks exist for development: starting the host with `SKYDESK_SMOKE_PNG=<file>` builds its window off screen, saves a picture and exits without opening the port or touching displays; `SKYDESK_DEMO=1` in the simulator shows the streaming screen with generated frames.
 
-Still to do on the real devices: run build 40 through the VPN and see the bitrate stay up; switch 4:4:4 on once; compare the Late figure with video over UDP off and on; the three unconfirmed items under [Status](#status); and film an input and its response at high speed, with both screens in view, to check the delay estimates.
+Still to do on the real devices: run build 41 through the VPN and see the bitrate stay up and parity switch on; switch 4:4:4 on once; compare the Late figure with video over UDP off and on; the three unconfirmed items under [Status](#status); and film an input and its response at high speed, with both screens in view, to check the delay estimates.
 
 ## Source map
 
@@ -375,7 +379,7 @@ Still to do on the real devices: run build 40 through the VPN and see the bitrat
 - `Config`: Info.plists, entitlements, icons. `project.yml`: the Xcode project definition. `Package.swift`: the core library, tests and `skydesk-check`. `scripts/build.sh`: both apps.
 - `Verification`: build and test logs and source snapshots kept along the way. `VERIFICATION.md`, `findings.md`, `progress.md`, `task_plan.md`: notes from the first builds on 2026-11-12, not kept up to date.
 
-Files the host writes: `~/Library/Logs/SkyDesk/stream-metrics.log` (numbers and events from both devices, no screen content, restarted above 4 MB), `display-session.log` and `update.log` beside it, and `~/Library/Application Support/SkyDesk` (staged updates, the update authority, display-switch timing).
+Files the host writes: `~/Library/Logs/SkyDesk/stream-metrics.log` (numbers and events from both devices, no screen content; above 4 MB it starts again and, since build 41, keeps the one before as `stream-metrics.previous.log`), `display-session.log` and `update.log` beside it, and `~/Library/Application Support/SkyDesk` (staged updates, the update authority, display-switch timing).
 
 ## Apple references
 
