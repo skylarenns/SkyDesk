@@ -5,6 +5,11 @@ import Foundation
 /// Two signs of trouble, both measured on the Mac: video waiting to be sent (`backlogBytes`), and frames taking
 /// longer than usual from "handed to the network" to "acknowledged by the iPad" (`transitMS`). Encoder time is
 /// not part of either, so a busy Mac never looks like a slow network.
+///
+/// A slow network path is not that kind of trouble. On 2026-11-13 the iPad's Wi-Fi answered everything (plain
+/// pings included) about 80 ms late for two minutes; build 33 read that as congestion and held the bitrate at
+/// its floor, which blurred the picture and could not shorten the delay. So the iPad's own round-trip time is
+/// taken off first: only time beyond it, video waiting behind a link that cannot carry it, counts as late.
 public struct BitrateController: Equatable {
     public struct Sample {
         /// Length of the interval the sample covers.
@@ -16,9 +21,11 @@ public struct BitrateController: Equatable {
         public var backlogBytes: Int
         /// Video bytes the iPad acknowledged in the interval: what the network actually carried.
         public var deliveredBytes: Int
-        public init(seconds: Double, transitMS: Double, acknowledged: Int, backlogBytes: Int, deliveredBytes: Int) {
+        /// The network round trip the iPad last measured with its own small pings, if known.
+        public var roundTripMS: Double?
+        public init(seconds: Double, transitMS: Double, acknowledged: Int, backlogBytes: Int, deliveredBytes: Int, roundTripMS: Double? = nil) {
             self.seconds = seconds; self.transitMS = transitMS; self.acknowledged = acknowledged
-            self.backlogBytes = backlogBytes; self.deliveredBytes = deliveredBytes
+            self.backlogBytes = backlogBytes; self.deliveredBytes = deliveredBytes; self.roundTripMS = roundTripMS
         }
     }
     public static let floor = 1_500_000
@@ -38,6 +45,10 @@ public struct BitrateController: Equatable {
     private var sinceTrouble = 0.0
     private var sinceCut = 10.0
     private var backedUpBefore = false
+    /// How long frames have been late without a break. The iPad's round-trip figure is a two-second average, so a
+    /// path that has just become slow looks like queueing for a moment; real queueing lasts.
+    private var lateFor = 0.0
+    public static let lateBeforeCutting = 1.5
     private var grace = 0.0
 
     public init(maximum: Int) {
@@ -46,20 +57,26 @@ public struct BitrateController: Equatable {
         target = self.maximum
     }
     /// Ignore the next `seconds`: a keyframe (session start, return from the background) is a burst, not congestion.
-    public mutating func startGrace(_ seconds: Double) { grace = max(grace, seconds); backedUpBefore = false }
+    public mutating func startGrace(_ seconds: Double) { grace = max(grace, seconds); backedUpBefore = false; lateFor = 0 }
 
     /// Returns the new target when it changed.
     public mutating func update(_ sample: Sample) -> Int? {
         let seconds = max(0.01, min(5, sample.seconds))
         sinceCut += seconds; sinceTrouble += seconds
         if grace > 0 { grace -= seconds; return nil }
-        var delayed = false
+        var late = false
+        var queued = 0.0
         if sample.acknowledged >= 5, sample.transitMS.isFinite, sample.transitMS > 0 {
+            // Time beyond the path's own round trip (a floor of 3 ms keeps the arithmetic sane).
+            let path = sample.roundTripMS.map { max(0, $0) } ?? 0
+            queued = max(3, sample.transitMS - path)
             if let usual = baseline {
-                delayed = sample.transitMS > usual + max(30, usual)
-                baseline = min(sample.transitMS, usual * (1 + 0.01 * seconds))
-            } else { baseline = sample.transitMS }
+                late = queued > usual + max(30, usual)
+                baseline = min(queued, usual * (1 + 0.01 * seconds))
+            } else { baseline = queued }
         }
+        lateFor = late ? lateFor + seconds : 0
+        let delayed = lateFor >= Self.lateBeforeCutting
         let backlogSeconds = Double(max(0, sample.backlogBytes)) * 8 / Double(target)
         // One reading above a quarter second can be a single large frame caught mid-send; two in a row cannot.
         let backedUp = backlogSeconds > 1 || (backlogSeconds > 0.25 && backedUpBefore)
@@ -77,7 +94,7 @@ public struct BitrateController: Equatable {
             sinceTrouble = 0
             guard next < target else { return nil }
             reason = backedUp ? String(format: "%.1f s of video waiting to be sent", backlogSeconds)
-                              : String(format: "frames taking %.0f ms instead of the usual %.0f ms", sample.transitMS, baseline ?? 0)
+                              : String(format: "frames queueing %.0f ms instead of the usual %.0f ms", queued, baseline ?? 0)
             target = next; sinceCut = 0
             return target
         }

@@ -103,7 +103,37 @@ final class HostAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let summary = "headline=\(host.headline) menuBarItems=\(items) content=\(Int(view.bounds.width))x\(Int(view.bounds.height)) "
             + "loginStatus=\(SMAppService.mainApp.status.rawValue) policy=\(NSApp.activationPolicy().rawValue)\n"
         try? summary.write(toFile: picture + ".txt", atomically: true, encoding: .utf8)
-        exit(0)
+        // SKYDESK_SMOKE_AUDIO=1 also reads the Mac's sound for 1.5 s, never silencing it, and reports what arrived.
+        guard ProcessInfo.processInfo.environment["SKYDESK_SMOKE_AUDIO"] != nil, #available(macOS 14.2, *) else { exit(0) }
+        let tap = SystemAudioTap()
+        let counts = SmokeAudioCounts()
+        // Off the main thread, as in a real session; a start that never returns is reported instead of hanging.
+        DispatchQueue.global(qos: .userInitiated).async {
+            var report = summary
+            do {
+                counts.stage = "creating the tap"
+                try tap.start(muted: false)
+                counts.stage = "started"
+                guard let format = tap.format else { throw DeskError.invalid("no format") }
+                let encoder = try OpusEncoder(input: format)
+                report += "audio format=\(format.sampleRate) Hz, \(format.channelCount) ch, interleaved=\(format.isInterleaved), float=\(format.commonFormat == .pcmFormatFloat32)\n"
+                tap.setHandler { buffer in
+                    counts.buffers += 1; counts.frames += Int(buffer.frameLength)
+                    counts.peak = max(counts.peak, AudioCaptureWorker.peak(buffer))
+                    if let packets = try? encoder.encode(buffer) { counts.packets += packets.count; counts.bytes += packets.reduce(0) { $0 + $1.count } }
+                    else { counts.failures += 1 }
+                }
+                Thread.sleep(forTimeInterval: 1.5)
+                tap.stop()
+                report += "audio buffers=\(counts.buffers) frames=\(counts.frames) peak=\(counts.peak) packets=\(counts.packets) bytes=\(counts.bytes) failures=\(counts.failures)\n"
+            } catch { report += "audio FAILED: \(error.localizedDescription)\n" }
+            try? report.write(toFile: picture + ".txt", atomically: true, encoding: .utf8)
+            exit(0)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6) {
+            try? (summary + "audio BLOCKED while \(counts.stage) (no answer after 6 s)\n").write(toFile: picture + ".txt", atomically: true, encoding: .utf8)
+            exit(5)
+        }
     }
     func windowWillClose(_ notification: Notification) {
         DispatchQueue.main.async { [weak self] in
@@ -432,6 +462,9 @@ private struct HostView: View {
                 Toggle("Allow keyboard, trackpad and touch input", isOn: $host.allowInput)
                 Toggle("Sync clipboard text with the iPad automatically", isOn: $host.allowClipboard)
                 Toggle("Allow file transfers (incoming files go to Downloads)", isOn: $host.allowFiles)
+                Toggle("Play this Mac's sound on the iPad", isOn: $host.allowAudio)
+                Text("The Mac's own speakers go quiet only while the iPad is playing. macOS asks once for permission to record system audio.")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 Toggle("Low-latency rate control (experimental)", isOn: $host.lowLatencyRateControl)
                 Text("Changes apply the next time the iPad connects.").font(.caption).foregroundStyle(.secondary)
             }.padding(.top, 8).disabled(host.clientConnected || host.busy)
@@ -509,4 +542,11 @@ private struct TransferRow: View {
             }
         }
     }
+}
+
+/// Only for the development self-check; touched on the sound tap's queue, read after it has stopped.
+private final class SmokeAudioCounts: @unchecked Sendable {
+    var buffers = 0, frames = 0, packets = 0, bytes = 0, failures = 0
+    var stage = "not started"
+    var peak: Float = 0
 }

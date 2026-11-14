@@ -14,7 +14,8 @@ public enum DeskError: Error, LocalizedError, Equatable {
 
 /// `file` (chunks of a file transfer) only ever travels on the file channel, opened when both sides list
 /// StreamFeature.fileTransfer; older builds never see it.
-public enum WireKind: UInt8 { case control = 1, video = 2, file = 3 }
+/// `audio` (compressed sound) only ever travels on the audio channel, opened when both sides list StreamFeature.audio.
+public enum WireKind: UInt8 { case control = 1, video = 2, file = 3, audio = 4 }
 
 public struct WirePacket {
     public let kind: WireKind
@@ -46,6 +47,7 @@ public struct WireParser {
         switch kind {
         case .video: return 8 * 1_024 * 1_024
         case .file: return FileSender.chunkSize + 64
+        case .audio: return AudioPacket.maximumBytes + 8
         case .control: return 64 * 1_024
         }
     }
@@ -96,10 +98,12 @@ public enum StreamFeature {
     public static let remoteUpdate = 256
     /// The iPad sends `gesture` (pinch to zoom, rotate) and the Mac replays it as a trackpad gesture.
     public static let gestures = 512
+    /// The iPad may open a fourth channel (Hello.Role.audio) on which the Mac sends its sound.
+    public static let audio = 1_024
 }
 
 public struct Hello: Codable {
-    public enum Role: String, Codable { case control, video, files }
+    public enum Role: String, Codable { case control, video, files, audio }
     public let session: UUID
     public let role: Role
     public let display: ClientDisplay?
@@ -244,6 +248,11 @@ public enum ControlMessage: Codable {
     case updateCertificateRequest
     /// iPad → Mac, only with StreamFeature.gestures.
     case gesture(GestureEvent)
+    /// Audio channel only, Mac → iPad: how the sound that follows is encoded.
+    case audioFormat(AudioStreamInfo)
+    /// Audio channel only, iPad → Mac: whether the iPad is playing the Mac's sound right now. The Mac silences
+    /// its own speakers only while this is true.
+    case audioPlaying(Bool)
 }
 
 public struct VideoFrame {

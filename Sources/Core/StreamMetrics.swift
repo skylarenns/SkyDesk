@@ -160,6 +160,13 @@ public enum StatisticsText {
                       s.fps, n(s.fpsLow1), s.arrivedFPS, s.megabitsPerSecond, n(s.rttAverageMS), n(s.rttHigh1MS),
                       n(s.displayAverageMS), n(s.displayHigh1MS), n(s.totalAverageMS), n(s.totalHigh1MS), n(s.decodeAverageMS), link)
     }
+    /// The average round trip (ms) from a `logLine`; nil when the line has none yet. The Mac's bitrate control
+    /// reads it to tell a slow network path from video queueing up behind a slow link.
+    public static func roundTrip(fromLogLine line: String) -> Double? {
+        guard let start = line.range(of: " rtt=")?.upperBound, let end = line[start...].firstIndex(of: "/"),
+              let value = Double(line[start..<end]), value.isFinite, value >= 0, value < 60_000 else { return nil }
+        return value
+    }
     public static let explanation = "Avg: last 2 s. 1% high/low: 99th percentile of the last 10 s, shown once 100 samples exist. "
         + "1% low skips pauses where the Mac screen was not changing. RTT: network round trip, 20 samples/s. "
         + "Total: Mac capture and encoding + network round trip + iPad display."

@@ -130,6 +130,21 @@ final class ClientModel: ObservableObject {
     @Published var syncClipboard = UserDefaults.standard.object(forKey: "syncClipboard") as? Bool ?? true {
         didSet { UserDefaults.standard.set(syncClipboard, forKey: "syncClipboard") }
     }
+    /// Play the Mac's sound here (build 34). Switchable during a session when the Mac offers sound.
+    @Published var playMacSound = UserDefaults.standard.object(forKey: "playMacSound") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(playMacSound, forKey: "playMacSound")
+            guard oldValue != playMacSound, info != nil else { return }
+            if playMacSound {
+                if soundOffered, let target = activeTarget { openAudio(endpoint: target.endpoint, key: target.key, session: token) }
+                else { notice = "This Mac isn't sending sound. Update SkyDesk on the Mac, or switch sound on in its Display & quality settings." }
+            } else { closeAudio() }
+        }
+    }
+    /// The Mac agreed to send sound in this session.
+    var soundOffered: Bool { (info?.features ?? 0) & StreamFeature.audio != 0 }
+    private var audioChannel: SecureChannel?
+    private var audioPlayer: AudioPlayer?
     /// Newest first.
     @Published var transfers: [FileTransferEngine.Progress] = []
     @Published var filesReady = false
@@ -416,7 +431,7 @@ final class ClientModel: ObservableObject {
         self.videoQueue = videoQueue; self.videoGate = gate; self.decoder = decoder
         var features = StreamFeature.idleGapFlags | StreamFeature.pauseVideo | StreamFeature.liveCursorToggle
             | StreamFeature.clipboardSync | StreamFeature.fileTransfer | StreamFeature.scrollMomentum | StreamFeature.remoteUpdate
-            | StreamFeature.gestures
+            | StreamFeature.gestures | StreamFeature.audio
         if localPointer { features |= StreamFeature.localCursor }
         control.onReady = { [weak control] in
             control?.send(.hello(Hello(session: session, role: .control, display: display, features: features, appBuild: Self.ownBuild)))
@@ -463,6 +478,7 @@ final class ClientModel: ObservableObject {
                         self.checkClipboard()
                     }
                     if agreed & StreamFeature.fileTransfer != 0 { self.openFiles(endpoint: endpoint, key: key, session: session) }
+                    if agreed & StreamFeature.audio != 0, self.playMacSound { self.openAudio(endpoint: endpoint, key: key, session: session) }
                     UIApplication.shared.isIdleTimerDisabled = true
                     if AutoPadOnly.shouldStart(setting: self.startIPadOnly, supported: info.displayBlankingSupported == true) {
                         // A moment for the new iPad desktop to settle before it becomes the only display.
@@ -611,6 +627,7 @@ final class ClientModel: ObservableObject {
         clipboard = nil; localCursorActive = false
         fileEngine?.close(reason: "Disconnected from the Mac."); fileEngine = nil
         files?.close(); files = nil; filesReady = false
+        closeAudio()
         info = nil; connecting = false
         if let reason { status = reason }
         textFocus = .none; keyboardWanted = false; awaitingTextFocus = false; lastTapRect = nil; remoteCursor = nil
@@ -642,6 +659,7 @@ final class ClientModel: ObservableObject {
         case .pauseAndHold:
             resumeTarget = activeTarget
             if let gate = videoGate { videoQueue?.async { gate.paused = true } }
+            audioPlayer?.setSuspended(true)
             control?.send(.pauseVideo(true))
             beginBackgroundTask()
         case .disconnectAndResumeLater:
@@ -665,6 +683,7 @@ final class ClientModel: ObservableObject {
                 // Ordered on the video queue before any frame sent after the resume request.
                 videoQueue?.async { decoder.reset(); gate.needKeyframe = true; gate.paused = false }
             }
+            audioPlayer?.setSuspended(false)
             control?.send(.pauseVideo(false))
             checkClipboard()
         case .reconnect:
@@ -905,6 +924,44 @@ final class ClientModel: ObservableObject {
                 sync.wroteRemote(changeCount: count); self.clipboard = sync
             }
         }
+    }
+
+    // MARK: Sound
+
+    /// A fourth connection that only carries the Mac's sound, so it never waits behind video or files.
+    private func openAudio(endpoint: NWEndpoint, key: PairingKey, session: UUID) {
+        guard audioChannel == nil else { return }
+        let queue = DispatchQueue(label: "skydesk.audio.net", qos: .userInteractive)
+        let channel = SecureChannel(connection: NWConnection(to: endpoint, using: DeskNetwork.parameters(key: key)), queue: queue,
+                                    maxPendingBytes: 64 * 1_024)
+        let player = AudioPlayer()
+        player.onPlaying = { [weak channel] in channel?.send(.audioPlaying($0)) }
+        player.onFailure = { [weak self, weak channel] reason in
+            channel?.close()
+            DispatchQueue.main.async { self?.notice = reason }
+        }
+        channel.onReady = { [weak channel] in channel?.send(.hello(Hello(session: session, role: .audio))) }
+        channel.onPacket = { [weak channel] packet in
+            do {
+                if packet.kind == .audio { player.receive(try AudioPacket(packet: packet)); return }
+                guard case .audioFormat(let format) = try packet.controlMessage(), format.isValid else { throw DeskError.invalid("Unexpected sound message.") }
+                player.configure(format)
+            } catch { channel?.close(reason: error.localizedDescription) }
+        }
+        channel.onClose = { [weak self, weak channel] _ in
+            player.stop()
+            DispatchQueue.main.async {
+                guard let self, let channel, self.audioChannel === channel else { return }
+                self.audioChannel = nil; self.audioPlayer = nil
+            }
+        }
+        audioChannel = channel; audioPlayer = player
+        if inBackground { player.setSuspended(true) }
+        channel.start()
+    }
+    private func closeAudio() {
+        audioPlayer?.stop(); audioPlayer = nil
+        audioChannel?.close(); audioChannel = nil
     }
 
     // MARK: Files

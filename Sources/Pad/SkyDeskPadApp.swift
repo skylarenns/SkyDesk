@@ -3,9 +3,46 @@ import UniformTypeIdentifiers
 
 /// UIKit owns the window (build 31) so the root view controller can keep the app in landscape; SwiftUI draws
 /// everything inside it, exactly as before.
+///
+/// The window and the session's lifecycle hang off scene notifications, not the scene delegate: iPadOS reopens an
+/// app with the scene set-up it saved earlier, and a set-up saved by a build before 31 names a delegate that draws
+/// nothing here. Build 31 relied on its own delegate and came up black after the update until the app was fully
+/// closed (user report 2026-11-13); notifications arrive whichever delegate the saved set-up names.
 @main
 final class PadAppDelegate: UIResponder, UIApplicationDelegate {
     let client = ClientModel()
+    private var windows: [ObjectIdentifier: UIWindow] = [:]
+    private var observers: [NSObjectProtocol] = []
+    func application(_ application: UIApplication, didFinishLaunchingWithOptions options: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
+        let center = NotificationCenter.default
+        observers.append(center.addObserver(forName: UIScene.willConnectNotification, object: nil, queue: .main) { [weak self] note in
+            MainActor.assumeIsolated { self?.attach(note.object as? UIScene) }
+        })
+        observers.append(center.addObserver(forName: UIScene.didDisconnectNotification, object: nil, queue: .main) { [weak self] note in
+            MainActor.assumeIsolated {
+                guard let scene = note.object as? UIScene else { return }
+                self?.windows[ObjectIdentifier(scene)] = nil
+            }
+        })
+        observers.append(center.addObserver(forName: UIScene.didActivateNotification, object: nil, queue: .main) { [weak self] note in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                // A scene that connected before this observer existed still gets its window.
+                self.attach(note.object as? UIScene)
+                // The first call starts discovery and tries the most recent Mac; later calls only resume.
+                self.client.launch()
+                self.client.enterForeground()
+            }
+        })
+        // Held keys and buttons are released on the Mac whenever the iPad stops being in front.
+        observers.append(center.addObserver(forName: UIScene.willDeactivateNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.client.releaseInput() }
+        })
+        observers.append(center.addObserver(forName: UIScene.didEnterBackgroundNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.client.enterBackground() }
+        })
+        return true
+    }
     func application(_ application: UIApplication, configurationForConnecting session: UISceneSession,
                      options: UIScene.ConnectionOptions) -> UISceneConfiguration {
         let configuration = UISceneConfiguration(name: "SkyDesk", sessionRole: session.role)
@@ -15,33 +52,28 @@ final class PadAppDelegate: UIResponder, UIApplicationDelegate {
     func application(_ application: UIApplication, supportedInterfaceOrientationsFor window: UIWindow?) -> UIInterfaceOrientationMask {
         .landscape
     }
-}
-
-final class PadSceneDelegate: UIResponder, UIWindowSceneDelegate {
-    var window: UIWindow?
-    private var client: ClientModel? { (UIApplication.shared.delegate as? PadAppDelegate)?.client }
-    func scene(_ scene: UIScene, willConnectTo session: UISceneSession, options: UIScene.ConnectionOptions) {
-        guard let scene = scene as? UIWindowScene, let client else { return }
+    private func attach(_ scene: UIScene?) {
+        guard let scene = scene as? UIWindowScene, windows[ObjectIdentifier(scene)] == nil else { return }
         let window = UIWindow(windowScene: scene)
         window.rootViewController = LandscapeHostingController(rootView: PadRootView(client: client))
-        self.window = window
+        // In front of anything a delegate from an older saved set-up may have put up.
+        if !(scene.delegate is PadSceneDelegate) { window.windowLevel = .normal + 1 }
+        windows[ObjectIdentifier(scene)] = window
         window.makeKeyAndVisible()
+    }
+}
+
+/// Only receives files: "Open in SkyDesk" from the share sheet or Files sends them to the Mac.
+final class PadSceneDelegate: UIResponder, UIWindowSceneDelegate {
+    private var client: ClientModel? { (UIApplication.shared.delegate as? PadAppDelegate)?.client }
+    func scene(_ scene: UIScene, willConnectTo session: UISceneSession, options: UIScene.ConnectionOptions) {
         open(options.urlContexts)
     }
-    /// "Open in SkyDesk" from the share sheet or Files: send the file to the Mac.
     func scene(_ scene: UIScene, openURLContexts contexts: Set<UIOpenURLContext>) { open(contexts) }
     private func open(_ contexts: Set<UIOpenURLContext>) {
         let files = contexts.map(\.url).filter(\.isFileURL)
         if !files.isEmpty { client?.sendFiles(files) }
     }
-    func sceneDidBecomeActive(_ scene: UIScene) {
-        // The first call starts discovery and tries the most recent Mac; later calls only resume.
-        client?.launch()
-        client?.enterForeground()
-    }
-    /// Held keys and buttons are released on the Mac whenever the iPad stops being in front.
-    func sceneWillResignActive(_ scene: UIScene) { client?.releaseInput() }
-    func sceneDidEnterBackground(_ scene: UIScene) { client?.enterBackground() }
 }
 
 /// Landscape only (user request, build 31). The supported-orientation answer is enough where iPadOS honours it.
@@ -412,6 +444,7 @@ private struct StreamView: View {
                         // Settings in a submenu keep More short enough that it never scrolls under the pointer.
                         Menu {
                             Toggle("Start in iPad only mode", isOn: $client.startIPadOnly)
+                            Toggle("Play Mac sound on iPad", isOn: $client.playMacSound)
                             Toggle("iPad pointer (no delay)", isOn: $client.localPointer)
                             Picker("Pointer size", selection: $client.pointerScale) {
                                 Text("Small").tag(0.75); Text("Medium (Mac size)").tag(1.0); Text("Large").tag(1.5); Text("Extra large").tag(2.0)

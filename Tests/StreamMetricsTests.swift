@@ -184,3 +184,24 @@ final class TotalLatencyTests: XCTestCase {
         XCTAssertNil(fresh.snapshot(now: 21 * ms).totalAverageMS)
     }
 }
+
+final class RoundTripReportTests: XCTestCase {
+    func testTheMacReadsTheRoundTripTheIPadReports() {
+        XCTAssertEqual(StatisticsText.roundTrip(fromLogLine: "shown=17 low1=3.7 arrived=17 mbps=0.1 rtt=54.8/298.1 display=15.4/24.8 total=96.9/185.4 decode=2.1 link=wifi"), 54.8)
+        XCTAssertEqual(StatisticsText.roundTrip(fromLogLine: "shown=7 low1=- arrived=30 mbps=3.9 rtt=57.3/- display=1/- total=1/- decode=1 link=cable"), 57.3)
+        XCTAssertNil(StatisticsText.roundTrip(fromLogLine: "shown=7 low1=- arrived=30 mbps=3.9 rtt=-/- display=1/-"))
+        XCTAssertNil(StatisticsText.roundTrip(fromLogLine: "MAIN THREAD STALLED 1.0 s at tick:end"))
+        XCTAssertNil(StatisticsText.roundTrip(fromLogLine: "x rtt=nan/1"))
+    }
+    func testOnlyAFreshReportIsUsed() {
+        let path = ControlFastPath()
+        let control = UUID()
+        path.bind(control: control)
+        XCTAssertNil(path.roundTripMS())
+        XCTAssertEqual(path.handle(.clientStats("shown=1 low1=- arrived=1 mbps=0.1 rtt=42.0/- display=1/-"), channel: control, reply: { _ in }), .handled)
+        XCTAssertEqual(path.roundTripMS(), 42)
+        XCTAssertNil(path.roundTripMS(maxAge: 3, now: monotonicNanos() + 4_000_000_000))
+        path.bind(control: UUID())
+        XCTAssertNil(path.roundTripMS())
+    }
+}

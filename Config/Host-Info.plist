@@ -10,6 +10,7 @@
 <key>LSMinimumSystemVersion</key><string>$(MACOSX_DEPLOYMENT_TARGET)</string>
 <key>NSPrincipalClass</key><string>NSApplication</string>
 <key>LSUIElement</key><true/>
+<key>NSAudioCaptureUsageDescription</key><string>SkyDesk plays this Mac's sound on your iPad while it is connected.</string>
 <key>NSLocalNetworkUsageDescription</key><string>Share this Mac's display with your paired iPad on your local network.</string>
 <key>NSBonjourServices</key><array><string>_skydesk._tcp</string></array>
 </dict></plist>

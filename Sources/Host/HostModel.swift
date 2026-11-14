@@ -28,6 +28,12 @@ final class HostModel: ObservableObject {
     @Published var allowFiles = UserDefaults.standard.object(forKey: "allowFiles") as? Bool ?? true {
         didSet { UserDefaults.standard.set(allowFiles, forKey: "allowFiles") }
     }
+    /// Send the Mac's sound to the iPad (build 34). The Mac's speakers go quiet only while the iPad is playing it.
+    @Published var allowAudio = UserDefaults.standard.object(forKey: "allowAudio") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(allowAudio, forKey: "allowAudio") }
+    }
+    private var audioChannel: SecureChannel?
+    private var audio: HostAudio?
     /// Newest first; finished transfers stay listed until the next session.
     @Published var transfers: [FileTransferEngine.Progress] = []
     @Published var filesReady = false
@@ -277,6 +283,7 @@ final class HostModel: ObservableObject {
         cursorMonitor?.stop(); cursorMonitor = nil
         clipboardTimer?.invalidate(); clipboardTimer = nil; clipboard = nil
         bitrateTimer?.invalidate(); bitrateTimer = nil; bitrateController = nil
+        audio?.stop(); audio = nil; audioChannel = nil
         fileRoute.set(nil, engine: nil)
         fileEngine?.close(reason: "The iPad disconnected."); fileEngine = nil; files = nil; filesReady = false
         current.forEach { $0.close() }
@@ -324,6 +331,9 @@ final class HostModel: ObservableObject {
                     if self.control === channel || self.video === channel {
                         self.disconnect()
                         if let reason { self.status = reason }
+                    } else if self.audioChannel === channel {
+                        // Losing only the sound channel puts the sound back on the Mac, nothing else.
+                        self.audio?.stop(); self.audio = nil; self.audioChannel = nil
                     } else if self.files === channel {
                         // Losing only the file channel ends transfers, not the session.
                         self.fileRoute.set(nil, engine: nil)
@@ -336,7 +346,9 @@ final class HostModel: ObservableObject {
         channel.start()
         DispatchQueue.main.asyncAfter(deadline: .now() + 12) { [weak self, weak channel] in
             guard let self, let channel, self.channels[channel.id] != nil else { return }
-            if self.control !== channel && self.video !== channel && self.files !== channel { channel.close(reason: "Session handshake timed out.") }
+            if self.control !== channel && self.video !== channel && self.files !== channel && self.audioChannel !== channel {
+                channel.close(reason: "Session handshake timed out.")
+            }
             else if self.control == nil || self.video == nil { self.disconnect() }
         }
     }
@@ -344,6 +356,11 @@ final class HostModel: ObservableObject {
         guard channels[channel.id] != nil else { return }
         do {
             let message = try packet.controlMessage()
+            if channel === audioChannel {
+                guard case .audioPlaying(let playing) = message else { throw DeskError.invalid("Unexpected message on the sound channel.") }
+                audio?.setPadPlaying(playing)
+                return
+            }
             if control !== channel && video !== channel {
                 guard case .hello(let hello) = message else { throw DeskError.invalid("Missing session handshake.") }
                 guard sessionID == nil || sessionID == hello.session else { throw DeskError.invalid("Another iPad is connected.") }
@@ -373,6 +390,14 @@ final class HostModel: ObservableObject {
                     guard sessionID == hello.session, control != nil, files == nil, allowFiles,
                           clientFeatures & StreamFeature.fileTransfer != 0 else { throw DeskError.invalid("File transfer is not available.") }
                     openFiles(on: channel)
+                    return
+                case .audio:
+                    guard sessionID == hello.session, control != nil, audioChannel == nil, allowAudio, HostAudio.supported,
+                          clientFeatures & StreamFeature.audio != 0 else { throw DeskError.invalid("Sound is not available.") }
+                    let sound = HostAudio(channel: channel)
+                    sound.onStatus = { [weak self] in self?.control?.send(.failure($0)) }
+                    audioChannel = channel; audio = sound
+                    if capture?.isPaused != true { sound.start() } else { sound.setPaused(true); sound.start() }
                     return
                 }
                 sessionID = hello.session
@@ -414,6 +439,7 @@ final class HostModel: ObservableObject {
                 if paused { input.releaseAll() }
                 capture?.setPaused(paused)
                 bitrateController?.startGrace(1.5)
+                audio?.setPaused(paused)
                 MetricsLog.shared.append(paused ? "host  iPad in background: input released, video paused" : "host  iPad back: video resumed with keyframe")
                 status = paused ? "iPad is in the background · video paused" : (capture.map { "\($0.info.width) × \($0.info.height) · streaming to iPad" } ?? status)
             case .clipboard(let text):
@@ -498,7 +524,7 @@ final class HostModel: ObservableObject {
                 let pipeline = try DisplayCapture(display: display, longestEdge: useiPadDesktop ? 4096 : longestEdge, fps: sessionFPS,
                     bitrate: bitrateMbps * 1_000_000, inputEnabled: allowInput, lowLatencyRateControl: lowLatencyRateControl,
                     nativeDesktop: useiPadDesktop, clientFeatures: clientFeatures, hostName: Host.current().localizedName,
-                    clipboard: allowClipboard, files: allowFiles)
+                    clipboard: allowClipboard, files: allowFiles, audio: allowAudio && HostAudio.supported)
                 pipeline.onFrame = { [weak video] frame in
                     do { video?.send(WirePacket(kind: .video, payload: try frame.encoded())) }
                     catch { video?.close(reason: error.localizedDescription) }
@@ -566,12 +592,13 @@ final class HostModel: ObservableObject {
         guard !capture.isPaused else { return }
         let before = controller.target
         let changed = controller.update(.init(seconds: seconds, transitMS: transit.meanMS, acknowledged: transit.count,
-                                              backlogBytes: video?.backlogBytes ?? 0, deliveredBytes: transit.bytes))
+                                              backlogBytes: video?.backlogBytes ?? 0, deliveredBytes: transit.bytes,
+                                              roundTripMS: fastPath.roundTripMS()))
         bitrateController = controller
         guard let changed else { return }
         capture.setBitrate(changed)
-        // Every cut is logged with its cause; the climb back only when it reaches the setting again.
-        if changed < before {
+        // Every real cut is logged with its cause; the climb back only when it reaches the setting again.
+        if Double(changed) < Double(before) * 0.95 {
             MetricsLog.shared.append(String(format: "host  bitrate %.1f → %.1f Mbps (%@)", Double(before) / 1e6, Double(changed) / 1e6, controller.reason))
         } else if changed == controller.maximum {
             MetricsLog.shared.append(String(format: "host  bitrate back to %.1f Mbps", Double(changed) / 1e6))
