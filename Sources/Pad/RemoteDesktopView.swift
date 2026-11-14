@@ -16,6 +16,7 @@ struct RemoteDesktopView: UIViewRepresentable {
         view.keyboardDismissed = { [weak client] in client?.keyboardWanted = false }
         view.sendMomentum = { [weak client] in client?.scrollMomentum($0) }
         view.sendGesture = { [weak client] in client?.gesture($0) }
+        client.drawNote = { [weak view] in view?.drawNote ?? "" }
         view.desktopSwipe = { [weak client] in client?.desktopSwipe($0) }
         return view
     }
@@ -185,8 +186,10 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
     private func startDisplayLink(rate: Int) {
         displayLink?.invalidate()
         let link = CADisplayLink(target: DisplayLinkTarget(self), selector: #selector(DisplayLinkTarget.tick(_:)))
+        // Exactly the stream's rate, not a range: given 80–120, iPadOS chose the slow end and every frame waited
+        // longer for its turn (build 35: local display 19 ms instead of 16.4).
         let fastest = Float(max(30, rate))
-        link.preferredFrameRateRange = CAFrameRateRange(minimum: min(fastest, 80), maximum: fastest, preferred: fastest)
+        link.preferredFrameRateRange = CAFrameRateRange(minimum: fastest, maximum: fastest, preferred: fastest)
         link.add(to: .main, forMode: .common)
         displayLink = link
         mailbox.onArrival { [weak self] in DispatchQueue.main.async { self?.frameArrived() } }
@@ -197,10 +200,17 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
     }
     /// Every screen refresh: draw whatever is waiting (a new frame, or a redraw after a layout change).
     fileprivate func displayTick(_ link: CADisplayLink) {
-        pacer.tick(target: link.targetTimestamp, interval: link.targetTimestamp - link.timestamp)
+        let interval = link.targetTimestamp - link.timestamp
+        if interval > 0 { refreshHz = refreshHz == 0 ? 1 / interval : refreshHz * 0.9 + 0.1 / interval }
+        pacer.tick(target: link.targetTimestamp, interval: interval)
         let before = renderer?.submitted
         draw()
         if renderer?.submitted != before { pacer.drew() }
+    }
+    private var refreshHz = 0.0
+    /// For the diagnostic log: the display link's real rate, and how drawing on arrival is going.
+    var drawNote: String {
+        String(format: "hz=%.0f early=%d/%d margin=%.1f", refreshHz, pacer.hits, pacer.misses, pacer.margin * 1_000)
     }
     /// A frame finished decoding. If nothing has been drawn for the coming refresh and there is still time to
     /// make it, draw now; otherwise the next tick takes it, as before.

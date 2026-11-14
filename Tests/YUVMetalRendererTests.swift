@@ -25,7 +25,37 @@ final class YUVMetalRendererTests: XCTestCase {
         return pixels
     }
 
-    private func render(destination: CGRect, size: (Int, Int), sharpen: Float) throws -> (Int, Int) -> [UInt8] {
+    /// 64 × 32 4:4:4 frame: every other column pure red, the rest white. The colour plane is as wide as the picture.
+    private func fullColourFrame() throws -> CVPixelBuffer {
+        var buffer: CVPixelBuffer?
+        let attributes: [CFString: Any] = [kCVPixelBufferIOSurfacePropertiesKey: [:], kCVPixelBufferMetalCompatibilityKey: true]
+        XCTAssertEqual(CVPixelBufferCreate(nil, 64, 32, kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange,
+                                           attributes as CFDictionary, &buffer), kCVReturnSuccess)
+        let pixels = try XCTUnwrap(buffer)
+        CVPixelBufferLockBaseAddress(pixels, [])
+        let luma = CVPixelBufferGetBaseAddressOfPlane(pixels, 0)!.assumingMemoryBound(to: UInt8.self)
+        let lumaStride = CVPixelBufferGetBytesPerRowOfPlane(pixels, 0)
+        let chroma = CVPixelBufferGetBaseAddressOfPlane(pixels, 1)!.assumingMemoryBound(to: UInt8.self)
+        let chromaStride = CVPixelBufferGetBytesPerRowOfPlane(pixels, 1)
+        for y in 0..<32 { for x in 0..<64 {
+            let red = x % 2 == 1
+            luma[y * lumaStride + x] = red ? 63 : 235
+            chroma[y * chromaStride + x * 2] = red ? 102 : 128
+            chroma[y * chromaStride + x * 2 + 1] = red ? 240 : 128
+        } }
+        CVPixelBufferUnlockBaseAddress(pixels, [])
+        return pixels
+    }
+
+    func testFullColourFrameKeepsSinglePixelColumns() throws {
+        let pixel = try render(destination: CGRect(x: 0, y: 0, width: 64, height: 32), size: (64, 32), sharpen: 0, frame: fullColourFrame())
+        for x in [10, 20, 40] {
+            assertColor(pixel(x, 16), [255, 255, 255], "even column \(x) is white")
+            assertColor(pixel(x + 1, 16), [255, 0, 0], "odd column \(x + 1) is red")
+        }
+    }
+
+    private func render(destination: CGRect, size: (Int, Int), sharpen: Float, frame custom: CVPixelBuffer? = nil) throws -> (Int, Int) -> [UInt8] {
         guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("No Metal device.") }
         let renderer = try YUVMetalRenderer(device: device)
         let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: size.0, height: size.1, mipmapped: false)
@@ -33,7 +63,7 @@ final class YUVMetalRendererTests: XCTestCase {
         let target = try XCTUnwrap(device.makeTexture(descriptor: descriptor))
         let pass = MTLRenderPassDescriptor(); pass.colorAttachments[0].texture = target
         let command = try XCTUnwrap(device.makeCommandQueue()?.makeCommandBuffer())
-        XCTAssertTrue(renderer.encode(try frame(), pass: pass, commandBuffer: command, destination: destination, sharpen: sharpen))
+        XCTAssertTrue(renderer.encode(try custom ?? frame(), pass: pass, commandBuffer: command, destination: destination, sharpen: sharpen))
         command.commit(); command.waitUntilCompleted()
         XCTAssertNil(command.error)
         var bytes = [UInt8](repeating: 0, count: size.0 * size.1 * 4)

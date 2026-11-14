@@ -105,6 +105,30 @@ final class ClientModel: ObservableObject {
     @Published var presentOnArrival = UserDefaults.standard.object(forKey: "presentOnArrival") as? Bool ?? true {
         didSet { UserDefaults.standard.set(presentOnArrival, forKey: "presentOnArrival") }
     }
+    /// Ask the Mac for full colour detail (HEVC 4:4:4, build 36). Off by default: it uses more bitrate. Applies
+    /// from the next connection.
+    @Published var sharperColour = UserDefaults.standard.bool(forKey: "sharperColour") {
+        didSet {
+            UserDefaults.standard.set(sharperColour, forKey: "sharperColour")
+            guard oldValue != sharperColour else { return }
+            if sharperColour {
+                UserDefaults.standard.set(false, forKey: Self.colourFailedKey)
+                if !Self.canDecodeFullColour { notice = "This iPad's video decoder doesn't support 4:4:4, so the picture stays as it is." }
+                else if info != nil { notice = "Sharper colour starts the next time you connect." }
+            } else if info != nil { notice = "Applies the next time you connect." }
+        }
+    }
+    private static let colourFailedKey = "sharperColourFailed"
+    private static let canDecodeFullColour: Bool = {
+        #if targetEnvironment(simulator)
+        return false
+        #else
+        return HEVCDecoder.canDecode444()
+        #endif
+    }()
+    /// A 4:4:4 session that has not shown a frame yet. If it ends that way, 4:4:4 is switched off so the next
+    /// connection works again.
+    private var fullColourUnproven = false
     @Published var preferCable = UserDefaults.standard.bool(forKey: "preferCable") {
         didSet { UserDefaults.standard.set(preferCable, forKey: "preferCable") }
     }
@@ -148,6 +172,8 @@ final class ClientModel: ObservableObject {
     /// The Mac agreed to send sound in this session.
     var soundOffered: Bool { (info?.features ?? 0) & StreamFeature.audio != 0 }
     private var audioChannel: SecureChannel?
+    /// Set by the stream view: a few words about its drawing for the diagnostic log.
+    var drawNote: (() -> String)?
     private var audioPlayer: AudioPlayer?
     /// Newest first.
     @Published var transfers: [FileTransferEngine.Progress] = []
@@ -437,6 +463,7 @@ final class ClientModel: ObservableObject {
             | StreamFeature.clipboardSync | StreamFeature.fileTransfer | StreamFeature.scrollMomentum | StreamFeature.remoteUpdate
             | StreamFeature.gestures | StreamFeature.audio
         if localPointer { features |= StreamFeature.localCursor }
+        if sharperColour, Self.canDecodeFullColour, !UserDefaults.standard.bool(forKey: Self.colourFailedKey) { features |= StreamFeature.chroma444 }
         control.onReady = { [weak control] in
             control?.send(.hello(Hello(session: session, role: .control, display: display, features: features, appBuild: Self.ownBuild)))
         }
@@ -472,6 +499,7 @@ final class ClientModel: ObservableObject {
                     }
                     self.remember(target, info: info, path: control?.connection.currentPath)
                     let agreed = info.features ?? 0
+                    self.fullColourUnproven = agreed & StreamFeature.chroma444 != 0
                     self.localCursorActive = agreed & StreamFeature.localCursor != 0
                     if agreed & StreamFeature.clipboardSync != 0 {
                         // Baseline = the clipboard as it was when the user left SkyDesk, so something copied in
@@ -622,6 +650,13 @@ final class ClientModel: ObservableObject {
     }
     private func endSession(reason: String?, keepDeadline: Bool = false) {
         token = UUID()
+        if fullColourUnproven {
+            // The session ended before a single 4:4:4 frame reached the screen: don't walk into that again.
+            fullColourUnproven = false
+            UserDefaults.standard.set(true, forKey: Self.colourFailedKey)
+            sharperColour = false
+            notice = "Sharper colour (4:4:4) didn't work on this connection, so it has been switched off."
+        }
         if !keepDeadline { probe?.cancel(); probe = nil }
         if !keepDeadline, autoDeadline != nil { clearAutoDeadline() }
         heartbeat?.invalidate(); heartbeat = nil
@@ -1053,13 +1088,16 @@ final class ClientModel: ObservableObject {
         }
         guard !inBackground else { return }
         let values = mailbox.statistics.snapshot()
+        if fullColourUnproven, values.fps > 0 { fullColourUnproven = false }
         Breadcrumb.mark("tick:text")
         stats.update(headline: StatisticsText.headline(values), network: StatisticsText.network(values),
                      display: StatisticsText.total(values), details: StatisticsText.pipeline(values),
                      corner: StatisticsText.corner(values, build: Self.ownBuild))
         statsTick += 1
         if statsTick % 2 == 0, (info?.features ?? 0) & StreamFeature.clientStatsLog != 0 {
-            control?.send(.clientStats(StatisticsText.logLine(values, link: usingCable ? "cable" : usingVPN ? "vpn" : networkSymbol)))
+            let note = drawNote?() ?? ""
+            control?.send(.clientStats(StatisticsText.logLine(values, link: usingCable ? "cable" : usingVPN ? "vpn" : networkSymbol)
+                                       + (note.isEmpty ? "" : " " + note)))
         }
         #if targetEnvironment(simulator)
         stats.metrics = "SIMULATOR (GPU completion only) · " + stats.metrics

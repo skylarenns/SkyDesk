@@ -13,8 +13,13 @@ public final class HEVCEncoder {
     private var session: VTCompressionSession?
     public private(set) var hardwareAccelerated = false
     public let fps: Int
-    public init(width: Int, height: Int, fps: Int, bitrate: Int, lowLatencyRateControl: Bool = false) throws {
-        self.fps = fps
+    /// With `chroma444` the session expects BGRA frames and keeps every pixel's colour (Main 4:4:4). The profile
+    /// has no named constant in the SDK; it is one of the values the hardware encoder lists as supported, and
+    /// creating the session fails cleanly on a Mac whose encoder does not have it.
+    public static let main444Profile = "HEVC_Main444_AutoLevel"
+    public let chroma444: Bool
+    public init(width: Int, height: Int, fps: Int, bitrate: Int, lowLatencyRateControl: Bool = false, chroma444: Bool = false) throws {
+        self.fps = fps; self.chroma444 = chroma444
         var specification: [CFString: Any] = [kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: true]
         if lowLatencyRateControl { specification[kVTVideoEncoderSpecification_EnableLowLatencyRateControl] = true }
         try checkVT(VTCompressionSessionCreate(allocator: kCFAllocatorDefault, width: Int32(width), height: Int32(height),
@@ -25,7 +30,7 @@ public final class HEVCEncoder {
         let properties: [CFString: Any] = [
             kVTCompressionPropertyKey_RealTime: true,
             kVTCompressionPropertyKey_AllowFrameReordering: false,
-            kVTCompressionPropertyKey_ProfileLevel: kVTProfileLevel_HEVC_Main_AutoLevel,
+            kVTCompressionPropertyKey_ProfileLevel: chroma444 ? Self.main444Profile as CFString : kVTProfileLevel_HEVC_Main_AutoLevel,
             kVTCompressionPropertyKey_AverageBitRate: bitrate,
             kVTCompressionPropertyKey_ExpectedFrameRate: fps,
             // The transport is lossless and a session starts with a forced keyframe, so periodic keyframes
@@ -101,7 +106,61 @@ public final class HEVCDecoder {
     private var parameters: [Data] = []
     private let requireHardware: Bool
     public private(set) var hardwareAccelerated = false
+    /// True while the stream being decoded is 4:4:4.
+    public private(set) var chroma444 = false
     public init(requireHardware: Bool = true) { self.requireHardware = requireHardware }
+    /// Chroma layout of a stream, read from its own description: 1 = 4:2:0, 3 = 4:4:4 (nil when it cannot be read).
+    public static func chromaFormat(of format: CMVideoFormatDescription) -> Int? {
+        guard let atoms = CMFormatDescriptionGetExtension(format, extensionKey: kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms) as? [String: Any],
+              let record = atoms["hvcC"] as? Data, record.count > 16 else { return nil }
+        return Int(record[record.startIndex + 16] & 3)
+    }
+    /// Builds the description of an HEVC stream from its VPS, SPS and PPS.
+    public static func description(parameterSets sets: [Data]) throws -> CMVideoFormatDescription {
+        guard sets.count == 3, sets.allSatisfy({ !$0.isEmpty }) else { throw DeskError.invalid("HEVC requires VPS, SPS, and PPS.") }
+        var format: CMVideoFormatDescription?
+        let sizes = sets.map(\.count)
+        let status = sets[0].withUnsafeBytes { a in
+            sets[1].withUnsafeBytes { b in
+                sets[2].withUnsafeBytes { c in
+                    let pointers = [a.bindMemory(to: UInt8.self).baseAddress!, b.bindMemory(to: UInt8.self).baseAddress!, c.bindMemory(to: UInt8.self).baseAddress!]
+                    return CMVideoFormatDescriptionCreateFromHEVCParameterSets(allocator: kCFAllocatorDefault,
+                        parameterSetCount: 3, parameterSetPointers: pointers, parameterSetSizes: sizes,
+                        nalUnitHeaderLength: 4, extensions: nil, formatDescriptionOut: &format)
+                }
+            }
+        }
+        try checkVT(status, "Create HEVC format")
+        guard let format else { throw DeskError.invalid("No HEVC format.") }
+        return format
+    }
+    /// Parameter sets of a real 4:4:4 stream from an Apple hardware encoder, used only to ask this device whether
+    /// its hardware decoder accepts 4:4:4 before offering it to the Mac.
+    public static let sample444ParameterSets: [Data] = [
+        "40010c01ffff240800000300be0800000300009c170240",
+        "420101240800000300be0800000300009c90002b0400408b102f722c8a5ff973f89fd1",
+        "4401c072f45364"
+    ].map { text in
+        var data = Data(); var index = text.startIndex
+        while index < text.endIndex { let next = text.index(index, offsetBy: 2); data.append(UInt8(text[index..<next], radix: 16) ?? 0); index = next }
+        return data
+    }
+    /// Whether a hardware decoder for 4:4:4 can be created here. Cheap; no frame is decoded.
+    public static func canDecode444(requireHardware: Bool = true) -> Bool {
+        guard let format = try? description(parameterSets: sample444ParameterSets), chromaFormat(of: format) == 3 else { return false }
+        var session: VTDecompressionSession?
+        let status = VTDecompressionSessionCreate(allocator: kCFAllocatorDefault, formatDescription: format,
+            decoderSpecification: [kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder: requireHardware] as CFDictionary,
+            imageBufferAttributes: outputAttributes(chroma444: true) as CFDictionary, outputCallback: nil, decompressionSessionOut: &session)
+        guard status == noErr, let session else { return false }
+        VTDecompressionSessionInvalidate(session)
+        return true
+    }
+    /// The renderer draws two-plane video-range frames; for 4:4:4 the colour plane is simply full size.
+    private static func outputAttributes(chroma444: Bool) -> [CFString: Any] {
+        [kCVPixelBufferPixelFormatTypeKey: chroma444 ? kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+         kCVPixelBufferMetalCompatibilityKey: true, kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary]
+    }
     public func decode(_ frame: VideoFrame, completion: @escaping (Result<CVPixelBuffer, Error>) -> Void) throws {
         if frame.keyframe, frame.parameterSets != parameters {
             try configure(frame.parameterSets)
@@ -133,27 +192,15 @@ public final class HEVCDecoder {
         guard sets.count == 3 else { throw DeskError.invalid("HEVC requires VPS, SPS, and PPS.") }
         if let session { VTDecompressionSessionWaitForAsynchronousFrames(session); VTDecompressionSessionInvalidate(session) }
         session = nil
-        var newFormat: CMVideoFormatDescription?
-        let sizes = sets.map(\.count)
-        let status = sets[0].withUnsafeBytes { a in
-            sets[1].withUnsafeBytes { b in
-                sets[2].withUnsafeBytes { c in
-                    let pointers = [a.bindMemory(to: UInt8.self).baseAddress!, b.bindMemory(to: UInt8.self).baseAddress!, c.bindMemory(to: UInt8.self).baseAddress!]
-                    return CMVideoFormatDescriptionCreateFromHEVCParameterSets(allocator: kCFAllocatorDefault,
-                        parameterSetCount: 3, parameterSetPointers: pointers, parameterSetSizes: sizes,
-                        nalUnitHeaderLength: 4, extensions: nil, formatDescriptionOut: &newFormat)
-                }
-            }
-        }
-        try checkVT(status, "Create HEVC format")
-        guard let newFormat else { throw DeskError.invalid("No HEVC format.") }
+        let newFormat = try Self.description(parameterSets: sets)
         let dimensions = CMVideoFormatDescriptionGetDimensions(newFormat)
         guard dimensions.width > 0, dimensions.height > 0, dimensions.width <= 4096, dimensions.height <= 4096 else {
             throw DeskError.invalid("HEVC dimensions exceed the supported limit.")
         }
         let specification: [CFString: Any] = [kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder: requireHardware]
-        let attributes: [CFString: Any] = [kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-                                          kCVPixelBufferMetalCompatibilityKey: true, kCVPixelBufferIOSurfacePropertiesKey: [:]]
+        // The stream says what it is; a 4:4:4 stream decoded to 4:2:0 output would throw its extra detail away.
+        let full = Self.chromaFormat(of: newFormat) == 3
+        let attributes = Self.outputAttributes(chroma444: full)
         try checkVT(VTDecompressionSessionCreate(allocator: kCFAllocatorDefault, formatDescription: newFormat,
             decoderSpecification: specification as CFDictionary, imageBufferAttributes: attributes as CFDictionary,
             outputCallback: nil, decompressionSessionOut: &session), "Create HEVC decoder")
@@ -162,7 +209,7 @@ public final class HEVCDecoder {
         var hardware: Unmanaged<CFTypeRef>?
         VTSessionCopyProperty(session, key: kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder, allocator: nil, valueOut: &hardware)
         hardwareAccelerated = (hardware?.takeRetainedValue() as? Bool) == true
-        format = newFormat; parameters = sets
+        format = newFormat; parameters = sets; chroma444 = full
     }
     public func flush() { if let session { VTDecompressionSessionWaitForAsynchronousFrames(session) } }
     /// Drops the session so the next keyframe builds a new one. iPadOS may invalidate decoder sessions while the

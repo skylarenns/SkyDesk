@@ -521,10 +521,22 @@ final class HostModel: ObservableObject {
                     }
                 }
                 guard let display = selectedDisplay else { throw DeskError.invalid("Select an available Mac display.") }
-                let pipeline = try DisplayCapture(display: display, longestEdge: useiPadDesktop ? 4096 : longestEdge, fps: sessionFPS,
-                    bitrate: bitrateMbps * 1_000_000, inputEnabled: allowInput, lowLatencyRateControl: lowLatencyRateControl,
-                    nativeDesktop: useiPadDesktop, clientFeatures: clientFeatures, hostName: Host.current().localizedName,
-                    clipboard: allowClipboard, files: allowFiles, audio: allowAudio && HostAudio.supported)
+                @MainActor func makePipeline(chroma444: Bool) throws -> DisplayCapture {
+                    try DisplayCapture(display: display, longestEdge: useiPadDesktop ? 4096 : longestEdge, fps: sessionFPS,
+                        bitrate: bitrateMbps * 1_000_000, inputEnabled: allowInput, lowLatencyRateControl: lowLatencyRateControl,
+                        nativeDesktop: useiPadDesktop, clientFeatures: clientFeatures, hostName: Host.current().localizedName,
+                        clipboard: allowClipboard, files: allowFiles, audio: allowAudio && HostAudio.supported, chroma444: chroma444)
+                }
+                // The iPad asked for full colour detail: use it if this Mac's encoder has it, otherwise carry on as before.
+                let wants444 = clientFeatures & StreamFeature.chroma444 != 0
+                let pipeline: DisplayCapture
+                if wants444, let full = try? makePipeline(chroma444: true) {
+                    pipeline = full
+                    MetricsLog.shared.append("host  video in full colour detail (4:4:4)")
+                } else {
+                    if wants444 { MetricsLog.shared.append("host  4:4:4 is not available on this Mac's encoder; using 4:2:0") }
+                    pipeline = try makePipeline(chroma444: false)
+                }
                 pipeline.onFrame = { [weak video] frame in
                     do { video?.send(WirePacket(kind: .video, payload: try frame.encoded())) }
                     catch { video?.close(reason: error.localizedDescription) }

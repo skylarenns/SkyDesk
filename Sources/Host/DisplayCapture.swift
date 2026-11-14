@@ -27,7 +27,7 @@ final class DisplayCapture: NSObject, SCStreamOutput, SCStreamDelegate {
 
     init(display: SCDisplay, longestEdge: Int, fps: Int, bitrate: Int, inputEnabled: Bool,
          lowLatencyRateControl: Bool, nativeDesktop: Bool = false, clientFeatures: Int = 0, hostName: String? = nil,
-         clipboard: Bool = false, files: Bool = false, audio: Bool = false) throws {
+         clipboard: Bool = false, files: Bool = false, audio: Bool = false, chroma444: Bool = false) throws {
         window = .streaming(fps: fps)
         markIdleGaps = clientFeatures & StreamFeature.idleGapFlags != 0
         let mode = CGDisplayCopyDisplayMode(display.displayID)
@@ -37,10 +37,11 @@ final class DisplayCapture: NSObject, SCStreamOutput, SCStreamDelegate {
                           displayName: nativeDesktop ? "iPad Retina desktop" : "Display \(display.displayID)",
                           inputEnabled: inputEnabled, textInputEnabled: inputEnabled,
                           displayBlankingSupported: nativeDesktop && inputEnabled,
-                          features: Self.features(client: clientFeatures, inputEnabled: inputEnabled, clipboard: clipboard, files: files, audio: audio), hostName: hostName)
+                          features: Self.features(client: clientFeatures, inputEnabled: inputEnabled, clipboard: clipboard, files: files, audio: audio, chroma444: chroma444), hostName: hostName)
         try info.validate()
+        let full = (info.features ?? 0) & StreamFeature.chroma444 != 0
         encoder = try HEVCEncoder(width: info.width, height: info.height, fps: fps, bitrate: bitrate,
-                                  lowLatencyRateControl: lowLatencyRateControl)
+                                  lowLatencyRateControl: lowLatencyRateControl, chroma444: full)
         super.init()
         let configuration = SCStreamConfiguration()
         configuration.width = info.width; configuration.height = info.height
@@ -49,7 +50,8 @@ final class DisplayCapture: NSObject, SCStreamOutput, SCStreamDelegate {
         // Surfaces stay retained until their encode finishes (measured p99 ≈ 16 ms, first frame ≈ 35 ms).
         // Three surfaces only cover 16.7 ms at 120 Hz, so ScreenCaptureKit ran dry and skipped frames.
         configuration.queueDepth = 8
-        configuration.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        // 4:4:4 starts from the screen's own BGRA pixels; the encoder converts them without halving the colour.
+        configuration.pixelFormat = full ? kCVPixelFormatType_32BGRA : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
         configuration.colorSpaceName = CGColorSpace.sRGB
         configuration.colorMatrix = kCVImageBufferYCbCrMatrix_ITU_R_709_2
         // With a local pointer on the iPad, a second, delayed one in the video would only trail behind it.
@@ -62,7 +64,7 @@ final class DisplayCapture: NSObject, SCStreamOutput, SCStreamDelegate {
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
         self.stream = stream
     }
-    private static func features(client: Int, inputEnabled: Bool, clipboard: Bool, files: Bool, audio: Bool) -> Int? {
+    private static func features(client: Int, inputEnabled: Bool, clipboard: Bool, files: Bool, audio: Bool, chroma444: Bool) -> Int? {
         var value = client & StreamFeature.idleGapFlags != 0 ? StreamFeature.idleGapFlags | StreamFeature.clientStatsLog : 0
         // Without remote input the iPad never moves the pointer, so the video must keep showing it.
         if inputEnabled, client & StreamFeature.localCursor != 0 { value |= StreamFeature.localCursor }
@@ -74,6 +76,7 @@ final class DisplayCapture: NSObject, SCStreamOutput, SCStreamDelegate {
         if clipboard, client & StreamFeature.clipboardSync != 0 { value |= StreamFeature.clipboardSync }
         if files, client & StreamFeature.fileTransfer != 0 { value |= StreamFeature.fileTransfer }
         if audio, client & StreamFeature.audio != 0 { value |= StreamFeature.audio }
+        if chroma444, client & StreamFeature.chroma444 != 0 { value |= StreamFeature.chroma444 }
         return value == 0 ? nil : value
     }
     func start() async throws { try await stream?.startCapture() }

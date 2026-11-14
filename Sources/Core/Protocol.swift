@@ -100,6 +100,9 @@ public enum StreamFeature {
     public static let gestures = 512
     /// The iPad may open a fourth channel (Hello.Role.audio) on which the Mac sends its sound.
     public static let audio = 1_024
+    /// Full colour detail (HEVC 4:4:4 instead of 4:2:0): coloured text and thin coloured lines stay sharp.
+    /// Offered by an iPad whose hardware can decode it, used by a Mac whose hardware can encode it.
+    public static let chroma444 = 2_048
 }
 
 public struct Hello: Codable {
