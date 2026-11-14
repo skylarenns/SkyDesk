@@ -46,9 +46,9 @@ public final class HEVCEncoder {
         guard hardwareAccelerated else { throw DeskError.invalid("Hardware HEVC encoding is unavailable.") }
     }
     public func encode(_ image: CVPixelBuffer, sequence: UInt64, captureTime: UInt64,
-                       timestamp: CMTime, afterIdle: Bool = false, completion: @escaping (Result<VideoFrame, Error>) -> Void) {
+                       timestamp: CMTime, afterIdle: Bool = false, forceKeyframe: Bool = false, completion: @escaping (Result<VideoFrame, Error>) -> Void) {
         guard let session else { completion(.failure(DeskError.invalid("Encoder stopped."))); return }
-        let properties = sequence == 1 ? [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary : nil
+        let properties = sequence == 1 || forceKeyframe ? [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary : nil
         let status = VTCompressionSessionEncodeFrame(session, imageBuffer: image, presentationTimeStamp: timestamp,
             duration: CMTime(value: 1, timescale: CMTimeScale(fps)), frameProperties: properties, infoFlagsOut: nil) { status, flags, sample in
                 do {
@@ -159,5 +159,11 @@ public final class HEVCDecoder {
         format = newFormat; parameters = sets
     }
     public func flush() { if let session { VTDecompressionSessionWaitForAsynchronousFrames(session) } }
+    /// Drops the session so the next keyframe builds a new one. iPadOS may invalidate decoder sessions while the
+    /// app is in the background, so this runs before video resumes.
+    public func reset() {
+        if let session { VTDecompressionSessionWaitForAsynchronousFrames(session); VTDecompressionSessionInvalidate(session) }
+        session = nil; format = nil; parameters = []
+    }
     deinit { if let session { VTDecompressionSessionInvalidate(session) } }
 }

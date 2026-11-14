@@ -71,3 +71,19 @@ final class ProtocolTests: XCTestCase {
         XCTAssertThrowsError(try PairingKey(text: "1234"))
     }
 }
+
+final class PauseVideoProtocolTests: XCTestCase {
+    func testPauseMessageAndHostNameRoundTrip() throws {
+        let packet = try WirePacket.control(.pauseVideo(true))
+        guard case .pauseVideo(true) = try packet.controlMessage() else { return XCTFail("pauseVideo did not round-trip") }
+        let info = StreamInfo(width: 2752, height: 2064, fps: 120, bitrate: 25_000_000, displayName: "iPad",
+                              inputEnabled: true, features: StreamFeature.pauseVideo, hostName: "Studio")
+        let decoded = try JSONDecoder().decode(StreamInfo.self, from: JSONEncoder().encode(info))
+        XCTAssertEqual(decoded.hostName, "Studio")
+        XCTAssertEqual((decoded.features ?? 0) & StreamFeature.pauseVideo, StreamFeature.pauseVideo)
+        // An older host's welcome has no name and no pause bit: the iPad falls back to disconnect-and-resume.
+        let old = try JSONDecoder().decode(StreamInfo.self, from: Data(#"{"width":2,"height":2,"fps":60,"bitrate":1000000,"displayName":"x","inputEnabled":true}"#.utf8))
+        XCTAssertNil(old.hostName); XCTAssertNil(old.features)
+        XCTAssertEqual(Set([StreamFeature.idleGapFlags, StreamFeature.clientStatsLog, StreamFeature.localCursor, StreamFeature.pauseVideo]).count, 4)
+    }
+}

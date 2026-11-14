@@ -9,7 +9,7 @@ settings:
     SWIFT_VERSION: "5.0"
     SWIFT_STRICT_CONCURRENCY: targeted
     MARKETING_VERSION: "0.1.0"
-    CURRENT_PROJECT_VERSION: 13
+    CURRENT_PROJECT_VERSION: 30
     ENABLE_USER_SCRIPT_SANDBOXING: YES
     CODE_SIGN_STYLE: Automatic
     GENERATE_INFOPLIST_FILE: NO
@@ -21,7 +21,7 @@ targets:
   SkyDeskHost:
     type: application
     platform: macOS
-    sources: [Sources/Core, Sources/Host]
+    sources: [Sources/Core, Sources/Host, Config/HostAssets.xcassets]
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.skylar.skydesk.host
@@ -29,6 +29,7 @@ targets:
         ENABLE_HARDENED_RUNTIME: YES
         INFOPLIST_FILE: Config/Host-Info.plist
         CODE_SIGN_ENTITLEMENTS: Config/Host.entitlements
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Host/SkyDesk-Bridging-Header.h
     dependencies:
       - target: SkyDeskRestore
@@ -43,7 +44,7 @@ targets:
   SkyDeskRestore:
     type: tool
     platform: macOS
-    sources: [Sources/Core/DisplayLayout.swift, Sources/Recovery]
+    sources: [Sources/Core/DisplayLayout.swift, Sources/Core/DisplaySwitchPacer.swift, Sources/Recovery]
     settings:
       base:
         PRODUCT_NAME: SkyDeskRestore
@@ -54,7 +55,7 @@ targets:
   SkyDeskPad:
     type: application
     platform: iOS
-    sources: [Sources/Core, Sources/Pad]
+    sources: [Sources/Core, Sources/Pad, Config/PadAssets.xcassets]
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.skylar.skydesk.pad
@@ -62,5 +63,6 @@ targets:
         TARGETED_DEVICE_FAMILY: "2"
         SUPPORTS_MACCATALYST: NO
         INFOPLIST_FILE: Config/Pad-Info.plist
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
     scheme:
       gatherCoverageData: false

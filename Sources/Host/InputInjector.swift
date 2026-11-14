@@ -10,14 +10,29 @@ final class InputInjector {
     private var lastClickTime: CFTimeInterval = 0
     private var lastClickLocation: CGPoint = .zero
     private var clickCount: Int64 = 1
+    private var scrollSteps = ScrollAccumulator()
+    private var momentum: ScrollMomentum?
+    private var momentumTimer: Timer?
+    private var momentumLast = 0.0
+    private var momentumStarted = false
 
     func handle(_ input: InputEvent) {
         guard input.isValid, AXIsProcessTrusted(), displayBounds.width > 0 else { return }
         let flags = Self.flags(input.modifiers)
         switch input.kind {
         case .move, .down, .up:
+            if input.kind == .down { stopMomentum() }
+            let previous = location
             location = CGPoint(x: displayBounds.minX + input.x * max(0, displayBounds.width - 1),
                                y: displayBounds.minY + input.y * max(0, displayBounds.height - 1))
+            var delta = CGPoint(x: location.x - previous.x, y: location.y - previous.y)
+            // macOS moves the Dock to a screen only when the pointer pushes down against that screen's bottom
+            // edge. Absolute positions never push, so a move that stays on the bottom row counts as a push.
+            let bottomRow = displayBounds.maxY - 1
+            if input.kind == .move, input.y >= Self.bottomEdge, previous.y >= bottomRow - 1, displayBounds.contains(previous) {
+                location.y = bottomRow
+                delta.y = max(delta.y, 8)
+            }
             let button = CGMouseButton(rawValue: UInt32(input.button)) ?? .left
             var type: CGEventType = .mouseMoved
             if input.kind == .down {
@@ -36,12 +51,17 @@ final class InputInjector {
             else if buttons.contains(1) { type = .rightMouseDragged }
             let event = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: location, mouseButton: button)
             event?.flags = flags
+            event?.setIntegerValueField(.mouseEventDeltaX, value: Int64(delta.x.rounded()))
+            event?.setIntegerValueField(.mouseEventDeltaY, value: Int64(delta.y.rounded()))
             if input.kind != .move { event?.setIntegerValueField(.mouseEventClickState, value: clickCount) }
             Self.post(event)
         case .scroll:
-            let event = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2,
-                                wheel1: Int32(input.y.rounded()), wheel2: Int32(input.x.rounded()), wheel3: 0)
-            event?.location = location; event?.flags = flags; Self.post(event)
+            if input.phase == ScrollPhase.began || input.phase == nil { stopMomentum() }
+            if input.phase == ScrollPhase.began { scrollSteps.reset() }
+            let step = scrollSteps.step(CGPoint(x: input.x, y: input.y))
+            // Whole points only reach the Mac, but the fractions carry over (slow scrolls used to be rounded away).
+            guard input.phase != nil || step.x != 0 || step.y != 0 else { return }
+            postScroll(step, flags: flags, phase: input.phase.map(Self.cgPhase) ?? 0, momentumPhase: 0)
         case .key:
             guard let code = Self.keyMap[input.keyCode] else { return }
             let repeated = input.isDown && keys.contains(code)
@@ -52,7 +72,42 @@ final class InputInjector {
             Self.post(event)
         }
     }
+    /// Normalised y at or below which a pointer move counts as resting on the bottom edge (about 5 points).
+    static let bottomEdge = 0.995
+    /// Lift-off velocity from the iPad (points per second): glide on, generated here at 120 Hz.
+    func startMomentum(velocity: CGPoint) {
+        stopMomentum()
+        guard let glide = ScrollMomentum(velocity: velocity) else { return }
+        momentum = glide; momentumStarted = false; momentumLast = CACurrentMediaTime()
+        let timer = Timer(timeInterval: 1.0 / 120, repeats: true) { [weak self] _ in MainActor.assumeIsolated { self?.glide() } }
+        RunLoop.main.add(timer, forMode: .common); momentumTimer = timer
+    }
+    private func glide() {
+        let now = CACurrentMediaTime(); let dt = min(0.05, now - momentumLast); momentumLast = now
+        guard var glide = momentum, let delta = glide.step(dt) else { stopMomentum(); return }
+        momentum = glide
+        let step = scrollSteps.step(delta)
+        postScroll(step, flags: [], phase: 0, momentumPhase: momentumStarted ? 2 : 1)
+        momentumStarted = true
+    }
+    func stopMomentum() {
+        guard momentumTimer != nil else { return }
+        momentumTimer?.invalidate(); momentumTimer = nil; momentum = nil
+        if momentumStarted { postScroll((0, 0), flags: [], phase: 0, momentumPhase: 3) }
+        momentumStarted = false
+    }
+    /// Continuous (trackpad-style) pixel scrolling with macOS phases, so apps scroll smoothly and rubber-band.
+    private func postScroll(_ step: (x: Int32, y: Int32), flags: CGEventFlags, phase: Int64, momentumPhase: Int64) {
+        let event = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2, wheel1: step.y, wheel2: step.x, wheel3: 0)
+        event?.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
+        if phase != 0 { event?.setIntegerValueField(.scrollWheelEventScrollPhase, value: phase) }
+        if momentumPhase != 0 { event?.setIntegerValueField(.scrollWheelEventMomentumPhase, value: momentumPhase) }
+        event?.location = location; event?.flags = flags; Self.post(event)
+    }
+    /// SkyDesk phase → CGScrollPhase (began 1, changed 2, ended 4).
+    private static func cgPhase(_ phase: Int) -> Int64 { phase == ScrollPhase.began ? 1 : phase == ScrollPhase.changed ? 2 : 4 }
     func releaseAll() {
+        stopMomentum()
         for code in keys {
             let event = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: false)
             event?.flags = []; Self.post(event)

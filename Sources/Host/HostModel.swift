@@ -5,8 +5,15 @@ import ScreenCaptureKit
 
 @MainActor
 final class HostModel: ObservableObject {
-    @Published var status = "Sharing is off"
-    @Published var running = false
+    @Published var status = "Starting…"
+    /// The user-facing switch. With `autoAccept` on, a paired iPad turns it on by connecting.
+    @Published var sharing = false
+    /// The secure listener is up (sharing on, or waiting for the paired iPad to turn it on).
+    @Published var listening = false
+    @Published var clientConnected = false
+    @Published var autoAccept = UserDefaults.standard.object(forKey: "autoAccept") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(autoAccept, forKey: "autoAccept"); updateListener() }
+    }
     @Published var busy = false
     @Published var displays: [SCDisplay] = []
     @Published var displayID: UInt32 = 0
@@ -15,22 +22,47 @@ final class HostModel: ObservableObject {
     @Published var fps = 120
     @Published var bitrateMbps = 25
     @Published var allowInput = true
-    @Published var allowClipboard = true
+    @Published var allowClipboard = UserDefaults.standard.object(forKey: "allowClipboard") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(allowClipboard, forKey: "allowClipboard") }
+    }
+    @Published var allowFiles = UserDefaults.standard.object(forKey: "allowFiles") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(allowFiles, forKey: "allowFiles") }
+    }
+    /// Newest first; finished transfers stay listed until the next session.
+    @Published var transfers: [FileTransferEngine.Progress] = []
+    @Published var filesReady = false
+    /// Build number of the staged update, if one is waiting in ~/Library/Application Support/SkyDesk/Updates/ready.
+    @Published var stagedBuild: Int?
+    @Published var updating = false
+    let ownBuild = Int(Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "") ?? 0
+    static let updateFolder = UpdateCertificates.support.appendingPathComponent("Updates/\(UpdateInfo.folderName)", isDirectory: true)
+    private var clientBuild: Int?
+    private var offeredBuild: Int?
+    private var updateServer: UpdateServer?
+    private var lastSessionEnd = Date()
+    /// The iPad's build at its last connection, or the staged build once that was fully downloaded by the iPad.
+    private var knownPadBuild = UserDefaults.standard.integer(forKey: "knownPadBuild") {
+        didSet { UserDefaults.standard.set(knownPadBuild, forKey: "knownPadBuild") }
+    }
     @Published var lowLatencyRateControl = false
-    @Published var pairingText = ""
+    @Published var password = ""
     @Published var pairingLocked = false
     @Published var metrics = "No client connected"
     @Published var lanAddresses = LANAddressDiscovery.current()
     @Published var screenAllowed = CGPreflightScreenCaptureAccess()
     @Published var inputAllowed = AXIsProcessTrusted()
     let input = InputInjector()
+    private static let passwordAccount = "host-password"
     private var key: PairingKey?
     private var listener: NWListener?
+    private var listenerRetry: DispatchWorkItem?
+    private var asleep = false
     private var channels: [UUID: SecureChannel] = [:]
     private var control: SecureChannel?
     private var video: SecureChannel?
     private var sessionID: UUID?
     private var generation = UUID()
+    private var listenerGeneration = UUID()
     private var capture: DisplayCapture?
     private var clientDisplay: ClientDisplay?
     private var clientFeatures = 0
@@ -40,6 +72,14 @@ final class HostModel: ObservableObject {
     private var virtualDisplay: SkyDeskVirtualDisplay?
     private var focusMonitor: RemoteFocusMonitor?
     private var cursorMonitor: CursorMonitor?
+    private var files: SecureChannel?
+    private var fileEngine: FileTransferEngine?
+    /// Lets the transport queue hand file packets straight to the engine, without a trip through the main thread.
+    private let fileRoute = FileRoute()
+    private var clipboard: ClipboardSync?
+    private var clipboardTimer: Timer?
+    static let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
+        ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Downloads")
     private lazy var displayController: MacDisplayController = {
         let blanker = MacDisplayController()
         blanker.onChange = { [weak self] blanked in self?.control?.send(.macDisplayBlanked(blanked)) }
@@ -51,25 +91,55 @@ final class HostModel: ObservableObject {
     private var lastMetrics = Date()
     private var startingCapture = false
 
+    /// Loads (or on first run creates) the pairing password, then starts listening if allowed.
+    /// The pre-password 64-hex key stays untouched in the Keychain under its old account.
     func loadPairing(allowInteraction: Bool = false) async {
         guard !busy, key == nil else { return }
         busy = true
-        let result = await Task.detached(priority: .userInitiated) { () -> Result<PairingKey, Error> in
+        let account = Self.passwordAccount
+        let result = await Task.detached(priority: .userInitiated) { () -> Result<(String, PairingKey), Error> in
             do {
-                if let saved = try PairingStore.load(account: "host", allowInteraction: allowInteraction) { return .success(saved) }
-                let created = try PairingKey()
-                try PairingStore.save(created, account: "host", allowInteraction: allowInteraction)
-                return .success(created)
+                var text = try PairingStore.loadText(account: account, allowInteraction: allowInteraction)
+                if text == nil {
+                    let created = try PairingPassword.generate()
+                    try PairingStore.saveText(created, account: account, allowInteraction: allowInteraction)
+                    text = created
+                }
+                return .success((text!, try PairingPassword.deriveKey(text!)))
             } catch { return .failure(error) }
         }.value
         busy = false
         switch result {
-        case .success(let key):
-            self.key = key; pairingText = key.text; pairingLocked = false; status = "Sharing is off"
+        case .success(let (text, key)):
+            self.key = key; password = text; pairingLocked = false
+            startTimer(); updateListener()
         case .failure:
             pairingLocked = true
-            status = "Keychain approval is needed. Choose Unlock pairing key, then respond to macOS."
+            status = "Keychain approval is needed. Choose Unlock, then respond to macOS."
         }
+    }
+    /// Replaces the password. The paired iPad must type the new one once.
+    func setPassword(_ text: String) async -> String? {
+        guard !busy, !clientConnected else { return "Disconnect the iPad first." }
+        do { try PairingPassword.validate(text) } catch { return error.localizedDescription }
+        busy = true; defer { busy = false }
+        let account = Self.passwordAccount
+        let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let result = await Task.detached(priority: .userInitiated) { () -> Result<PairingKey, Error> in
+            do { try PairingStore.saveText(clean, account: account); return .success(try PairingPassword.deriveKey(clean)) }
+            catch { return .failure(error) }
+        }.value
+        switch result {
+        case .success(let key):
+            self.key = key; password = clean
+            restartListener()
+            return nil
+        case .failure(let error): return error.localizedDescription
+        }
+    }
+    func randomPassword() async -> String? {
+        guard let generated = try? PairingPassword.generate() else { return "Could not generate a password." }
+        return await setPassword(generated)
     }
     func refreshNetworkAddresses() {
         let current = LANAddressDiscovery.current()
@@ -95,59 +165,84 @@ final class HostModel: ObservableObject {
             if !displays.contains(where: { $0.displayID == displayID }) { displayID = displays.first?.displayID ?? 0 }
         } catch { status = error.localizedDescription }
     }
-    func rotateKey() {
-        guard !running else { return }
-        do {
-            let replacement = try PairingKey()
-            try PairingStore.save(replacement, account: "host")
-            key = replacement; pairingText = replacement.text; status = "Pairing key replaced. Pair your iPad again."
-        } catch { status = error.localizedDescription }
+    func startSharing() {
+        sharing = true
+        updateListener()
     }
-    func start() async {
-        guard !running, !busy, let key else { return }
-        busy = true; defer { busy = false }
-        await refreshDisplays()
-        guard screenAllowed, useiPadDesktop || displays.contains(where: { $0.displayID == displayID }) else { return }
-        if allowInput && !inputAllowed { status = "Allow Accessibility or turn off remote input."; return }
+    func stopSharing() {
+        sharing = false
+        disconnect()
+        updateListener()
+    }
+    /// Quit or sleep: end the session and close the port. Sharing preferences are kept for wake.
+    func shutdown() {
+        disconnect()
+        closeListener()
+    }
+    func sleep() { asleep = true; shutdown() }
+    func wake() { asleep = false; updateListener() }
+    private var wantsListener: Bool { key != nil && !asleep && (sharing || autoAccept) }
+    private func updateListener() {
+        if wantsListener { openListener() } else { closeListener() }
+        refreshStatus()
+    }
+    private func restartListener() {
+        disconnect(); closeListener(); updateListener()
+    }
+    private func closeListener() {
+        listenerGeneration = UUID()
+        listenerRetry?.cancel(); listenerRetry = nil
+        listener?.cancel(); listener = nil
+        listening = false
+    }
+    private func openListener() {
+        guard listener == nil, let key else { return }
         do {
             let listener = try NWListener(using: DeskNetwork.parameters(key: key), on: NWEndpoint.Port(rawValue: DeskNetwork.port)!)
             listener.service = NWListener.Service(name: Host.current().localizedName ?? "SkyDesk Mac", type: DeskNetwork.serviceType)
-            let token = UUID(); generation = token
+            let token = UUID(); listenerGeneration = token
             listener.newConnectionHandler = { [weak self] connection in
                 Task { @MainActor in
-                    guard let self, self.generation == token, self.running else { connection.cancel(); return }
+                    guard let self, self.listenerGeneration == token else { connection.cancel(); return }
                     self.accept(connection)
                 }
             }
             listener.stateUpdateHandler = { [weak self] state in
                 Task { @MainActor in
-                    guard let self, self.generation == token else { return }
+                    guard let self, self.listenerGeneration == token else { return }
                     switch state {
-                    case .ready: self.status = "Ready for your paired iPad · port \(DeskNetwork.port)"
-                    case .failed(let error): self.stop(); self.status = error.localizedDescription
+                    case .ready: self.listening = true; self.refreshStatus()
+                    case .failed(let error):
+                        // Usually the port is briefly busy after a relaunch: try again shortly.
+                        self.closeListener(); self.status = "Couldn't open the network port (\(error.localizedDescription)). Retrying…"
+                        let retry = DispatchWorkItem { [weak self] in self?.updateListener() }
+                        self.listenerRetry = retry
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: retry)
                     default: break
                     }
                 }
             }
-            self.listener = listener; running = true
-            status = "Starting secure listener…"
+            self.listener = listener
             listener.start(queue: .main)
-            lastMetrics = Date()
-            timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
-                Task { @MainActor in self?.tick() }
-            }
-            if let timer { RunLoop.main.add(timer, forMode: .common) }
         } catch { status = error.localizedDescription }
     }
-    func stop() {
-        generation = UUID()
-        timer?.invalidate(); timer = nil
-        listener?.cancel(); listener = nil
-        running = false
-        disconnect()
-        status = "Sharing is off"
+    private func startTimer() {
+        guard timer == nil else { return }
+        lastMetrics = Date()
+        timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.tick() }
+        }
+        if let timer { RunLoop.main.add(timer, forMode: .common) }
+    }
+    func refreshStatus() {
+        if pairingLocked || key == nil { return }
+        if clientConnected { return }
+        if asleep { status = "Paused while the Mac sleeps"; return }
+        if !listening { status = wantsListener ? "Starting…" : "Off. Your iPad can't connect."; return }
+        status = sharing ? "Waiting for your iPad" : "Off. Your iPad can turn it on by connecting."
     }
     private func disconnect() {
+        generation = UUID()
         ContinuityLink.resume()
         displayController.restore(reason: "session ended")
         let current = channels.values
@@ -155,6 +250,9 @@ final class HostModel: ObservableObject {
         fastPath.bind(control: nil); fastPath.bind(window: nil)
         focusMonitor?.stop(); focusMonitor = nil
         cursorMonitor?.stop(); cursorMonitor = nil
+        clipboardTimer?.invalidate(); clipboardTimer = nil; clipboard = nil
+        fileRoute.set(nil, engine: nil)
+        fileEngine?.close(reason: "The iPad disconnected."); fileEngine = nil; files = nil; filesReady = false
         current.forEach { $0.close() }
         input.releaseAll()
         let old = capture; capture = nil
@@ -162,14 +260,23 @@ final class HostModel: ObservableObject {
         Task { await old?.stop(); oldDisplay?.invalidate() }
         startingCapture = false
         metrics = "No client connected"
-        if running { status = "Ready for your paired iPad" }
+        if clientConnected { lastSessionEnd = Date() }
+        if updateWhenPadDrops {
+            updateWhenPadDrops = false
+            MetricsLog.shared.append("host  iPad that asked for the update disconnected; updating the Mac now")
+            DispatchQueue.main.async { [weak self] in self?.updateAfterDrop(attempt: 0) }
+        }
+        clientBuild = nil; offeredBuild = nil
+        clientConnected = false
+        refreshStatus()
     }
     private func accept(_ connection: NWConnection) {
         guard channels.count < 4 else { connection.cancel(); return }
         let channel = SecureChannel(connection: connection, queue: transportQueue, maxPendingBytes: 18 * 1024 * 1024)
         channels[channel.id] = channel
-        channel.onPacket = { [weak self, weak channel, fastPath] packet in
+        channel.onPacket = { [weak self, weak channel, fastPath, fileRoute] packet in
             guard let channel else { return }
+            if let engine = fileRoute.engine(for: channel.id) { engine.handle(packet); return }
             var pongSent = false
             if let message = try? packet.controlMessage() {
                 switch fastPath.handle(message, channel: channel.id, reply: { channel.send($0) }) {
@@ -190,6 +297,11 @@ final class HostModel: ObservableObject {
                     if self.control === channel || self.video === channel {
                         self.disconnect()
                         if let reason { self.status = reason }
+                    } else if self.files === channel {
+                        // Losing only the file channel ends transfers, not the session.
+                        self.fileRoute.set(nil, engine: nil)
+                        self.fileEngine?.close(reason: reason ?? "File connection closed."); self.fileEngine = nil
+                        self.files = nil; self.filesReady = false
                     }
                 }
             }
@@ -197,7 +309,7 @@ final class HostModel: ObservableObject {
         channel.start()
         DispatchQueue.main.asyncAfter(deadline: .now() + 12) { [weak self, weak channel] in
             guard let self, let channel, self.channels[channel.id] != nil else { return }
-            if self.control !== channel && self.video !== channel { channel.close(reason: "Session handshake timed out.") }
+            if self.control !== channel && self.video !== channel && self.files !== channel { channel.close(reason: "Session handshake timed out.") }
             else if self.control == nil || self.video == nil { self.disconnect() }
         }
     }
@@ -208,17 +320,33 @@ final class HostModel: ObservableObject {
             if control !== channel && video !== channel {
                 guard case .hello(let hello) = message else { throw DeskError.invalid("Missing session handshake.") }
                 guard sessionID == nil || sessionID == hello.session else { throw DeskError.invalid("Another iPad is connected.") }
+                // Reaching here means TLS completed with the pairing password: only the paired iPad gets this far.
+                if !sharing {
+                    guard autoAccept else { throw DeskError.invalid("Sharing is off on the Mac.") }
+                    sharing = true
+                    MetricsLog.shared.append("host  sharing turned on automatically by the paired iPad")
+                }
                 switch hello.role {
                 case .control:
                     guard control == nil else { throw DeskError.invalid("Control channel already connected.") }
                     if let display = hello.display { try display.validate() }
                     clientDisplay = hello.display
                     clientFeatures = hello.features ?? 0
+                    clientBuild = hello.appBuild
+                    if let build = hello.appBuild {
+                        knownPadBuild = build
+                        MetricsLog.shared.append("host  iPad connected (build \(build))")
+                    }
                     control = channel
                     fastPath.bind(control: channel.id)
                 case .video:
                     guard video == nil else { throw DeskError.invalid("Video channel already connected.") }
                     video = channel
+                case .files:
+                    guard sessionID == hello.session, control != nil, files == nil, allowFiles,
+                          clientFeatures & StreamFeature.fileTransfer != 0 else { throw DeskError.invalid("File transfer is not available.") }
+                    openFiles(on: channel)
+                    return
                 }
                 sessionID = hello.session
                 lastHeartbeat = Date()
@@ -253,9 +381,39 @@ final class HostModel: ObservableObject {
                     } catch { if sessionID == session { control?.send(.failure(error.localizedDescription)) } }
                 }
             case .releaseInput: input.releaseAll()
+            case .pauseVideo(let paused):
+                guard clientFeatures & StreamFeature.pauseVideo != 0 else { throw DeskError.invalid("Unexpected pause request.") }
+                // The iPad went to the background: nothing it holds may stay pressed on the Mac.
+                if paused { input.releaseAll() }
+                capture?.setPaused(paused)
+                MetricsLog.shared.append(paused ? "host  iPad in background: input released, video paused" : "host  iPad back: video resumed with keyframe")
+                status = paused ? "iPad is in the background · video paused" : (capture.map { "\($0.info.width) × \($0.info.height) · streaming to iPad" } ?? status)
             case .clipboard(let text):
-                guard text.utf8.count <= 8192 else { throw DeskError.invalid("Clipboard text exceeds 8 KiB.") }
-                if allowClipboard { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(text, forType: .string) }
+                let limit = clipboard != nil ? ClipboardSync.maxBytes : 8192
+                guard text.utf8.count <= limit else { throw DeskError.invalid("Clipboard text is too large.") }
+                guard allowClipboard else { return }
+                if var sync = clipboard {
+                    if sync.incoming(text) {
+                        NSPasteboard.general.clearContents(); NSPasteboard.general.setString(text, forType: .string)
+                        sync.wroteRemote(changeCount: NSPasteboard.general.changeCount)
+                    }
+                    clipboard = sync
+                } else { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(text, forType: .string) }
+            case .scrollMomentum(let vx, let vy):
+                guard clientFeatures & StreamFeature.scrollMomentum != 0, vx.isFinite, vy.isFinite else { throw DeskError.invalid("Invalid scroll.") }
+                if allowInput, capture != nil { input.startMomentum(velocity: CGPoint(x: vx, y: vy)) }
+            case .updateRequest:
+                guard clientFeatures & StreamFeature.remoteUpdate != 0 else { throw DeskError.invalid("Unexpected update request.") }
+                // The user chose to update: the Mac follows the moment this iPad disconnects (user request 2026-11-13).
+                updateWhenPadDrops = true
+                verifyStagedHost()
+                serveUpdate()
+            case .updateCertificateRequest:
+                guard clientFeatures & StreamFeature.remoteUpdate != 0 else { throw DeskError.invalid("Unexpected update request.") }
+                sendCertificate()
+            case .setLocalCursor(let enabled):
+                guard clientFeatures & StreamFeature.liveCursorToggle != 0, let capture else { return }
+                setLocalCursor(enabled && allowInput, capture: capture)
             case .clipboardRequest:
                 if allowClipboard {
                     let text = NSPasteboard.general.string(forType: .string) ?? ""
@@ -270,8 +428,18 @@ final class HostModel: ObservableObject {
         guard !startingCapture, capture == nil, let video, let control, let sessionID else { return }
         startingCapture = true
         let token = generation
+        clientConnected = true
+        status = "Connecting to your iPad…"
         Task { [self, video, control] in
             do {
+                await refreshDisplays()
+                guard generation == token, self.sessionID == sessionID else { return }
+                guard screenAllowed else {
+                    throw DeskError.invalid("SkyDesk on the Mac needs Screen Recording permission. On the Mac: open SkyDesk Host and click Allow.")
+                }
+                if allowInput && !inputAllowed {
+                    throw DeskError.invalid("SkyDesk on the Mac needs Accessibility permission for your touches and keys. On the Mac: open SkyDesk Host and click Allow.")
+                }
                 var selectedDisplay = displays.first(where: { $0.displayID == displayID })
                 let sessionFPS = min(fps, (clientDisplay?.maximumFPS ?? fps) >= 120 ? 120 : (clientDisplay?.maximumFPS ?? fps) >= 60 ? 60 : 30)
                 if useiPadDesktop {
@@ -298,7 +466,8 @@ final class HostModel: ObservableObject {
                 guard let display = selectedDisplay else { throw DeskError.invalid("Select an available Mac display.") }
                 let pipeline = try DisplayCapture(display: display, longestEdge: useiPadDesktop ? 4096 : longestEdge, fps: sessionFPS,
                     bitrate: bitrateMbps * 1_000_000, inputEnabled: allowInput, lowLatencyRateControl: lowLatencyRateControl,
-                    nativeDesktop: useiPadDesktop, clientFeatures: clientFeatures)
+                    nativeDesktop: useiPadDesktop, clientFeatures: clientFeatures, hostName: Host.current().localizedName,
+                    clipboard: allowClipboard, files: allowFiles)
                 pipeline.onFrame = { [weak video] frame in
                     do { video?.send(WirePacket(kind: .video, payload: try frame.encoded())) }
                     catch { video?.close(reason: error.localizedDescription) }
@@ -326,16 +495,231 @@ final class HostModel: ObservableObject {
                     }
                     focusMonitor = monitor; monitor.start()
                 }
-                if (pipeline.info.features ?? 0) & StreamFeature.localCursor != 0 {
-                    let cursors = CursorMonitor(desktop: input.displayBounds.size)
-                    cursors.onCursor = { [weak control] in control?.send(.cursor($0)) }
-                    cursorMonitor = cursors; cursors.start()
-                }
-                status = "\(pipeline.info.displayName) · \(pipeline.info.width) × \(pipeline.info.height) · \(sessionFPS) FPS target"
+                let agreed = pipeline.info.features ?? 0
+                if agreed & StreamFeature.localCursor != 0 { startCursorMonitor() }
+                if agreed & StreamFeature.clipboardSync != 0 { startClipboardSync() }
+                if agreed & StreamFeature.remoteUpdate != 0 { offeredBuild = nil; offerUpdateIfNeeded() }
+                status = "Streaming to iPad · \(pipeline.info.width) × \(pipeline.info.height) · \(sessionFPS) FPS"
                 startingCapture = false
             } catch {
                 guard generation == token, self.sessionID == sessionID else { return }
-                disconnect(); status = error.localizedDescription
+                // Tell the iPad why before closing, so it can show the reason instead of a bare disconnect.
+                let reason = error.localizedDescription
+                control.send(.failure(reason))
+                startingCapture = false
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                    guard let self, self.generation == token, self.sessionID == sessionID else { return }
+                    self.disconnect(); self.status = reason
+                }
+            }
+        }
+    }
+    // MARK: Pointer, clipboard and files
+
+    private func startCursorMonitor() {
+        guard cursorMonitor == nil, let control else { return }
+        let cursors = CursorMonitor(desktop: input.displayBounds.size)
+        cursors.onCursor = { [weak control] in control?.send(.cursor($0)) }
+        cursorMonitor = cursors; cursors.start()
+    }
+    /// The iPad switched its own pointer on or off: hide or show the Mac pointer in the video to match.
+    private func setLocalCursor(_ enabled: Bool, capture: DisplayCapture) {
+        if enabled { startCursorMonitor() } else { cursorMonitor?.stop(); cursorMonitor = nil }
+        let session = sessionID
+        Task {
+            do { try await capture.setShowsCursor(!enabled) }
+            catch { if sessionID == session { control?.send(.failure("Couldn't switch the pointer: \(error.localizedDescription)")) } }
+        }
+        MetricsLog.shared.append("host  iPad pointer " + (enabled ? "on (Mac pointer hidden in video)" : "off (Mac pointer in video)"))
+    }
+    /// Polls the change counter only; the text is read when it moves (and wasn't our own write).
+    private func startClipboardSync() {
+        clipboard = ClipboardSync(changeCount: NSPasteboard.general.changeCount)
+        let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in MainActor.assumeIsolated { self?.checkClipboard() } }
+        RunLoop.main.add(timer, forMode: .common); clipboardTimer = timer
+    }
+    private func checkClipboard() {
+        guard var sync = clipboard, allowClipboard, let control else { return }
+        let pasteboard = NSPasteboard.general
+        if sync.localChanged(changeCount: pasteboard.changeCount), let text = sync.outgoing(pasteboard.string(forType: .string)) {
+            control.send(.clipboard(text))
+        }
+        clipboard = sync
+    }
+    private func openFiles(on channel: SecureChannel) {
+        let engine = FileTransferEngine(directory: Self.downloads, queue: DispatchQueue(label: "skydesk.host.files", qos: .utility))
+        engine.sendMessage = { [weak channel] in channel?.send($0) }
+        engine.sendPacket = { [weak channel] packet, done in
+            guard let channel else { done(false); return }
+            channel.send(packet, completion: done)
+        }
+        engine.onProgress = { [weak self] progress in
+            DispatchQueue.main.async { MainActor.assumeIsolated { self?.record(progress) } }
+        }
+        files = channel; fileEngine = engine; filesReady = true
+        fileRoute.set(channel.id, engine: engine)
+    }
+    private func record(_ progress: FileTransferEngine.Progress) {
+        if let index = transfers.firstIndex(where: { $0.id == progress.id }) { transfers[index] = progress }
+        else { transfers.insert(progress, at: 0); if transfers.count > 20 { transfers.removeLast() } }
+        if case .saved(let name) = progress.state, !progress.outgoing {
+            MetricsLog.shared.append("host  received file from iPad: \(progress.size) bytes")
+            NSWorkspace.shared.noteFileSystemChanged(Self.downloads.appendingPathComponent(name).path)
+        }
+    }
+    /// Files dropped on the window or chosen in the open panel go to the iPad's SkyDesk folder.
+    func sendFiles(_ urls: [URL]) {
+        guard let fileEngine, filesReady else { status = "Connect your iPad (with the latest SkyDesk) to send files."; return }
+        for url in urls { fileEngine.send(fileAt: url) }
+    }
+    // MARK: Wireless updates
+
+    private var updateTicks = 0
+    private func checkForUpdate() {
+        updateTicks += 1
+        guard updateTicks % 5 == 1 else { return }
+        let info = UpdateInfo.load(from: Self.updateFolder)
+        stagedBuild = info.map(\.build).flatMap { $0 > ownBuild || $0 > knownPadBuild ? $0 : nil }
+        offerUpdateIfNeeded()
+        if autoUpdateMacReady { updateMacNow() }
+    }
+    private var stagedHostApp: URL? {
+        let url = Self.updateFolder.appendingPathComponent(UpdateInfo.hostAppName)
+        guard let info = UpdateInfo.load(from: Self.updateFolder), info.build > ownBuild,
+              FileManager.default.fileExists(atPath: url.path) else { return nil }
+        return url
+    }
+    var macUpdateAvailable: Bool { stagedHostApp != nil }
+    /// iPad first, then the Mac: the Mac waits until the iPad has the staged build (or the update has no iPad part),
+    /// and only replaces itself with no iPad connected, no iPad-only mode, and 10 s after the last session.
+    private var autoUpdateMacReady: Bool {
+        guard stagedHostApp != nil, !clientConnected, !updating, Date().timeIntervalSince(lastSessionEnd) > 10,
+              let info = UpdateInfo.load(from: Self.updateFolder) else { return false }
+        let hasPadPart = FileManager.default.fileExists(atPath: Self.updateFolder.appendingPathComponent(UpdateInfo.ipaName).path)
+        return !hasPadPart || knownPadBuild >= info.build
+    }
+    private var updateWhenPadDrops = false
+    /// The staged build the running update server describes; a different staged build gets a fresh server.
+    private var updateServerBuild = 0
+    /// Right after the iPad drops; only waits (up to 30 s) while the iPad-only display restore finishes.
+    private func updateAfterDrop(attempt: Int) {
+        guard stagedHostApp != nil, !clientConnected, !updating else { return }
+        if Self.displayRestoreRunning() {
+            if attempt < 60 { DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.updateAfterDrop(attempt: attempt + 1) } }
+            return
+        }
+        updateMacNow()
+    }
+    /// Staged host app path → build that passed the signature check.
+    private var verifiedStaged: (path: String, build: Int)?
+    private func verifyStagedHost() {
+        guard let staged = stagedHostApp, let build = UpdateInfo.load(from: Self.updateFolder)?.build,
+              verifiedStaged?.path != staged.path || verifiedStaged?.build != build else { return }
+        Task {
+            let ok = await Task.detached(priority: .utility) { SelfUpdater.verify(staged) }.value
+            if ok { verifiedStaged = (staged.path, build) }
+            else { MetricsLog.shared.append("host  staged Mac update failed its signature check; not installing it") }
+        }
+    }
+    func updateMacNow() {
+        guard let staged = stagedHostApp, !clientConnected, !updating else { return }
+        guard !Self.displayRestoreRunning() else { status = "Waiting for the Mac's displays to be restored before updating."; return }
+        let build = UpdateInfo.load(from: Self.updateFolder)?.build ?? 0
+        if !(verifiedStaged?.path == staged.path && verifiedStaged?.build == build) {
+            guard SelfUpdater.verify(staged) else { status = "The Mac update failed its signature check, so it wasn't installed."; return }
+        }
+        updating = true
+        status = "Updating SkyDesk… it will reopen in a few seconds."
+        MetricsLog.shared.append("host  self-update to staged build starting")
+        do {
+            try SelfUpdater.replace(with: staged)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { NSApp.terminate(nil) }
+        } catch { updating = false; status = "Update failed: \(error.localizedDescription)" }
+    }
+    private static func displayRestoreRunning() -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep"); process.arguments = ["-f", "SkyDeskRestore"]
+        process.standardOutput = FileHandle.nullDevice
+        do { try process.run(); process.waitUntilExit() } catch { return true }
+        return process.terminationStatus == 0
+    }
+    private func offerUpdateIfNeeded() {
+        guard clientFeatures & StreamFeature.remoteUpdate != 0, capture != nil, let control,
+              let info = UpdateInfo.load(from: Self.updateFolder), info.build > (clientBuild ?? 0), offeredBuild != info.build,
+              FileManager.default.fileExists(atPath: Self.updateFolder.appendingPathComponent(UpdateInfo.ipaName).path) else { return }
+        offeredBuild = info.build
+        control.send(.updateAvailable(info.build))
+    }
+    /// Starts (or reuses) the HTTPS server and tells the iPad where the manifest is.
+    private func serveUpdate() {
+        guard let info = UpdateInfo.load(from: Self.updateFolder) else { control?.send(.failure("No update is waiting on the Mac.")); return }
+        let ipa = Self.updateFolder.appendingPathComponent(UpdateInfo.ipaName)
+        // The address the iPad already reaches this Mac on.
+        var host: String?
+        if let local = control?.connection.currentPath?.localEndpoint, case .hostPort(let h, _) = local, case .ipv4(let ip) = h {
+            host = "\(ip)".components(separatedBy: "%").first
+        }
+        guard let host else { control?.send(.failure("Wireless updates need a Wi-Fi (IPv4) connection.")); return }
+        let addresses = Array(Set([host] + lanAddresses.map(\.address)))
+        let session = sessionID
+        // A second tap reuses the running server (opening the port twice failed with "address already in use").
+        if let server = updateServer, !server.stopped, server.host == host, updateServerBuild == info.build {
+            control?.send(.updateReady(UpdateServer.url(host: host, port: UpdatePort.https, token: server.token, file: "manifest.plist").absoluteString))
+            return
+        }
+        let previous = updateServer
+        previous?.stop(); updateServer = nil
+        Task {
+            let result = await Task.detached(priority: .userInitiated) { () -> Result<SecIdentity, Error> in
+                Result { try UpdateCertificates.identity(for: addresses) }
+            }.value
+            // Give a stopped server's port a moment to be released.
+            if previous != nil { try? await Task.sleep(nanoseconds: 800_000_000) }
+            guard sessionID == session else { return }
+            do {
+                let identity = try result.get()
+                let server = try UpdateServer(identity: identity, manifest: { url in
+                    try UpdateManifest.plist(ipaURL: url, bundleID: "com.skylar.skydesk.pad", version: "0.1.0 (\(info.build))", title: "SkyDesk")
+                }, ipa: ipa, baseHost: host)
+                server.onLog = { MetricsLog.shared.append("host  " + $0) }
+                // A finished download is not an install: the iPad's build is only trusted from its next hello
+                // (build 21 marked 22 as installed after a download iPadOS never installed, 2026-11-13).
+                server.onIPAServed = { MetricsLog.shared.append("host  iPad downloaded build \(info.build); waiting for it to report that build") }
+                updateServer = server; updateServerBuild = info.build
+                let manifest = UpdateServer.url(host: host, port: UpdatePort.https, token: server.token, file: "manifest.plist")
+                server.start { [weak self] error in
+                    DispatchQueue.main.async {
+                        MainActor.assumeIsolated {
+                            guard let self, self.sessionID == session else { return }
+                            if let error { self.control?.send(.failure("The Mac couldn't start the update server: \(error.localizedDescription)")) }
+                            else { self.control?.send(.updateReady(manifest.absoluteString)) }
+                        }
+                    }
+                }
+                // The download link is only needed for a few minutes.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 900) { [weak self, weak server] in
+                    if let server, self?.updateServer === server { server.stop(); self?.updateServer = nil }
+                }
+            } catch { control?.send(.failure(error.localizedDescription)) }
+        }
+    }
+    private func sendCertificate() {
+        guard let fileEngine, filesReady else { control?.send(.failure("Reconnect to get the update certificate (file transfer is off or still starting).")); return }
+        let name = Host.current().localizedName ?? "your Mac"
+        Task {
+            let result = await Task.detached(priority: .userInitiated) { () -> Result<URL, Error> in
+                Result {
+                    let profile = try UpdateManifest.profile(caDER: try UpdateCertificates.caDER(), macName: name)
+                    let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+                    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+                    let file = folder.appendingPathComponent("SkyDesk Updates.mobileconfig")
+                    try profile.write(to: file)
+                    return file
+                }
+            }.value
+            switch result {
+            case .success(let file): fileEngine.send(fileAt: file)
+            case .failure(let error): control?.send(.failure(error.localizedDescription))
             }
         }
     }
@@ -349,7 +733,8 @@ final class HostModel: ObservableObject {
     }
     private func tick() {
         refreshPermissions()
-        if allowInput && !inputAllowed { input.releaseAll(); displayController.restore(reason: "remote input permission lost") }
+        checkForUpdate()
+        if allowInput && !inputAllowed && capture != nil { input.releaseAll(); displayController.restore(reason: "remote input permission lost") }
         if control != nil && Date().timeIntervalSince(lastHeartbeat) > 5 { disconnect(); status = "Client timed out; remote keys released."; return }
         guard let capture else { return }
         ContinuityLink.suspend()
@@ -361,4 +746,13 @@ final class HostModel: ObservableObject {
         MetricsLog.shared.append(String(format: "host  %@ · %.1f Mbps encoded", metrics, Double(stats.bytes) * 8 / elapsed / 1_000_000))
         if let age = capture.window.oldestAge(), age > 5_000_000_000 { disconnect(); status = "Video stalled; reconnect the iPad." }
     }
+}
+
+/// Which channel carries files, readable from the transport queue.
+final class FileRoute: @unchecked Sendable {
+    private let lock = NSLock()
+    private var channelID: UUID?
+    private var current: FileTransferEngine?
+    func set(_ id: UUID?, engine: FileTransferEngine?) { lock.withLock { channelID = id; current = engine } }
+    func engine(for id: UUID) -> FileTransferEngine? { lock.withLock { channelID == id ? current : nil } }
 }

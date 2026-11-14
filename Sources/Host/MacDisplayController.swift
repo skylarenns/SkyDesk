@@ -27,6 +27,15 @@ final class MacDisplayController {
     func enable(excluding displayID: CGDirectDisplayID) async throws {
         guard !isEnabled else { return }
         guard AXIsProcessTrusted() else { throw DisplayLayoutFailure.unsafeLayout }
+        // The Mac display was only just turned back on: let it stay on a while before turning it off again.
+        let wait = DisplaySwitchClock.load().waitBeforeOff()
+        if wait > 0 {
+            let before = generation
+            DisplayLog.write("enable: waiting \(String(format: "%.1f", wait)) s (Mac display was just switched)")
+            try await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
+            // A restore, a new session or another request during the wait cancels this one.
+            guard generation == before, !isEnabled else { return }
+        }
         let saved = try DisplayLayout.snapshot(sessionDisplay: displayID)
         guard saved.main != displayID, saved.screens.contains(where: { $0.id == displayID }) else {
             throw DisplayLayoutFailure.unsafeLayout

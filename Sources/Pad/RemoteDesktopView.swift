@@ -14,12 +14,15 @@ struct RemoteDesktopView: UIViewRepresentable {
         view.sendText = { [weak client] in client?.sendText($0) }
         view.deleteText = { [weak client] in client?.deleteText() }
         view.keyboardDismissed = { [weak client] in client?.keyboardWanted = false }
+        view.sendMomentum = { [weak client] in client?.scrollMomentum($0) }
         return view
     }
     func updateUIView(_ view: DesktopMetalView, context: Context) {
         Breadcrumb.mark("swiftui:update"); defer { Breadcrumb.mark("swiftui:updated") }
         view.controlsFrame = controlsFrame
         view.setSharpening(client.sharpenText)
+        view.setLocalCursorEnabled(client.localCursorActive)
+        view.setPointerScale(client.pointerScale)
         view.setCursor(client.remoteCursor)
         view.updateKeyboard(wanted: client.keyboardWanted, focus: client.textFocus, fallback: client.lastTapRect)
     }
@@ -37,6 +40,8 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
     var sendText: ((String) -> Void)?
     var deleteText: (() -> Void)?
     var keyboardDismissed: (() -> Void)?
+    /// Lift-off velocity of a scroll, in points per second.
+    var sendMomentum: ((CGPoint) -> Void)?
     var controlsFrame: CGRect = .zero
     private let keyboard = RemoteKeyboardProxy()
     private var keyboardObservers: [NSObjectProtocol] = []
@@ -46,7 +51,7 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
     private var keyboardWanted = false
     /// Drawn here, under the user's hand, so pointer movement does not wait for the video round trip.
     private let cursorView = UIImageView()
-    private let localCursor: Bool
+    private var localCursor: Bool
     private var cursor: RemoteCursor?
     private var cursorHotSpot = CGPoint(x: 5.0 / 28, y: 5.0 / 40)
     private var cursorLocation: CGPoint?
@@ -78,12 +83,11 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
             catch { DispatchQueue.main.async { [weak self] in self?.reportError?(error.localizedDescription) } }
         } else { DispatchQueue.main.async { [weak self] in self?.reportError?("Metal is unavailable on this device.") } }
         addSubview(keyboard)
-        if localCursor {
-            cursorView.isUserInteractionEnabled = false; cursorView.isHidden = true
-            cursorView.image = Self.arrowImage; cursorView.bounds.size = CGSize(width: 28, height: 40)
-            cursorView.layer.actions = ["position": NSNull(), "bounds": NSNull(), "contents": NSNull(), "hidden": NSNull()]
-            addSubview(cursorView)
-        }
+        // Always present (hidden) so the pointer can be switched on and off during a session.
+        cursorView.isUserInteractionEnabled = false; cursorView.isHidden = true
+        cursorView.image = Self.arrowImage; cursorView.bounds.size = CGSize(width: 28, height: 40)
+        cursorView.layer.actions = ["position": NSNull(), "bounds": NSNull(), "contents": NSNull(), "hidden": NSNull()]
+        addSubview(cursorView)
         keyboard.committedText = { [weak self] in self?.sendText?($0) }
         keyboard.deleteRemote = { [weak self] in self?.deleteText?() }
         keyboard.hardwareBegan = { [weak self] in self?.pressesBegan($0, with: $1) }
@@ -167,18 +171,32 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
         if keyboardWanted, !keyboard.isFirstResponder { keyboard.becomeFirstResponder() }
         if !keyboardWanted, keyboard.isFirstResponder { keyboard.resignFirstResponder(); becomeFirstResponder() }
     }
+    /// Only shows or hides a subview: safe inside a SwiftUI update (no responder change).
+    private var pointerScale: CGFloat = 1
+    /// Enlarges the drawn pointer around its tip (hot spot), so clicks still land where it points.
+    func setPointerScale(_ scale: Double) {
+        let value = CGFloat(max(0.5, min(3, scale)))
+        guard value != pointerScale else { return }
+        pointerScale = value
+        if localCursor { placeCursor() }
+    }
+    func setLocalCursorEnabled(_ enabled: Bool) {
+        guard enabled != localCursor else { return }
+        localCursor = enabled
+        if enabled { placeCursor() } else { cursorView.isHidden = true }
+    }
     func setCursor(_ value: RemoteCursor?) {
-        guard localCursor, value != cursor else { return }
+        guard value != cursor else { return }
         cursor = value
         if let value, let image = UIImage(data: value.png) {
             cursorView.image = image; cursorHotSpot = CGPoint(x: value.hotX, y: value.hotY)
         }
-        placeCursor()
+        if localCursor { placeCursor() }
     }
     /// `location` is in this view's coordinates; nil hides the pointer (it left the desktop).
     private func moveCursor(to location: CGPoint?) {
-        guard localCursor else { return }
-        cursorLocation = location; placeCursor()
+        cursorLocation = location
+        if localCursor { placeCursor() }
     }
     private func placeCursor() {
         guard localCursor else { return }
@@ -186,6 +204,7 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
         let frame = DesktopGeometry.keyboardAdjustedFit(content: remoteSize, in: bounds, keyboardHeight: keyboardHeight, focus: focusRect)
         var size = CGSize(width: 28, height: 40)
         if let cursor { size = CGSize(width: cursor.width * frame.width, height: cursor.height * frame.height) }
+        size = CGSize(width: size.width * pointerScale, height: size.height * pointerScale)
         guard size.width >= 1, size.height >= 1 else { cursorView.isHidden = true; return }
         cursorView.frame = CGRect(x: location.x - cursorHotSpot.x * size.width, y: location.y - cursorHotSpot.y * size.height,
                                   width: size.width, height: size.height)
@@ -215,11 +234,21 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
         let frame = DesktopGeometry.keyboardAdjustedFit(content: remoteSize, in: bounds, keyboardHeight: keyboardHeight, focus: focusRect)
         return DesktopGeometry.normalized(location, in: frame)
     }
+    /// Pointer events report the real modifier keys; trust them over what earlier key events left behind.
+    private func syncModifiers(_ recognizer: UIGestureRecognizer) {
+        let actual = Self.flags(recognizer.modifierFlags)
+        for code in ModifierSync.stale(held: heldKeys, actual: actual) {
+            heldKeys.remove(code)
+            sendInput?(InputEvent(kind: .key, keyCode: code, isDown: false, modifiers: actual))
+        }
+        modifiers = actual
+    }
     private func pointer(_ kind: InputEvent.Kind, at point: CGPoint, button: Int = 0) {
         lastPoint = point
         sendInput?(InputEvent(kind: kind, x: point.x, y: point.y, button: button, modifiers: modifiers))
     }
     @objc private func hovered(_ recognizer: UIHoverGestureRecognizer) {
+        syncModifiers(recognizer)
         let location = recognizer.location(in: self)
         let p = point(location)
         let leaving = recognizer.state == .ended || recognizer.state == .cancelled || recognizer.state == .failed
@@ -230,11 +259,13 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
     @objc private func rightClicked(_ recognizer: UITapGestureRecognizer) { click(recognizer, button: 1) }
     private func click(_ recognizer: UITapGestureRecognizer, button: Int) {
         if !keyboard.isFirstResponder { becomeFirstResponder() }
+        syncModifiers(recognizer)
         guard let p = point(recognizer.location(in: self)) else { return }
         moveCursor(to: recognizer.location(in: self))
         pointer(.down, at: p, button: button); pointer(.up, at: p, button: button)
     }
     @objc private func dragged(_ recognizer: UIPanGestureRecognizer) {
+        syncModifiers(recognizer)
         let location = recognizer.location(in: self)
         switch recognizer.state {
         case .began:
@@ -250,14 +281,23 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
         }
     }
     @objc private func scrolled(_ recognizer: UIPanGestureRecognizer) {
+        syncModifiers(recognizer)
         if recognizer.state == .began, dragActive { pointer(.up, at: lastPoint); dragActive = false }
         if let p = point(recognizer.location(in: self)) { pointer(.move, at: p) }
         let delta = recognizer.translation(in: self)
         recognizer.setTranslation(.zero, in: self)
-        if delta != .zero {
-            sendInput?(InputEvent(kind: .scroll, x: max(-2000, min(2000, delta.x)),
-                                 y: max(-2000, min(2000, delta.y)), modifiers: modifiers))
+        let phase: Int
+        switch recognizer.state {
+        case .began: phase = ScrollPhase.began
+        case .changed: phase = ScrollPhase.changed
+        default: phase = ScrollPhase.ended
         }
+        // Began and ended are always sent (they frame the gesture for Mac apps); changes only when something moved.
+        if delta != .zero || phase != ScrollPhase.changed {
+            sendInput?(InputEvent(kind: .scroll, x: max(-2000, min(2000, delta.x)),
+                                 y: max(-2000, min(2000, delta.y)), modifiers: modifiers, phase: phase))
+        }
+        if recognizer.state == .ended { sendMomentum?(recognizer.velocity(in: self)) }
     }
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
         gestureRecognizer is UIHoverGestureRecognizer || other is UIHoverGestureRecognizer

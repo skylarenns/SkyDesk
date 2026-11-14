@@ -65,6 +65,7 @@ public enum DisplayLayout {
                 try check(setEnabled(config, screen.id, false), "Disable Mac display")
             }
         }
+        DisplaySwitchClock.noteOff()
     }
     public static func restore(_ snapshot: DisplayLayoutSnapshot) throws {
         guard let setEnabled else { throw DisplayLayoutFailure.unavailable }
@@ -72,12 +73,18 @@ public enum DisplayLayout {
         // Restore each missing display separately, then restore the original arrangement.
         for screen in snapshot.screens where screen.id != 0 {
             if !(try online()).contains(screen.id) {
+                // A panel that was only just powered off may not come back if powered on at once.
+                // Hold this thread for the rest of the minimum off time (at most 5 s), then turn it on.
+                let wait = DisplaySwitchClock.load().waitBeforeOn()
+                if wait > 0 { Thread.sleep(forTimeInterval: wait) }
+                guard !(try online()).contains(screen.id) else { continue }
                 // A virtual display may have ended with the host. Failure to restore that
                 // one must not prevent recovery of the original physical/main display.
                 do {
                     try configure(scope: .forSession) { config in
                         try check(setEnabled(config, screen.id, true), "Restore display \(screen.id)")
                     }
+                    if screen.id != snapshot.sessionDisplay { DisplaySwitchClock.noteOn() }
                 } catch { if screen.id != snapshot.sessionDisplay { throw error } }
             }
         }

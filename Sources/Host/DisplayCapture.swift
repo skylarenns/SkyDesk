@@ -9,6 +9,9 @@ final class DisplayCapture: NSObject, SCStreamOutput, SCStreamDelegate {
     private let encoder: HEVCEncoder
     private let lock = NSLock()
     private var active = true
+    private var paused = false
+    private var configuration = SCStreamConfiguration()
+    private var keyframeNeeded = false
     private var received = 0
     private var captured = 0
     private var skipped = 0
@@ -17,12 +20,14 @@ final class DisplayCapture: NSObject, SCStreamOutput, SCStreamDelegate {
     private let markIdleGaps: Bool
     private var lastCapture: UInt64?   // capture queue only
     private var idlePending = true     // capture queue only
+    private var latestImage: CVPixelBuffer?  // capture queue only
     var onFrame: ((VideoFrame) -> Void)?
     var onFailure: ((String) -> Void)?
     let info: StreamInfo
 
     init(display: SCDisplay, longestEdge: Int, fps: Int, bitrate: Int, inputEnabled: Bool,
-         lowLatencyRateControl: Bool, nativeDesktop: Bool = false, clientFeatures: Int = 0) throws {
+         lowLatencyRateControl: Bool, nativeDesktop: Bool = false, clientFeatures: Int = 0, hostName: String? = nil,
+         clipboard: Bool = false, files: Bool = false) throws {
         window = .streaming(fps: fps)
         markIdleGaps = clientFeatures & StreamFeature.idleGapFlags != 0
         let mode = CGDisplayCopyDisplayMode(display.displayID)
@@ -32,7 +37,7 @@ final class DisplayCapture: NSObject, SCStreamOutput, SCStreamDelegate {
                           displayName: nativeDesktop ? "iPad Retina desktop" : "Display \(display.displayID)",
                           inputEnabled: inputEnabled, textInputEnabled: inputEnabled,
                           displayBlankingSupported: nativeDesktop && inputEnabled,
-                          features: Self.features(client: clientFeatures, inputEnabled: inputEnabled))
+                          features: Self.features(client: clientFeatures, inputEnabled: inputEnabled, clipboard: clipboard, files: files), hostName: hostName)
         try info.validate()
         encoder = try HEVCEncoder(width: info.width, height: info.height, fps: fps, bitrate: bitrate,
                                   lowLatencyRateControl: lowLatencyRateControl)
@@ -52,14 +57,21 @@ final class DisplayCapture: NSObject, SCStreamOutput, SCStreamDelegate {
         configuration.capturesAudio = false
         configuration.scalesToFit = true
         let filter = SCContentFilter(display: display, excludingWindows: [])
+        self.configuration = configuration
         let stream = SCStream(filter: filter, configuration: configuration, delegate: self)
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
         self.stream = stream
     }
-    private static func features(client: Int, inputEnabled: Bool) -> Int? {
+    private static func features(client: Int, inputEnabled: Bool, clipboard: Bool, files: Bool) -> Int? {
         var value = client & StreamFeature.idleGapFlags != 0 ? StreamFeature.idleGapFlags | StreamFeature.clientStatsLog : 0
         // Without remote input the iPad never moves the pointer, so the video must keep showing it.
         if inputEnabled, client & StreamFeature.localCursor != 0 { value |= StreamFeature.localCursor }
+        if client & StreamFeature.pauseVideo != 0 { value |= StreamFeature.pauseVideo }
+        if inputEnabled, client & StreamFeature.liveCursorToggle != 0 { value |= StreamFeature.liveCursorToggle }
+        if inputEnabled, client & StreamFeature.scrollMomentum != 0 { value |= StreamFeature.scrollMomentum }
+        if client & StreamFeature.remoteUpdate != 0 { value |= StreamFeature.remoteUpdate }
+        if clipboard, client & StreamFeature.clipboardSync != 0 { value |= StreamFeature.clipboardSync }
+        if files, client & StreamFeature.fileTransfer != 0 { value |= StreamFeature.fileTransfer }
         return value == 0 ? nil : value
     }
     func start() async throws { try await stream?.startCapture() }
@@ -69,6 +81,23 @@ final class DisplayCapture: NSObject, SCStreamOutput, SCStreamDelegate {
         stream = nil
         window.reset()
     }
+    /// While paused nothing is encoded or sent; the first frame after resuming is a keyframe for a fresh decoder.
+    func setPaused(_ value: Bool) {
+        lock.withLock {
+            guard paused != value else { return }
+            paused = value
+            if !value { keyframeNeeded = true }
+        }
+        window.reset()
+        if !value { queue.async { [weak self] in self?.resendLatest() } }
+    }
+    /// Live switch between the Mac drawing its pointer into the video and the iPad drawing it locally.
+    @MainActor func setShowsCursor(_ show: Bool) async throws {
+        guard configuration.showsCursor != show, let stream else { return }
+        configuration.showsCursor = show
+        try await stream.updateConfiguration(configuration)
+    }
+    var isPaused: Bool { lock.withLock { paused } }
     func statistics() -> (captured: Int, frames: Int, skipped: Int, encodeMS: Double, bytes: Int) {
         lock.lock(); defer { lock.unlock() }
         let value = (captured, received, skipped, encodeMilliseconds, encodedBytes)
@@ -81,19 +110,26 @@ final class DisplayCapture: NSObject, SCStreamOutput, SCStreamDelegate {
               let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
               let rawStatus = attachments.first?[.status] as? Int, SCFrameStatus(rawValue: rawStatus) == .complete,
               let image = sampleBuffer.imageBuffer else { return }
-        lock.lock(); let enabled = active; captured += 1; lock.unlock()
+        // Kept so a resume can resend the current screen even if it never changes again.
+        latestImage = image
+        lock.lock(); let enabled = active && !paused; captured += 1; lock.unlock()
         guard enabled else { return }
         let now = monotonicNanos()
         // Measured against every changed frame, including ones the window drops, so only a real pause counts.
         if let lastCapture, now >= lastCapture, now - lastCapture >= StreamStatistics.idleGapNanos { idlePending = true }
         lastCapture = now
+        submit(image, now: now, timestamp: sampleBuffer.presentationTimeStamp)
+    }
+    /// Capture queue only.
+    private func submit(_ image: CVPixelBuffer, now: UInt64, timestamp: CMTime) {
         guard let sequence = window.reserve(now: now) else {
             lock.lock(); skipped += 1; lock.unlock(); return
         }
         let afterIdle = markIdleGaps && idlePending
         idlePending = false
+        let forceKeyframe: Bool = lock.withLock { let value = keyframeNeeded; keyframeNeeded = false; return value }
         encoder.encode(image, sequence: sequence, captureTime: now,
-                       timestamp: sampleBuffer.presentationTimeStamp, afterIdle: afterIdle) { [weak self] result in
+                       timestamp: timestamp, afterIdle: afterIdle, forceKeyframe: forceKeyframe) { [weak self] result in
             guard let self else { return }
             self.lock.lock(); let enabled = self.active; self.lock.unlock()
             guard enabled else { return }
@@ -110,5 +146,10 @@ final class DisplayCapture: NSObject, SCStreamOutput, SCStreamDelegate {
                 self.onFailure?(error.localizedDescription)
             }
         }
+    }
+    /// Capture queue only: re-encodes the newest screen image as a keyframe.
+    private func resendLatest() {
+        guard let image = latestImage, lock.withLock({ active && !paused }) else { return }
+        submit(image, now: monotonicNanos(), timestamp: CMClockGetTime(CMClockGetHostTimeClock()))
     }
 }

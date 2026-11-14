@@ -12,6 +12,7 @@ public struct PairingKey: Equatable, Sendable {
         guard status == errSecSuccess else { throw DeskError.system("Generate pairing key", status) }
         data = Data(bytes)
     }
+    public init(data: Data) { precondition(data.count == 32, "Pairing keys are 32 bytes."); self.data = data }
     public init(text: String) throws {
         let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard clean.utf8.count == 64 else { throw DeskError.invalid("Pairing key must contain 64 hexadecimal characters.") }
@@ -31,6 +32,14 @@ public enum PairingStore {
     private static let service = "com.skylar.skydesk.pairing"
     private static let accessLock = NSLock()
     public static func load(account: String, allowInteraction: Bool = false) throws -> PairingKey? {
+        guard let text = try loadText(account: account, allowInteraction: allowInteraction) else { return nil }
+        return try PairingKey(text: text)
+    }
+    public static func save(_ key: PairingKey, account: String, allowInteraction: Bool = false) throws {
+        try saveText(key.text, account: account, allowInteraction: allowInteraction)
+    }
+    /// The same Keychain service as the keys; used for the Mac's pairing password.
+    public static func loadText(account: String, allowInteraction: Bool = false) throws -> String? {
         try withKeychainAccess(allowInteraction: allowInteraction) {
         var query = base(account)
         let context = LAContext()
@@ -42,25 +51,29 @@ public enum PairingStore {
         let status = SecItemCopyMatching(query as CFDictionary, &item)
         if status == errSecItemNotFound { return nil }
         guard status == errSecSuccess, let data = item as? Data, let text = String(data: data, encoding: .utf8) else {
-            throw DeskError.system("Read pairing key", status)
+            throw DeskError.system("Read pairing secret", status)
         }
-        return try PairingKey(text: text)
+        return text
         }
     }
-    public static func save(_ key: PairingKey, account: String, allowInteraction: Bool = false) throws {
+    public static func saveText(_ text: String, account: String, allowInteraction: Bool = false) throws {
         try withKeychainAccess(allowInteraction: allowInteraction) {
         var query = base(account)
         let context = LAContext()
         context.interactionNotAllowed = !allowInteraction
         query[kSecUseAuthenticationContext as String] = context
-        let attributes: [String: Any] = [kSecValueData as String: Data(key.text.utf8),
+        let attributes: [String: Any] = [kSecValueData as String: Data(text.utf8),
                                         kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly]
         var status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
         if status == errSecItemNotFound {
             status = SecItemAdd(query.merging(attributes) { _, new in new } as CFDictionary, nil)
         }
-        guard status == errSecSuccess else { throw DeskError.system("Save pairing key", status) }
+        guard status == errSecSuccess else { throw DeskError.system("Save pairing secret", status) }
         }
+    }
+    /// Removes one item. Missing items are not an error.
+    public static func delete(account: String) {
+        withKeychainAccess(allowInteraction: false) { _ = SecItemDelete(base(account) as CFDictionary) }
     }
     private static func withKeychainAccess<T>(allowInteraction: Bool, _ operation: () throws -> T) rethrows -> T {
         accessLock.lock()
@@ -91,7 +104,7 @@ public enum DeskNetwork {
         sec_protocol_options_set_max_tls_protocol_version(options, .TLSv12)
         sec_protocol_options_append_tls_ciphersuite(options, tls_ciphersuite_t(rawValue: UInt16(TLS_PSK_WITH_AES_128_GCM_SHA256))!)
         let secret = key.data.withUnsafeBytes { DispatchData(bytes: $0) }
-        let identity = Data("SkyDesk-v1".utf8).withUnsafeBytes { DispatchData(bytes: $0) }
+        let identity = Data(PairingPassword.pskIdentity.utf8).withUnsafeBytes { DispatchData(bytes: $0) }
         sec_protocol_options_add_pre_shared_key(options, secret as __DispatchData, identity as __DispatchData)
         let tcp = NWProtocolTCP.Options()
         tcp.noDelay = true
@@ -137,8 +150,12 @@ public final class SecureChannel {
             guard let self, !self.closed else { return }
             switch state {
             case .ready: self.ready = true; self.receive(); self.onReady?()
-            case .failed(let error): self.finish(error.localizedDescription)
-            case .waiting(let error): if self.failWhenWaiting { self.finish(error.localizedDescription) }
+            case .failed(let error):
+                if case .tls = error { self.finish(PairingPassword.mismatchMessage) } else { self.finish(error.localizedDescription) }
+            case .waiting(let error):
+                // A TLS failure never recovers by waiting: the password (pre-shared key) did not match.
+                if case .tls = error { self.finish(PairingPassword.mismatchMessage) }
+                else if self.failWhenWaiting { self.finish(error.localizedDescription) }
             case .cancelled: self.finish(nil)
             default: break
             }
@@ -146,7 +163,7 @@ public final class SecureChannel {
         connection.start(queue: queue)
         queue.asyncAfter(deadline: .now() + 10) { [weak self] in
             guard let self, !self.ready else { return }
-            self.finish("Connection timed out. Check the pairing key and local network access.")
+            self.finish("Connection timed out. Check that the Mac is awake and on the same network.")
         }
     }
     public func send(_ message: ControlMessage) {

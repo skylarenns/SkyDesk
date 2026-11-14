@@ -161,3 +161,26 @@ private extension Array {
         return result
     }
 }
+
+final class TotalLatencyTests: XCTestCase {
+    func testTotalAddsMacTimeRoundTripAndLocalDisplay() {
+        let ms: UInt64 = 1_000_000
+        let stats = StreamStatistics()
+        let start: UInt64 = 1_000 * ms
+        // RTT 8 ms, Mac capture→encode 12 ms, local display 16 ms → total 36 ms.
+        for index in 0..<120 {
+            let t = start + UInt64(index) * 10 * ms
+            _ = stats.recordPong(sentAt: t - 8 * ms, now: t)
+            stats.recordPresented(at: t + 16 * ms, receivedAt: t, afterIdle: false, macMS: 12)
+        }
+        let value = stats.snapshot(now: start + 1_200 * ms)
+        XCTAssertEqual(value.totalAverageMS ?? 0, 36, accuracy: 0.01)
+        XCTAssertEqual(value.totalHigh1MS ?? 0, 36, accuracy: 0.01)
+        XCTAssertEqual(StatisticsText.total(value), "Total  avg 36.0 ms · 1% high 36.0 ms")
+        XCTAssertTrue(StatisticsText.pipeline(value).hasSuffix("Local display avg 16.0 ms"))
+        // No RTT yet or no Mac timing: no total sample rather than a misleading one.
+        let fresh = StreamStatistics()
+        fresh.recordPresented(at: 20 * ms, receivedAt: 4 * ms, afterIdle: false, macMS: 12)
+        XCTAssertNil(fresh.snapshot(now: 21 * ms).totalAverageMS)
+    }
+}
