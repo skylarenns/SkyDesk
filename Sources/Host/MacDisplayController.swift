@@ -5,6 +5,8 @@ import IOKit.pwr_mgt
 @MainActor
 final class MacDisplayController {
     private(set) var isEnabled = false
+    /// iPad only is on and the switch has finished: the state a kept desktop needs.
+    var isSettled: Bool { isEnabled && !changing }
     var onChange: ((Bool) -> Void)?
     var onLayoutChange: (() -> Void)?
     private var snapshot: DisplayLayoutSnapshot?

@@ -71,6 +71,15 @@ final class HostModel: ObservableObject {
         }
     }
     /// Keep the Mac from going to sleep on its own while it is ready for the iPad (for use away from home).
+    /// Stay in iPad only mode when the iPad goes away, so it gets its desktop back at once (KeptDesktop.swift).
+    @Published var keepPadDesktop = UserDefaults.standard.bool(forKey: "keepPadDesktop") {
+        didSet {
+            UserDefaults.standard.set(keepPadDesktop, forKey: "keepPadDesktop")
+            if !keepPadDesktop { releaseKeptDesktop(reason: "keeping the iPad desktop was switched off") }
+        }
+    }
+    /// True while the iPad-only desktop is being kept with no iPad connected.
+    @Published private(set) var desktopKept = false
     @Published var keepAwake = UserDefaults.standard.bool(forKey: "keepAwake") {
         didSet { UserDefaults.standard.set(keepAwake, forKey: "keepAwake"); updateAwake() }
     }
@@ -157,6 +166,10 @@ final class HostModel: ObservableObject {
     private let transportQueue = DispatchQueue(label: "skydesk.host.transport", qos: .userInteractive)
     private let fastPath = ControlFastPath()
     private var virtualDisplay: SkyDeskVirtualDisplay?
+    /// What `virtualDisplay` was built for.
+    private var sessionShape: KeptDesktop.Shape?
+    /// The iPad-only desktop of an iPad that left, still the Mac's only display, waiting for it to return.
+    private var keptDesktop: (display: SkyDeskVirtualDisplay, shape: KeptDesktop.Shape)?
     private var focusMonitor: RemoteFocusMonitor?
     private var cursorMonitor: CursorMonitor?
     private var files: SecureChannel?
@@ -169,7 +182,11 @@ final class HostModel: ObservableObject {
         ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Downloads")
     private lazy var displayController: MacDisplayController = {
         let blanker = MacDisplayController()
-        blanker.onChange = { [weak self] blanked in self?.control?.send(.macDisplayBlanked(blanked)) }
+        blanker.onChange = { [weak self] blanked in
+            self?.control?.send(.macDisplayBlanked(blanked))
+            // Someone used the Mac, or the arrangement changed: a kept desktop has nothing left to wait on.
+            if !blanked { self?.keptDesktopEnded() }
+        }
         blanker.onLayoutChange = { [weak self] in self?.refreshInputGeometry() }
         return blanker
     }()
@@ -255,7 +272,8 @@ final class HostModel: ObservableObject {
         guard screenAllowed else { status = "Allow Screen Recording, then refresh displays. You may need to reopen SkyDesk."; return }
         do {
             displays = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true).displays
-            if !displays.contains(where: { $0.displayID == displayID }) { displayID = displays.first?.displayID ?? 0 }
+            // In iPad only mode the list holds nothing but the iPad's display; the saved choice is still the right one.
+            if !displayController.isEnabled, !displays.contains(where: { $0.displayID == displayID }) { displayID = displays.first?.displayID ?? 0 }
         } catch { status = error.localizedDescription }
     }
     func startSharing() {
@@ -433,12 +451,45 @@ final class HostModel: ObservableObject {
         if clientConnected { return }
         if asleep { status = "Paused while the Mac sleeps"; return }
         if !listening { status = wantsListener ? "Starting…" : "Off. Your iPad can't connect."; return }
-        status = sharing ? "Waiting for your iPad" : "Off. Your iPad can turn it on by connecting."
+        status = !sharing ? "Off. Your iPad can turn it on by connecting."
+            : desktopKept ? "Waiting for your iPad. Its desktop is kept; press a key on the Mac to get the Mac's display back." : "Waiting for your iPad"
     }
-    private func disconnect() {
+    /// Gives up a kept desktop: the Mac's displays come back and the iPad's display is removed.
+    private func releaseKeptDesktop(reason: String) {
+        guard keptDesktop != nil else { return }
+        displayController.restore(reason: reason)
+        keptDesktopEnded()
+    }
+    /// The Mac's displays are back (or on their way); remove the iPad's display that was being kept.
+    private func keptDesktopEnded() {
+        guard let kept = keptDesktop else { return }
+        keptDesktop = nil; desktopKept = false
+        MetricsLog.shared.append("host  kept iPad desktop given up; the Mac's displays are back")
+        let display = kept.display
+        Task { display.invalidate() }
+        refreshStatus()
+    }
+    /// A virtual display a cancelled session start no longer needs, unless it is the kept one.
+    private func discard(_ display: SkyDeskVirtualDisplay) {
+        if keptDesktop?.display !== display, virtualDisplay !== display { display.invalidate() }
+    }
+    private func disconnect(_ end: KeptDesktop.SessionEnd = .hostEnded) {
         generation = UUID()
         ContinuityLink.resume()
-        displayController.restore(reason: "session ended")
+        let padOnly = displayController.isSettled && (keptDesktop != nil || (virtualDisplay != nil && sessionShape != nil))
+        let keep = KeptDesktop.shouldKeep(setting: keepPadDesktop, padOnly: padOnly, end: end,
+                                          macUpdateWaiting: updateWhenPadDrops || macUpdateDue)
+        if keep {
+            if let display = virtualDisplay, let shape = sessionShape {
+                keptDesktop = (display, shape); desktopKept = true; virtualDisplay = nil
+                MetricsLog.shared.append("host  iPad left; its desktop stays the Mac's only display until it returns or someone uses the Mac")
+                DisplayLog.write("kept: session ended with iPad only on; nothing restored")
+            }
+        } else {
+            displayController.restore(reason: "session ended")
+            keptDesktopEnded()
+        }
+        sessionShape = nil
         let current = channels.values
         channels.removeAll(); control = nil; video = nil; sessionID = nil; clientDisplay = nil; clientFeatures = 0
         fastPath.bind(control: nil); fastPath.bind(window: nil)
@@ -503,7 +554,7 @@ final class HostModel: ObservableObject {
                         self.noteRefused(channel.connection, reason: reason == PairingPassword.mismatchMessage ? "wrong key or an unsupported key exchange" : reason)
                     }
                     if self.control === channel || self.video === channel {
-                        self.disconnect()
+                        self.disconnect(.padLeft)
                         if let reason { self.status = reason }
                     } else if self.audioChannel === channel {
                         // Losing only the sound channel puts the sound back on the Mac, nothing else.
@@ -523,7 +574,7 @@ final class HostModel: ObservableObject {
             if self.control !== channel && self.video !== channel && self.files !== channel && self.audioChannel !== channel {
                 channel.close(reason: "Session handshake timed out.")
             }
-            else if self.control == nil || self.video == nil { self.disconnect() }
+            else if self.control == nil || self.video == nil { self.disconnect(.padLeft) }
         }
     }
     private func receive(_ packet: WirePacket, from channel: SecureChannel, pongSent: Bool = false) {
@@ -687,18 +738,30 @@ final class HostModel: ObservableObject {
                     throw DeskError.invalid("SkyDesk on the Mac needs Accessibility permission for your touches and keys. On the Mac: open SkyDesk Host and click Allow.")
                 }
                 var selectedDisplay = displays.first(where: { $0.displayID == displayID })
+                var resumedKept = false
+                if !useiPadDesktop { releaseKeptDesktop(reason: "mirroring the Mac display instead") }
                 let sessionFPS = min(fps, (clientDisplay?.maximumFPS ?? fps) >= 120 ? 120 : (clientDisplay?.maximumFPS ?? fps) >= 60 ? 60 : 30)
                 if useiPadDesktop {
                     guard let clientDisplay else { throw DeskError.invalid("Update SkyDesk on iPad to create its Retina desktop, or choose Mirror Mac display.") }
-                    let virtual = try SkyDeskVirtualDisplay(pixelWidth: UInt32(clientDisplay.width),
-                                                          height: UInt32(clientDisplay.height), refreshRate: Double(sessionFPS))
-                    virtualDisplay = virtual
-                    try await Task.sleep(nanoseconds: 100_000_000)
-                    guard generation == token, self.sessionID == sessionID else { virtual.invalidate(); return }
-                    try virtual.activate()
+                    let shape = KeptDesktop.Shape(width: Int(clientDisplay.width), height: Int(clientDisplay.height), fps: sessionFPS)
+                    let virtual: SkyDeskVirtualDisplay
+                    if let kept = keptDesktop, KeptDesktop.canReuse(kept: kept.shape, wanted: shape, padOnly: displayController.isSettled) {
+                        // The desktop this iPad left is still the Mac's only display: carry on with it as it is.
+                        virtual = kept.display; keptDesktop = nil; desktopKept = false; resumedKept = true
+                        virtualDisplay = virtual; sessionShape = shape
+                        MetricsLog.shared.append("host  iPad returned to its kept desktop; no display switch needed")
+                    } else {
+                        releaseKeptDesktop(reason: "the connecting iPad needs a different desktop")
+                        virtual = try SkyDeskVirtualDisplay(pixelWidth: UInt32(clientDisplay.width),
+                                                            height: UInt32(clientDisplay.height), refreshRate: Double(sessionFPS))
+                        virtualDisplay = virtual; sessionShape = shape
+                        try await Task.sleep(nanoseconds: 100_000_000)
+                        guard generation == token, self.sessionID == sessionID else { discard(virtual); return }
+                        try virtual.activate()
+                    }
                     for _ in 0..<20 {
                         let available = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true).displays
-                        guard generation == token, self.sessionID == sessionID else { virtual.invalidate(); return }
+                        guard generation == token, self.sessionID == sessionID else { discard(virtual); return }
                         if let match = available.first(where: { $0.displayID == virtual.displayID }) { selectedDisplay = match; break }
                         try await Task.sleep(nanoseconds: 100_000_000)
                     }
@@ -748,6 +811,8 @@ final class HostModel: ObservableObject {
                 var welcome = pipeline.info
                 if (welcome.features ?? 0) & StreamFeature.deviceKeys != 0 { welcome.hostID = hostID }
                 control.send(.welcome(welcome))
+                // iPad only is already on, so the iPad shows it that way and does not ask for the switch again.
+                if resumedKept { control.send(.macDisplayBlanked(true)) }
                 if let suite = control.negotiatedSuite {
                     MetricsLog.shared.append("host  connection secured with " + (suite == DeskNetwork.forwardSecretSuite ? "forward secrecy" : "the pre-37 key exchange"))
                 }
@@ -911,7 +976,9 @@ final class HostModel: ObservableObject {
         let info = UpdateInfo.load(from: Self.updateFolder)
         stagedBuild = info.map(\.build).flatMap { $0 > ownBuild || $0 > knownPadBuild ? $0 : nil }
         offerUpdateIfNeeded()
-        if autoUpdateMacReady { updateMacNow() }
+        // The Mac cannot replace itself while iPad only is on, so a waiting update ends a kept desktop first.
+        if autoUpdateMacReady, keptDesktop != nil { releaseKeptDesktop(reason: "a Mac update is waiting") }
+        else if autoUpdateMacReady { updateMacNow() }
     }
     private var stagedHostApp: URL? {
         let url = Self.updateFolder.appendingPathComponent(UpdateInfo.hostAppName)
@@ -923,8 +990,11 @@ final class HostModel: ObservableObject {
     /// iPad first, then the Mac: the Mac waits until the iPad has the staged build (or the update has no iPad part),
     /// and only replaces itself with no iPad connected, no iPad-only mode, and 10 s after the last session.
     private var autoUpdateMacReady: Bool {
-        guard stagedHostApp != nil, !clientConnected, !updating, Date().timeIntervalSince(lastSessionEnd) > 10,
-              let info = UpdateInfo.load(from: Self.updateFolder) else { return false }
+        !clientConnected && !updating && Date().timeIntervalSince(lastSessionEnd) > 10 && macUpdateDue
+    }
+    /// A newer Mac build is staged and no iPad still has to take its part first.
+    private var macUpdateDue: Bool {
+        guard stagedHostApp != nil, let info = UpdateInfo.load(from: Self.updateFolder) else { return false }
         let hasPadPart = FileManager.default.fileExists(atPath: Self.updateFolder.appendingPathComponent(UpdateInfo.ipaName).path)
         return !hasPadPart || knownPadBuild >= info.build
     }
@@ -953,6 +1023,7 @@ final class HostModel: ObservableObject {
     }
     func updateMacNow() {
         guard let staged = stagedHostApp, !clientConnected, !updating else { return }
+        releaseKeptDesktop(reason: "updating the Mac")
         guard !Self.displayRestoreRunning() else { status = "Waiting for the Mac's displays to be restored before updating."; return }
         let build = UpdateInfo.load(from: Self.updateFolder)?.build ?? 0
         if !(verifiedStaged?.path == staged.path && verifiedStaged?.build == build) {
@@ -1085,7 +1156,7 @@ final class HostModel: ObservableObject {
         refreshPermissions()
         checkForUpdate()
         if allowInput && !inputAllowed && capture != nil { input.releaseAll(); displayController.restore(reason: "remote input permission lost") }
-        if control != nil && Date().timeIntervalSince(lastHeartbeat) > 5 { disconnect(); status = "Client timed out; remote keys released."; return }
+        if control != nil && Date().timeIntervalSince(lastHeartbeat) > 5 { disconnect(.padLeft); status = "Client timed out; remote keys released."; return }
         guard let capture else { return }
         ContinuityLink.suspend()
         let stats = capture.statistics()
@@ -1101,7 +1172,7 @@ final class HostModel: ObservableObject {
             metrics += String(format: " · bitrate limited to %.1f Mbps by the network", Double(controller.target) / 1e6)
         }
         MetricsLog.shared.append(String(format: "host  %@ · %.1f Mbps encoded", metrics, Double(stats.bytes) * 8 / elapsed / 1_000_000))
-        if let age = capture.window.oldestAge(), age > 5_000_000_000 { disconnect(); status = "Video stalled; reconnect the iPad." }
+        if let age = capture.window.oldestAge(), age > 5_000_000_000 { disconnect(.padLeft); status = "Video stalled; reconnect the iPad." }
     }
 }
 
