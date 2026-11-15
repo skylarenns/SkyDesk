@@ -67,4 +67,28 @@ final class GestureTests: XCTestCase {
         RemoteInputOrigin.lastGesture = 0
     }
     #endif
+
+    func testAPointerNearAnEdgeCountsAsOnIt() {
+        let frame = CGRect(x: 0, y: 0, width: 1376, height: 1032)
+        // Three points from the left: on the left edge, height untouched.
+        var result = PointerEdges.snapped(CGPoint(x: 3, y: 500), in: frame)
+        XCTAssertEqual(result.point, CGPoint(x: 0, y: 500)); XCTAssertTrue(result.onEdge)
+        // A corner snaps both ways (hot corners).
+        result = PointerEdges.snapped(CGPoint(x: 1373, y: 2), in: frame)
+        XCTAssertEqual(result.point.x, 1375.99, accuracy: 0.001); XCTAssertEqual(result.point.y, 0); XCTAssertTrue(result.onEdge)
+        // Bottom edge, and the normalised value stays inside the desktop.
+        result = PointerEdges.snapped(CGPoint(x: 700, y: 1030), in: frame)
+        XCTAssertTrue(result.onEdge)
+        XCTAssertNotNil(DesktopGeometry.normalized(result.point, in: frame))
+        XCTAssertGreaterThan(DesktopGeometry.normalized(result.point, in: frame)!.y, 0.9995)
+        // Anywhere else nothing changes.
+        result = PointerEdges.snapped(CGPoint(x: 6, y: 500), in: frame)
+        XCTAssertEqual(result.point, CGPoint(x: 6, y: 500)); XCTAssertFalse(result.onEdge)
+        // Exactly on the edge already.
+        XCTAssertTrue(PointerEdges.snapped(CGPoint(x: 0, y: 500), in: frame).onEdge)
+        // A picture shifted up for the keyboard: edges are the picture's, not the screen's.
+        let shifted = CGRect(x: 0, y: -300, width: 1376, height: 1032)
+        XCTAssertFalse(PointerEdges.snapped(CGPoint(x: 700, y: 2), in: shifted).onEdge)
+        XCTAssertTrue(PointerEdges.snapped(CGPoint(x: 700, y: 730), in: shifted).onEdge)
+    }
 }

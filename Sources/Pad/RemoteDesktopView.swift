@@ -168,7 +168,7 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
     }
     required init(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     deinit {
-        repeatTimer?.invalidate()
+        repeatTimer?.invalidate(); edgePushTimer?.invalidate()
         displayLink?.invalidate(); mailbox.onArrival(nil)
         if let deactivateObserver { NotificationCenter.default.removeObserver(deactivateObserver) }
         keyboardObservers.forEach { NotificationCenter.default.removeObserver($0) }
@@ -302,6 +302,7 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
         repeatTimer?.invalidate(); repeatTimer = nil; repeatKey = nil
         heldKeys.removeAll(); modifiers = 0; dragActive = false
         activeGestures.removeAll()
+        pushAgainstEdge(nil)
         releaseRemoteInput?()
     }
     private func point(_ location: CGPoint) -> CGPoint? {
@@ -324,11 +325,37 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
     }
     @objc private func hovered(_ recognizer: UIHoverGestureRecognizer) {
         syncModifiers(recognizer)
-        let location = recognizer.location(in: self)
-        let p = point(location)
+        var location = recognizer.location(in: self)
         let leaving = recognizer.state == .ended || recognizer.state == .cancelled || recognizer.state == .failed
+        // Near an edge of the Mac desktop the pointer counts as on it; a pointer that leaves the picture close to
+        // an edge went out through that edge. (Not under the toolbar, which is not part of the desktop.)
+        var onEdge = false
+        if !controlsFrame.contains(convert(location, to: nil)) {
+            let frame = DesktopGeometry.keyboardAdjustedFit(content: remoteSize, in: bounds, keyboardHeight: keyboardHeight, focus: focusRect)
+            if frame.insetBy(dx: leaving ? -24 : 0, dy: leaving ? -24 : 0).contains(location) {
+                let clamped = CGPoint(x: min(max(location.x, frame.minX), frame.maxX - 0.01), y: min(max(location.y, frame.minY), frame.maxY - 0.01))
+                (location, onEdge) = PointerEdges.snapped(clamped, in: frame)
+            }
+        }
+        let p = point(location)
         moveCursor(to: p == nil || leaving ? nil : location)
         if let p { pointer(.move, at: p) }
+        pushAgainstEdge(onEdge ? p : nil)
+    }
+    private var edgePush: (point: CGPoint, left: Int)?
+    private var edgePushTimer: Timer?
+    /// A real mouse held against a screen edge keeps reporting movement; the iPad's pointer goes quiet. While the
+    /// pointer rests on an edge the same move is sent a few more times, and the Mac replays each as a push.
+    private func pushAgainstEdge(_ point: CGPoint?) {
+        guard let point else { edgePush = nil; edgePushTimer?.invalidate(); edgePushTimer = nil; return }
+        edgePush = (point, PointerEdges.pushes)
+        guard edgePushTimer == nil else { return }
+        let timer = Timer(timeInterval: PointerEdges.pushInterval, repeats: true) { [weak self] _ in
+            guard let self, let push = self.edgePush, push.left > 0, !self.dragActive else { self?.pushAgainstEdge(nil); return }
+            self.edgePush = (push.point, push.left - 1)
+            self.pointer(.move, at: push.point)
+        }
+        RunLoop.main.add(timer, forMode: .common); edgePushTimer = timer
     }
     @objc private func tapped(_ recognizer: UITapGestureRecognizer) { click(recognizer, button: 0) }
     @objc private func rightClicked(_ recognizer: UITapGestureRecognizer) { click(recognizer, button: 1) }
