@@ -108,6 +108,10 @@ public enum StreamFeature {
     /// Video may travel as encrypted UDP datagrams (DatagramVideo.swift) once the iPad's UDP flow is accepted;
     /// TCP carries it until then and again if UDP stops getting through.
     public static let datagramVideo = 8_192
+    /// The Mac tells the iPad when iPadOS actually fetches a staged update (`updateDownload`), and the iPad stays
+    /// open until then. Before build 44 it closed three seconds after showing Apple's prompt whether or not the
+    /// prompt had been answered, and a prompt answered late installed nothing (2026-11-15).
+    public static let updateSignals = 16_384
 }
 
 public struct Hello: Codable {
@@ -259,6 +263,9 @@ public enum ControlMessage: Codable {
     /// iPad → Mac: start serving the update. Answered by `updateReady` (HTTPS manifest URL) or `failure`.
     case updateRequest
     case updateReady(String)
+    /// Mac → iPad, only with StreamFeature.updateSignals: iPadOS is fetching the staged app from the Mac
+    /// (false = the download started, true = every byte was delivered).
+    case updateDownload(Bool)
     /// iPad → Mac: send the update certificate profile (arrives over the file channel).
     case updateCertificateRequest
     /// iPad → Mac, only with StreamFeature.gestures.

@@ -2,7 +2,7 @@
 
 A native Apple remote desktop for one person's own devices. **SkyDesk Host** runs in the Mac's menu bar, captures a display and streams it as hardware-encoded HEVC. **SkyDesk** on the iPad decodes it in hardware, draws it with Metal and sends back keyboard, trackpad, touch and gesture input. The same link carries clipboard text, files in both directions, the Mac's sound, and updates of both apps. The two devices talk to each other directly: there is no account, relay or server.
 
-This file describes the code at **build 42** (`CURRENT_PROJECT_VERSION` in `project.yml`). [VERIFICATION.md](VERIFICATION.md) is the dated record of the first builds and does not describe the current state.
+This file describes the code at **build 44** (`CURRENT_PROJECT_VERSION` in `project.yml`). [VERIFICATION.md](VERIFICATION.md) is the dated record of the first builds and does not describe the current state.
 
 **No end-to-end performance figure has been measured.** 120 FPS is the default target frame rate, not a verified result. The delays the iPad shows are estimates added up from parts (see [Statistics](#statistics)); nobody has yet filmed an input and its response to check them.
 
@@ -16,14 +16,16 @@ This file describes the code at **build 42** (`CURRENT_PROJECT_VERSION` in `proj
 | 39 (first frame always over TCP, the iPad reports a stream that started on the wrong path within half a second, faster encoder mode) | Installed and used on 2026-11-14. Video stayed on UDP for a 62-minute session on home Wi-Fi (Late: average 2.3 ms, 1% high 12.2 ms). The Mac's sound was heard on the iPad and the log shows the Mac's speakers silenced. Encoding took 13.9 ms at 10 to 29 frames a second against 17.0 ms in build 38, and click-to-screen 37.3 ms against 41.1. A session through WireGuard worked (46 ms round trip, video on UDP), but the Mac re-sent a piece of every frame after a fixed 35 ms without an acknowledgement, counted those as loss, and cut the bitrate to its 1.5 Mbps floor within a minute. |
 | 40 (the Mac learns how long acknowledgements take; its own probes no longer count as loss) | Installed on 2026-11-14 and used on home Wi-Fi (video on UDP, no bitrate cuts). Not yet used through the VPN, which is where its fix matters. |
 | 41 (parity packets on slow links, connections without forward secrecy refused, no automatic use of the saved password, Dock brought over while iPad only waits, refused connections logged) | Installed on 2026-11-14. Sessions connect and use the forward-secret exchange and UDP. **The Dock did not come over during the wait**: the injected pointer push was sent on time and did nothing. The iPad's own address probe was logged as a refused connection. Parity and the VPN fix have not been exercised (no VPN session yet). |
-| 42 (the iPad's desktop is made the main display during the wait, which is what moves the Dock; the address probe is no longer logged as a refusal) | Built and unit-tested. Not yet run on the real devices; the display change in particular can only be tried there. |
+| 42 (the iPad's desktop is made the main display during the wait, which is what moves the Dock; the address probe is no longer logged as a refusal) | Installed on 2026-11-14. The display log shows the iPad's desktop made main during the wait. |
+| 43 (the pointer snaps to the desktop's edges and keeps pushing against them, for sidebars and bars that open on an edge) | The Mac app installed itself on 2026-11-15; the iPad stayed on 42 because Apple's install prompt was answered after SkyDesk had already closed. The edge behaviour has not been tried on the real devices. |
+| 44 (the iPad stays open until the Mac sees iPadOS fetch the update; the Mac only follows an iPad that did) | Built and unit-tested. The install prompt itself only exists on a real iPad, so the new wait has not been run end to end. |
 
 Not yet confirmed on real hardware, even in the installed builds:
 
 - that the Mac's speakers really are silent while the iPad plays its sound (the log says the Mac asked for that; nobody has yet confirmed it by ear);
 - pinch and rotate actually reaching Mac apps (a unit test shows AppKit reads the injected events as magnify and rotate events, nothing more).
 
-`swift test` runs 157 tests with no failures (last run 2026-11-14 on the build 42 sources). Tests use the Mac's hardware encoder and loopback connections; they never capture the screen.
+`swift test` runs 158 tests with no failures (last run 2026-11-15 on the build 44 sources). Tests use the Mac's hardware encoder and loopback connections; they never capture the screen.
 
 ## Requirements
 
@@ -245,8 +247,8 @@ Both apps are updated from the Mac, without a cable.
 
    The script checks that the build numbers match and both signatures verify, packs the iPad app as an `.ipa`, and places everything in `~/Library/Application Support/SkyDesk/Updates/ready`.
 3. The running host notices within about five seconds. It offers the iPad build at the start of the iPad's next session (or straight away if one is running): an **Update** button appears in the toolbar.
-4. On the iPad, tap **Update › Install Update**. SkyDesk counts down three seconds, disconnects and goes to the Home Screen, because iPadOS only replaces an app that is off screen. Open it again afterwards; it reconnects by itself.
-5. The Mac app replaces itself once the iPad that asked for the update disconnects. Without that, it does so on its own when no iPad is connected, the last session ended more than ten seconds ago, and the iPad has already reported the staged build. **Update Mac Now** does it on request.
+4. On the iPad, tap **Update › Install Update**, then **Install** on the iPadOS prompt. SkyDesk stays open until the Mac sees iPadOS fetch the app, which only happens once that prompt is answered (build 44; **Show the Prompt Again** brings it back). It then counts down three seconds, disconnects and goes to the Home Screen, because iPadOS only replaces an app that is off screen. Open it again afterwards; it reconnects by itself. Going from build 43 or earlier there is no wait: answer the prompt within the three seconds, or tap **Stay Open** first.
+5. The Mac app replaces itself once the iPad that downloaded the update disconnects (for an iPad on build 43 or earlier: the iPad that asked for it). Without that, it does so on its own when no iPad is connected, the last session ended more than ten seconds ago, and the iPad has already reported the staged build. **Update Mac Now** does it on request.
 
 **One-time setup on the iPad.** iPadOS installs over-the-air only from an HTTPS server it trusts. Each Mac creates its own small certificate authority for this. The first time, the update sheet offers **Get Certificate**: the Mac sends a profile over the SkyDesk file connection, and the sheet walks through installing it (Settings › General › VPN & Device Management) and switching on full trust (Settings › General › About › Certificate Trust Settings). The authority is limited by name constraints to private IPv4 ranges and `.local` names, so it cannot vouch for a website. Remove it at any time in VPN & Device Management.
 
@@ -307,7 +309,7 @@ iPad   VideoToolbox HEVC           hardware only
 
 ### Input
 
-Input events travel as small JSON messages on the control connection and are replayed on the Mac as Core Graphics events, each marked as remote so iPad only mode can tell them from someone at the Mac. Pointer positions are fractions of the desktop, mapped through the same aspect-fit and keyboard shift the renderer uses. Pings and frame acknowledgements are answered on the network queue of each side, not the main thread, so interface work does not distort them.
+Input events travel as small JSON messages on the control connection and are replayed on the Mac as Core Graphics events, each marked as remote so iPad only mode can tell them from someone at the Mac. Pointer positions are fractions of the desktop, mapped through the same aspect-fit and keyboard shift the renderer uses. Since build 43 a pointer within a few points of the iPad's edge is sent as exactly on the desktop's edge, and while it rests there both sides repeat the move with a push towards that edge, because sidebars, the menu bar and the Dock open on pressure against an edge, not on position. Pings and frame acknowledgements are answered on the network queue of each side, not the main thread, so interface work does not distort them.
 
 ### Sound
 
@@ -356,7 +358,7 @@ That refusal happens after the handshake because it cannot happen in it: Apple's
 ## Tests and checks
 
 ```sh
-swift test                                  # 157 tests at build 42 (about 30 s; several open loopback sockets) (about 20 s; a few open loopback sockets)
+swift test                                  # 158 tests at build 44 (about 30 s; several open loopback sockets) (about 20 s; a few open loopback sockets)
 swift run skydesk-check --frames 120        # synthetic frames, hardware HEVC, encrypted loopback
 swift run skydesk-check --width 1920 --height 1200 --frames 240 --low-latency
 ```
@@ -367,7 +369,7 @@ The tests cover message framing and hostile input, HEVC framing, 4:4:4 colour, g
 
 Two self-checks exist for development: starting the host with `SKYDESK_SMOKE_PNG=<file>` builds its window off screen, saves a picture and exits without opening the port or touching displays; `SKYDESK_DEMO=1` in the simulator shows the streaming screen with generated frames.
 
-Still to do on the real devices: run build 41 through the VPN and see the bitrate stay up and parity switch on; switch 4:4:4 on once; compare the Late figure with video over UDP off and on; the three unconfirmed items under [Status](#status); and film an input and its response at high speed, with both screens in view, to check the delay estimates.
+Still to do on the real devices: open an edge sidebar (build 43) and run one update through the new wait (build 44, from the build after it); run build 41 through the VPN and see the bitrate stay up and parity switch on; switch 4:4:4 on once; compare the Late figure with video over UDP off and on; the three unconfirmed items under [Status](#status); and film an input and its response at high speed, with both screens in view, to check the delay estimates.
 
 ## Source map
 

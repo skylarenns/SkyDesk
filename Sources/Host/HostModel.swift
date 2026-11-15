@@ -649,7 +649,9 @@ final class HostModel: ObservableObject {
             case .updateRequest:
                 guard clientFeatures & StreamFeature.remoteUpdate != 0 else { throw DeskError.invalid("Unexpected update request.") }
                 // The user chose to update: the Mac follows the moment this iPad disconnects (user request 2026-11-13).
-                updateWhenPadDrops = true
+                // An iPad that waits for `updateDownload` may still leave its prompt unanswered, so for those the
+                // Mac only follows once iPadOS has fetched the app (2026-11-15: the Mac went to 43 alone).
+                updateWhenPadDrops = clientFeatures & StreamFeature.updateSignals == 0
                 verifyStagedHost()
                 serveUpdate()
             case .updateCertificateRequest:
@@ -1019,7 +1021,13 @@ final class HostModel: ObservableObject {
                 server.onLog = { MetricsLog.shared.append("host  " + $0) }
                 // A finished download is not an install: the iPad's build is only trusted from its next hello
                 // (build 21 marked 22 as installed after a download iPadOS never installed, 2026-11-13).
-                server.onIPAServed = { MetricsLog.shared.append("host  iPad downloaded build \(info.build); waiting for it to report that build") }
+                server.onIPAServed = { [weak self] in
+                    MetricsLog.shared.append("host  iPad downloaded build \(info.build); waiting for it to report that build")
+                    DispatchQueue.main.async { MainActor.assumeIsolated { self?.noteUpdateDownload(finished: true) } }
+                }
+                server.onIPAStarted = { [weak self] in
+                    DispatchQueue.main.async { MainActor.assumeIsolated { self?.noteUpdateDownload(finished: false) } }
+                }
                 updateServer = server; updateServerBuild = info.build
                 let manifest = UpdateServer.url(host: host, port: UpdatePort.https, token: server.token, file: "manifest.plist")
                 server.start { [weak self] error in
@@ -1037,6 +1045,13 @@ final class HostModel: ObservableObject {
                 }
             } catch { control?.send(.failure(error.localizedDescription)) }
         }
+    }
+    /// Tells the iPad that iPadOS is fetching the update, so it knows the prompt was answered and can step aside.
+    /// Not tied to the session that asked: the iPad may have reconnected while its prompt was up.
+    private func noteUpdateDownload(finished: Bool) {
+        guard clientConnected, clientFeatures & StreamFeature.updateSignals != 0 else { return }
+        updateWhenPadDrops = true
+        control?.send(.updateDownload(finished))
     }
     private func sendCertificate() {
         guard let fileEngine, filesReady else { control?.send(.failure("Reconnect to get the update certificate (file transfer is off or still starting).")); return }

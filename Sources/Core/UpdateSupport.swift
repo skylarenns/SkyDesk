@@ -98,6 +98,8 @@ public enum MiniHTTP {
 /// Every other path is 404, so only someone told the random token (over the paired SkyDesk link) gets anything.
 public final class UpdateServer {
     public var onIPAServed: (() -> Void)?
+    /// iPadOS asked for the app itself, which it does only after the user taps Install on its prompt.
+    public var onIPAStarted: (() -> Void)?
     public var onLog: ((String) -> Void)?
     public let token: String
     private let listener: NWListener
@@ -194,6 +196,7 @@ public final class UpdateServer {
             let part = MiniHTTP.byteRange(range, size: size)
             let span = part ?? 0..<size
             onLog?("update: iPad app download " + (part.map { "resumed at byte \($0.lowerBound)" } ?? "started") + " (\(span.count) of \(size) bytes)")
+            if !headOnly { onIPAStarted?() }
             let head = part == nil
                 ? MiniHTTP.head(status: 200, reason: "OK", type: "application/octet-stream", length: size)
                 : MiniHTTP.head(status: 206, reason: "Partial Content", type: "application/octet-stream", length: span.count,

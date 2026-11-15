@@ -563,6 +563,13 @@ private struct UpdateSheet: View {
                             Text("Closing SkyDesk in \(left)… iPadOS finishes the update once SkyDesk is off screen.")
                                 .font(.title3).monospacedDigit()
                             Button("Stay Open") { client.stayOpenForUpdate() }.buttonStyle(.bordered)
+                        } else if client.updateDownload == .waitingForPrompt {
+                            Text("Tap Install on the iPadOS prompt.").font(.title3)
+                            Text("SkyDesk stays open until the download has started, then closes by itself so iPadOS can finish.")
+                                .foregroundStyle(.secondary)
+                            Button("Show the Prompt Again") { client.installUpdate() }.buttonStyle(.bordered)
+                        } else if client.updateDownload == .downloading {
+                            HStack(spacing: 12) { ProgressView(); Text("Downloading from your Mac…").font(.title3) }
                         } else {
                             Text("Go to the Home Screen and iPadOS installs the update (watch the SkyDesk icon). Open SkyDesk again afterwards and it reconnects; the Mac app updates itself a few seconds after the iPad disconnects.")
                                 .foregroundStyle(.secondary)

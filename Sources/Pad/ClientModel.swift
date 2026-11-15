@@ -522,7 +522,7 @@ final class ClientModel: ObservableObject {
         videoOrder = order; videoPath = "tcp"
         var features = StreamFeature.idleGapFlags | StreamFeature.pauseVideo | StreamFeature.liveCursorToggle
             | StreamFeature.clipboardSync | StreamFeature.fileTransfer | StreamFeature.scrollMomentum | StreamFeature.remoteUpdate
-            | StreamFeature.gestures | StreamFeature.audio | StreamFeature.deviceKeys
+            | StreamFeature.gestures | StreamFeature.audio | StreamFeature.deviceKeys | StreamFeature.updateSignals
         if localPointer { features |= StreamFeature.localCursor }
         if datagramVideo { features |= StreamFeature.datagramVideo }
         if sharperColour, Self.canDecodeFullColour, !UserDefaults.standard.bool(forKey: Self.colourFailedKey) { features |= StreamFeature.chroma444 }
@@ -626,6 +626,8 @@ final class ClientModel: ObservableObject {
                     if build > Self.ownBuild { self.updateBuild = build }
                 case .updateReady(let manifest):
                     self.verifyAndInstall(manifest)
+                case .updateDownload(let finished):
+                    self.noteUpdateDownload(finished: finished)
                 case .failure(let reason):
                     self.changingMacDisplay = false
                     if self.updateState == .preparing { self.updateState = .failed(reason) }
@@ -793,8 +795,14 @@ final class ClientModel: ObservableObject {
         releaseInput()
         // Mid-update, hold nothing: iPadOS installs only once SkyDesk has really stopped, and the background task
         // that keeps a session alive for ~30 s delayed that until the user had already come back (2026-11-13).
+        if updateState == .installing, updateDownload == .waitingForPrompt {
+            // Apple's prompt was never answered, so nothing is installing: an ordinary trip to the Home Screen.
+            stayOpenForUpdate()
+            updateState = .idle
+        }
         if updateState == .installing {
             closeForUpdateWork?.cancel(); closeForUpdateWork = nil; closingForUpdate = nil
+            downloadWaitWork?.cancel(); downloadWaitWork = nil
             if info != nil || connecting { disconnect(reason: "Updating SkyDesk…") }
             return
         }
@@ -865,6 +873,26 @@ final class ClientModel: ObservableObject {
     }
     func stayOpenForUpdate() {
         closeForUpdateWork?.cancel(); closeForUpdateWork = nil; closingForUpdate = nil
+        downloadWaitWork?.cancel(); downloadWaitWork = nil
+        updateDownload = .unknown
+    }
+    /// Where iPadOS is with the update, as the Mac reports it (StreamFeature.updateSignals).
+    enum UpdateDownload: Equatable { case unknown, waitingForPrompt, downloading }
+    @Published var updateDownload = UpdateDownload.unknown
+    private var downloadWaitWork: DispatchWorkItem?
+    /// The Mac saw iPadOS ask for the app (`finished` false) or handed over its last byte (true). SkyDesk steps
+    /// aside once the download is in, or ten seconds after it started if the end is never reported.
+    private func noteUpdateDownload(finished: Bool) {
+        guard updateState == .installing, updateDownload != .unknown, closingForUpdate == nil else { return }
+        downloadWaitWork?.cancel(); downloadWaitWork = nil
+        if finished { scheduleCloseForUpdate(); return }
+        updateDownload = .downloading
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.updateState == .installing, self.updateDownload == .downloading, self.closingForUpdate == nil else { return }
+            self.scheduleCloseForUpdate()
+        }
+        downloadWaitWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: work)
     }
     private func beginBackgroundTask() {
         guard backgroundTask == .invalid else { return }
@@ -984,6 +1012,7 @@ final class ClientModel: ObservableObject {
     @Published var certificateName = "SkyDesk Updates.mobileconfig"
     func installUpdate() {
         guard updateBuild != nil, (info?.features ?? 0) & StreamFeature.remoteUpdate != 0 else { return }
+        stayOpenForUpdate()
         updateState = .preparing
         control?.send(.updateRequest)
     }
@@ -1008,7 +1037,13 @@ final class ClientModel: ObservableObject {
                 if (response as? HTTPURLResponse)?.statusCode == 200 {
                     self.updateState = .installing
                     UIApplication.shared.open(install)
-                    self.scheduleCloseForUpdate()
+                    if (self.info?.features ?? 0) & StreamFeature.updateSignals != 0 {
+                        // Stay open until the Mac sees iPadOS fetch the app: that only happens once Install is tapped.
+                        self.stayOpenForUpdate()
+                        self.updateDownload = .waitingForPrompt
+                    } else {
+                        self.scheduleCloseForUpdate()
+                    }
                 } else if let error = error as? URLError, [.serverCertificateUntrusted, .serverCertificateHasUnknownRoot,
                           .serverCertificateNotYetValid, .serverCertificateHasBadDate, .secureConnectionFailed].contains(error.code) {
                     self.updateState = .needsCertificate

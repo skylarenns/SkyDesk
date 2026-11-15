@@ -84,6 +84,10 @@ final class UpdateTests: XCTestCase {
             try UpdateManifest.plist(ipaURL: url, bundleID: "b", version: "1", title: "t")
         }, ipa: ipa, baseHost: "127.0.0.1")
         let served = expectation(description: "ipa served"); served.assertForOverFulfill = false; server.onIPAServed = { served.fulfill() }
+        // The iPad stays open until this fires, so it must mean "iPadOS asked for the app", nothing earlier.
+        let startLock = NSLock(); var starts = 0
+        server.onIPAStarted = { startLock.lock(); starts += 1; startLock.unlock() }
+        func started() -> Int { startLock.lock(); defer { startLock.unlock() }; return starts }
         let ready = expectation(description: "ready"); server.start { XCTAssertNil($0); ready.fulfill() }
         wait(for: [ready], timeout: 5)
         defer { server.stop() }
@@ -102,10 +106,14 @@ final class UpdateTests: XCTestCase {
         XCTAssertTrue(String(decoding: manifest.1, as: UTF8.self).contains("https://127.0.0.1:48799/\(server.token)/SkyDesk.ipa"))
         XCTAssertEqual(try get("/wrongtoken/SkyDesk.ipa").0, 404)
         XCTAssertEqual(try get("/\(server.token)/ping").0, 200)
+        XCTAssertEqual(started(), 0, "the manifest is fetched before the user answers Apple's prompt")
         let resumed = try get("/\(server.token)/SkyDesk.ipa", range: "bytes=1000000-")
         XCTAssertEqual(resumed.0, 206); XCTAssertEqual(resumed.1, payload.subdata(in: 1_000_000..<payload.count))
         let app = try get("/\(server.token)/SkyDesk.ipa")
         XCTAssertEqual(app.0, 200); XCTAssertEqual(app.1, payload)
+        XCTAssertEqual(started(), 2)
+        let message = try JSONDecoder().decode(ControlMessage.self, from: JSONEncoder().encode(ControlMessage.updateDownload(true)))
+        if case .updateDownload(let finished) = message { XCTAssertTrue(finished) } else { XCTFail("wrong message") }
         wait(for: [served], timeout: 5)
     }
 }
