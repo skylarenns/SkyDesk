@@ -497,6 +497,17 @@ private struct HostView: View {
                 Toggle("Play this Mac's sound on the iPad", isOn: $host.allowAudio)
                 Text("The Mac's own speakers go quiet only while the iPad is playing. macOS asks once for permission to record system audio.")
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                Toggle("Let the iPad send its microphone to this Mac", isOn: $host.allowMicrophone)
+                    .onAppear { host.refreshSoundOutputs() }
+                if host.allowMicrophone {
+                    Picker("Play it into", selection: $host.microphoneDeviceUID) {
+                        Text(host.soundOutputs.first(where: { SoundOutputs.isLoopback($0.name) }).map { "Automatic (\($0.name))" } ?? "Automatic (no loopback device found)").tag("")
+                        ForEach(host.soundOutputs) { Text($0.name).tag($0.uid) }
+                    }
+                    Text(host.microphoneTarget.map { "In the Mac app that should hear you, choose “\($0.name)” as the microphone. The iPad decides when its microphone is on." }
+                         ?? "This needs a loopback sound device, such as the free BlackHole: what is played into it comes out as a microphone for Mac apps.")
+                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
                 Toggle("Encode faster (about 5 ms less delay; uses more data while little is moving)", isOn: $host.fastEncoding)
                 Toggle("Low-latency rate control (experimental)", isOn: $host.lowLatencyRateControl)
                 Text("Changes apply the next time the iPad connects.").font(.caption).foregroundStyle(.secondary)

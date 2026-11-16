@@ -15,7 +15,7 @@ public struct AudioStreamInfo: Codable, Equatable {
         self.framesPerPacket = framesPerPacket; self.cookie = cookie
     }
     public var isValid: Bool {
-        codec == Self.opus && sampleRate == 48_000 && channels == 2 && [120, 240, 480, 960].contains(framesPerPacket)
+        codec == Self.opus && sampleRate == 48_000 && (1...2).contains(channels) && [120, 240, 480, 960].contains(framesPerPacket)
             && (cookie?.count ?? 0) <= 256
     }
     fileprivate func compressedFormat() throws -> AVAudioFormat {
@@ -53,13 +53,14 @@ public final class OpusEncoder {
     private let converter: AVAudioConverter
     private let output: AVAudioFormat
     /// `input` is whatever the Mac's audio system delivers (any sample rate, interleaved or not).
-    public init(input: AVAudioFormat, bitrate: Int = 128_000, framesPerPacket: Int = 480) throws {
-        let plain = AudioStreamInfo(framesPerPacket: framesPerPacket)
+    /// Two channels at 128 kbit/s for the Mac's sound; one channel at a lower rate for a voice (the iPad's microphone).
+    public init(input: AVAudioFormat, bitrate: Int = 128_000, framesPerPacket: Int = 480, channels: Int = 2) throws {
+        let plain = AudioStreamInfo(channels: channels, framesPerPacket: framesPerPacket)
         output = try plain.compressedFormat()
         guard let converter = AVAudioConverter(from: input, to: output) else { throw DeskError.invalid("Can't compress this Mac's sound format.") }
         converter.bitRate = bitrate
         self.converter = converter
-        info = AudioStreamInfo(framesPerPacket: framesPerPacket, cookie: converter.magicCookie)
+        info = AudioStreamInfo(channels: channels, framesPerPacket: framesPerPacket, cookie: converter.magicCookie)
     }
     /// Compresses `buffer` (copied, so the caller may reuse its memory) and returns the packets that are complete.
     public func encode(_ buffer: AVAudioPCMBuffer) throws -> [Data] {

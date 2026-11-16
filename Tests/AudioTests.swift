@@ -120,4 +120,71 @@ final class AudioTests: XCTestCase {
         // The round trip is still found in a line that carries the sound figures after it.
         XCTAssertEqual(StatisticsText.roundTrip(fromLogLine: "shown=60 rtt=4.9/7.0 display=16.2 video=udp " + health.drain()), 4.9)
     }
+
+    func testAVoiceSurvivesAsOneChannelFromTheUsualMicrophoneFormats() throws {
+        // The iPad's microphone: one channel, at whatever rate the input in use runs (a headset may give 24 or 16 kHz).
+        for (rate, chunk) in [(48_000.0, 240), (44_100.0, 256), (24_000.0, 120), (16_000.0, 160)] {
+            let input = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: rate, channels: 1, interleaved: false)!
+            let encoder = try OpusEncoder(input: input, bitrate: 48_000, channels: 1)
+            XCTAssertTrue(encoder.info.isValid); XCTAssertEqual(encoder.info.channels, 1)
+            let decoder = try OpusDecoder(info: try JSONDecoder().decode(AudioStreamInfo.self, from: JSONEncoder().encode(encoder.info)))
+            var phase = 0.0, frames = 0, peak: Float = 0, largest = 0
+            for _ in 0..<(Int(rate) / chunk) {
+                for packet in try encoder.encode(tone(format: input, frames: chunk, phase: &phase)) {
+                    largest = max(largest, packet.count)
+                    guard let sound = try decoder.decode(packet) else { continue }
+                    XCTAssertEqual(sound.format.channelCount, 1); XCTAssertEqual(sound.format.sampleRate, 48_000)
+                    frames += Int(sound.frameLength)
+                    for index in 0..<Int(sound.frameLength) { peak = max(peak, abs(sound.floatChannelData![0][index])) }
+                }
+            }
+            XCTAssertGreaterThan(frames, 43_000, "\(rate)"); XCTAssertLessThanOrEqual(frames, 48_480, "\(rate)")
+            XCTAssertEqual(peak, 0.5, accuracy: 0.15, "\(rate)")
+            XCTAssertLessThan(largest, 400, "a voice packet stays small")
+        }
+    }
+
+    func testTheMicrophoneGoesToTheChosenOutputOrTheFirstLoopbackDevice() {
+        let devices = [SoundOutput(id: 1, uid: "speakers", name: "MacBook Pro Speakers"), SoundOutput(id: 2, uid: "bh2", name: "BlackHole 2ch"),
+                       SoundOutput(id: 3, uid: "scarlett", name: "Scarlett 4i4 4th Gen")]
+        XCTAssertEqual(SoundOutputs.microphoneTarget(saved: nil, among: devices)?.uid, "bh2")
+        XCTAssertEqual(SoundOutputs.microphoneTarget(saved: "scarlett", among: devices)?.uid, "scarlett")
+        // The saved device was unplugged or removed: back to a loopback device, never to the speakers.
+        XCTAssertEqual(SoundOutputs.microphoneTarget(saved: "gone", among: devices)?.uid, "bh2")
+        XCTAssertNil(SoundOutputs.microphoneTarget(saved: nil, among: [devices[0], devices[2]]))
+    }
+
+    func testMicrophonePacketsArePlayedIntoALoopbackDevice() throws {
+        // Needs a loopback device on this Mac; what is played is silence, so nothing listening to it hears anything.
+        guard let device = SoundOutputs.microphoneTarget(saved: nil, among: SoundOutputs.all()) else { throw XCTSkip("No loopback sound device here.") }
+        let input = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48_000, channels: 1, interleaved: false)!
+        let encoder = try OpusEncoder(input: input, bitrate: 48_000, channels: 1)
+        let playback = MicPlayback(device: device.id)
+        var failure: String?
+        playback.onFailure = { failure = $0 }
+        // A packet before the format is ignored, not an error.
+        let quiet = AVAudioPCMBuffer(pcmFormat: input, frameCapacity: 480)!; quiet.frameLength = 480
+        memset(quiet.floatChannelData![0], 0, 480 * MemoryLayout<Float>.size)
+        var sequence: UInt64 = 0
+        func send() throws {
+            for bytes in try encoder.encode(quiet) { sequence += 1; playback.handle(AudioPacket(sequence: sequence, bytes: bytes).packet()) }
+        }
+        try send()
+        playback.handle(try WirePacket.control(.audioFormat(encoder.info)))
+        for _ in 0..<50 { try send(); usleep(10_000) }
+        playback.drain()
+        let counts = playback.statistics()
+        XCTAssertNil(failure)
+        XCTAssertGreaterThanOrEqual(counts.packets, 45); XCTAssertGreaterThanOrEqual(counts.played, 40)
+        XCTAssertLessThanOrEqual(counts.dropped, 1)
+        // A second format mid-stream (the iPad's microphone changed) starts again cleanly.
+        playback.handle(try WirePacket.control(.audioFormat(encoder.info)))
+        for _ in 0..<10 { try send(); usleep(10_000) }
+        playback.drain(); XCTAssertNil(failure)
+        XCTAssertGreaterThanOrEqual(playback.statistics().played, 8)
+        // Anything else on this channel ends it.
+        playback.handle(try WirePacket.control(.ping(1))); playback.drain()
+        XCTAssertNotNil(failure)
+        playback.stop(); playback.drain()
+    }
 }

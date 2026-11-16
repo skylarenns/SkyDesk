@@ -52,6 +52,27 @@ final class HostModel: ObservableObject {
     @Published var allowAudio = UserDefaults.standard.object(forKey: "allowAudio") as? Bool ?? true {
         didSet { UserDefaults.standard.set(allowAudio, forKey: "allowAudio") }
     }
+    /// The iPad may send its microphone (build 49). It is played into `microphoneTarget`, a loopback sound device
+    /// that Mac apps then use as their microphone (MicPlayback.swift).
+    @Published var allowMicrophone = UserDefaults.standard.object(forKey: "allowMicrophone") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(allowMicrophone, forKey: "allowMicrophone") }
+    }
+    /// The chosen device's identifier; empty = the first loopback device found.
+    @Published var microphoneDeviceUID = UserDefaults.standard.string(forKey: "microphoneDeviceUID") ?? "" {
+        didSet { UserDefaults.standard.set(microphoneDeviceUID, forKey: "microphoneDeviceUID") }
+    }
+    @Published private(set) var soundOutputs: [SoundOutput] = []
+    var microphoneTarget: SoundOutput? { SoundOutputs.microphoneTarget(saved: microphoneDeviceUID, among: soundOutputs) }
+    func refreshSoundOutputs() { soundOutputs = SoundOutputs.all() }
+    private var micChannel: SecureChannel?
+    private var mic: MicPlayback?
+    private let micRoute = MicRoute()
+    private func stopMicrophone() {
+        guard mic != nil || micChannel != nil else { return }
+        micRoute.set(nil, sink: nil)
+        mic?.stop(); mic = nil; micChannel = nil
+        MetricsLog.shared.append("host  iPad microphone off")
+    }
     private var audioChannel: SecureChannel?
     private var audio: HostAudio?
     // MARK: Video over UDP (build 38)
@@ -518,6 +539,7 @@ final class HostModel: ObservableObject {
         router.end()
         datagramFlows.values.forEach { $0.close() }
         audio?.stop(); audio = nil; audioChannel = nil
+        stopMicrophone()
         fileRoute.set(nil, engine: nil)
         fileEngine?.close(reason: "The iPad disconnected."); fileEngine = nil; files = nil; filesReady = false
         current.forEach { $0.close() }
@@ -546,9 +568,11 @@ final class HostModel: ObservableObject {
         guard channels.count < 8 else { connection.cancel(); return }
         let channel = SecureChannel(connection: connection, queue: transportQueue, maxPendingBytes: 18 * 1024 * 1024)
         channels[channel.id] = channel
-        channel.onPacket = { [weak self, weak channel, fastPath, fileRoute] packet in
+        channel.onPacket = { [weak self, weak channel, fastPath, fileRoute, micRoute] packet in
             guard let channel else { return }
             if let engine = fileRoute.engine(for: channel.id) { engine.handle(packet); return }
+            // The microphone goes straight to its player, never through the main thread.
+            if let sink = micRoute.sink(for: channel.id) { sink.handle(packet); return }
             var pongSent = false
             if let message = try? packet.controlMessage() {
                 switch fastPath.handle(message, channel: channel.id, reply: { channel.send($0) }) {
@@ -568,12 +592,15 @@ final class HostModel: ObservableObject {
                     guard let self, let channel, self.channels.removeValue(forKey: channel.id) != nil else { return }
                     // A connection that was never accepted into a session and did not simply close: record it.
                     // (The iPad's own "which address answers?" probes close cleanly, with no reason, and are not counted.)
-                    if self.control !== channel, self.video !== channel, self.files !== channel, self.audioChannel !== channel, let reason {
+                    if self.control !== channel, self.video !== channel, self.files !== channel, self.audioChannel !== channel,
+                       self.micChannel !== channel, let reason {
                         self.noteRefused(channel.connection, reason: reason == PairingPassword.mismatchMessage ? "wrong key or an unsupported key exchange" : reason)
                     }
                     if self.control === channel || self.video === channel {
                         self.disconnect(.padLeft)
                         if let reason { self.status = reason }
+                    } else if self.micChannel === channel {
+                        self.stopMicrophone()
                     } else if self.audioChannel === channel {
                         // Losing only the sound channel puts the sound back on the Mac, nothing else.
                         self.audio?.stop(); self.audio = nil; self.audioChannel = nil
@@ -589,7 +616,8 @@ final class HostModel: ObservableObject {
         channel.start()
         DispatchQueue.main.asyncAfter(deadline: .now() + 12) { [weak self, weak channel] in
             guard let self, let channel, self.channels[channel.id] != nil else { return }
-            if self.control !== channel && self.video !== channel && self.files !== channel && self.audioChannel !== channel {
+            if self.control !== channel && self.video !== channel && self.files !== channel && self.audioChannel !== channel
+                && self.micChannel !== channel {
                 channel.close(reason: "Session handshake timed out.")
             }
             else if self.control == nil || self.video == nil { self.disconnect(.padLeft) }
@@ -646,6 +674,27 @@ final class HostModel: ObservableObject {
                     sound.onStatus = { [weak self] in self?.control?.send(.failure($0)) }
                     audioChannel = channel; audio = sound
                     if capture?.isPaused != true { sound.start() } else { sound.setPaused(true); sound.start() }
+                    return
+                case .microphone:
+                    refreshSoundOutputs()
+                    guard sessionID == hello.session, control != nil, micChannel == nil, allowMicrophone,
+                          clientFeatures & StreamFeature.microphone != 0, let target = microphoneTarget else {
+                        throw DeskError.invalid("The microphone is not available on this Mac.")
+                    }
+                    let playback = MicPlayback(device: target.id)
+                    playback.onFailure = { [weak self, weak channel] reason in
+                        DispatchQueue.main.async {
+                            MainActor.assumeIsolated {
+                                guard let self, let channel, self.micChannel === channel else { return }
+                                MetricsLog.shared.append("host  iPad microphone failed: \(reason)")
+                                self.control?.send(.failure(reason))
+                                channel.close()
+                            }
+                        }
+                    }
+                    micChannel = channel; mic = playback
+                    micRoute.set(channel.id, sink: playback)
+                    MetricsLog.shared.append("host  iPad microphone on, played into \(target.name)")
                     return
                 }
                 sessionID = hello.session
@@ -748,6 +797,7 @@ final class HostModel: ObservableObject {
         Task { [self, video, control] in
             do {
                 await refreshDisplays()
+                refreshSoundOutputs()
                 guard generation == token, self.sessionID == sessionID else { return }
                 guard screenAllowed else {
                     throw DeskError.invalid("SkyDesk on the Mac needs Screen Recording permission. On the Mac: open SkyDesk Host and click Allow.")
@@ -797,7 +847,7 @@ final class HostModel: ObservableObject {
                         bitrate: bitrateMbps * 1_000_000, inputEnabled: allowInput, lowLatencyRateControl: lowLatencyRateControl,
                         nativeDesktop: useiPadDesktop, clientFeatures: clientFeatures, hostName: Host.current().localizedName,
                         clipboard: allowClipboard, files: allowFiles, audio: allowAudio && HostAudio.supported, chroma444: chroma444,
-                        preferSpeed: fastEncoding)
+                        preferSpeed: fastEncoding, microphone: allowMicrophone && microphoneTarget != nil)
                 }
                 // The iPad asked for full colour detail: use it if this Mac's encoder has it, otherwise carry on as before.
                 let wants444 = clientFeatures & StreamFeature.chroma444 != 0
@@ -829,6 +879,7 @@ final class HostModel: ObservableObject {
                 input.displayBounds = CGDisplayBounds(display.displayID)
                 var welcome = pipeline.info
                 if (welcome.features ?? 0) & StreamFeature.deviceKeys != 0 { welcome.hostID = hostID }
+                if (welcome.features ?? 0) & StreamFeature.microphone != 0 { welcome.microphoneName = microphoneTarget?.name }
                 control.send(.welcome(welcome))
                 // iPad only is already on, so the iPad shows it that way and does not ask for the switch again.
                 if resumedKept { control.send(.macDisplayBlanked(true)) }
@@ -1197,12 +1248,21 @@ final class HostModel: ObservableObject {
             metrics += String(format: " · bitrate limited to %.1f Mbps by the network", Double(controller.target) / 1e6)
         }
         MetricsLog.shared.append(String(format: "host  %@ · %.1f Mbps encoded", metrics, Double(stats.bytes) * 8 / elapsed / 1_000_000)
-                                 + (audio?.statisticsText().map { " · " + $0 } ?? ""))
+                                 + (audio?.statisticsText().map { " · " + $0 } ?? "")
+                                 + (mic.map { let counts = $0.statistics(); return " · mic \(counts.packets) arrived, \(counts.played) played, ran dry \(counts.ranDry), dropped \(counts.dropped)" } ?? ""))
         if let age = capture.window.oldestAge(), age > 5_000_000_000 { disconnect(.padLeft); status = "Video stalled; reconnect the iPad." }
     }
 }
 
 /// Which channel carries files, readable from the transport queue.
+/// The same for the microphone channel and its player.
+final class MicRoute: @unchecked Sendable {
+    private let lock = NSLock()
+    private var channelID: UUID?
+    private var current: MicPlayback?
+    func set(_ id: UUID?, sink: MicPlayback?) { lock.withLock { channelID = id; current = sink } }
+    func sink(for id: UUID) -> MicPlayback? { lock.withLock { channelID == id ? current : nil } }
+}
 final class FileRoute: @unchecked Sendable {
     private let lock = NSLock()
     private var channelID: UUID?

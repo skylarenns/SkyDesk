@@ -55,39 +55,80 @@ final class PointerCaptureTests: XCTestCase {
         let sent = try JSONDecoder().decode(InputEvent.self, from: JSONEncoder().encode(InputEvent(kind: .move, x: 3, y: -4, relative: true)))
         XCTAssertEqual(sent.relative, true)
     }
-    func testAnAppThatKeepsThePointerHiddenWhileItMovesHasTakenTheMouse() {
+    func testAnAppThatHidesThePointerAndHoldsItInPlaceHasTakenTheMouse() {
         var mac = PointerHoldDetector()
-        // Moves 8 ms apart with the pointer hidden throughout: held once 150 ms and four moves have passed.
+        // Before the pointer has been seen to go where it is put on this Mac, "it did not" proves nothing.
+        for step in 0..<200 { XCTAssertNil(mac.note(hidden: true, moved: true, followed: false, now: -10 + Double(step) * 0.008)) }
+        for step in 0..<PointerHoldDetector.provenAfter { XCTAssertNil(mac.note(hidden: false, moved: true, followed: true, now: -5 + Double(step) * 0.008)) }
+        // Moves 8 ms apart, pointer hidden, and each time found somewhere other than where it was sent.
         var changes: [(Double, Bool)] = []
-        for step in 0..<40 { let now = Double(step) * 0.008; if let held = mac.note(hidden: true, moved: true, now: now) { changes.append((now, held)) } }
+        for step in 0..<40 { let now = Double(step) * 0.008; if let held = mac.note(hidden: true, moved: true, followed: false, now: now) { changes.append((now, held)) } }
         XCTAssertEqual(changes.count, 1); XCTAssertEqual(changes.first?.1, true)
         XCTAssertEqual(changes.first?.0 ?? 0, 0.152, accuracy: 0.001)
         // Given back once the pointer has been showing for a fifth of a second, movement or not; one flash does not count.
-        XCTAssertNil(mac.note(hidden: false, moved: false, now: 1.00))
-        XCTAssertNil(mac.note(hidden: true, moved: false, now: 1.05))
-        XCTAssertNil(mac.note(hidden: false, moved: false, now: 1.10))
-        XCTAssertNil(mac.note(hidden: false, moved: true, now: 1.25))
-        XCTAssertEqual(mac.note(hidden: false, moved: false, now: 1.31), false)
+        XCTAssertNil(mac.note(hidden: false, moved: false, followed: nil, now: 1.00))
+        XCTAssertNil(mac.note(hidden: true, moved: false, followed: nil, now: 1.05))
+        XCTAssertNil(mac.note(hidden: false, moved: false, followed: nil, now: 1.10))
+        XCTAssertNil(mac.note(hidden: false, moved: true, followed: false, now: 1.25))
+        XCTAssertEqual(mac.note(hidden: false, moved: false, followed: nil, now: 1.31), false)
         XCTAssertFalse(mac.held)
     }
-    func testAPointerHiddenOnlyUntilItMovesIsNotHeld() {
-        // A film has hidden the pointer for a minute; nothing moves, so nothing is concluded.
+    func testAHiddenPointerThatGoesWhereItIsPutIsNeverHeld() {
+        // What broke build 48: after typing, the Mac's pointer stays hidden however much the iPad moves it.
+        // It goes exactly where it is sent, so nobody has taken it.
         var mac = PointerHoldDetector()
-        for second in 0..<60 { XCTAssertNil(mac.note(hidden: true, moved: false, now: Double(second))) }
-        // The first movement finds it still hidden; the player shows it within a frame or two.
-        XCTAssertNil(mac.note(hidden: true, moved: true, now: 60.000))
-        XCTAssertNil(mac.note(hidden: true, moved: true, now: 60.008))
-        for step in 2..<100 { XCTAssertNil(mac.note(hidden: false, moved: true, now: 60 + Double(step) * 0.008)) }
-        // Typing hides it again and again between short movements: each time the count starts over.
-        for burst in 0..<20 {
-            let start = 70 + Double(burst)
-            XCTAssertNil(mac.note(hidden: true, moved: true, now: start))
-            XCTAssertNil(mac.note(hidden: false, moved: true, now: start + 0.008))
-            XCTAssertNil(mac.note(hidden: false, moved: true, now: start + 0.3))
+        for step in 0..<5_000 { XCTAssertNil(mac.note(hidden: true, moved: true, followed: true, now: Double(step) * 0.008)) }
+        // The odd movement that seems not to have landed changes nothing while others do land.
+        for step in 0..<5_000 {
+            XCTAssertNil(mac.note(hidden: true, moved: true, followed: step % 4 == 0 ? false : true, now: 40 + Double(step) * 0.008))
         }
-        // Three quick moves in 150 ms are not enough either.
-        XCTAssertNil(mac.note(hidden: true, moved: true, now: 100.0)); XCTAssertNil(mac.note(hidden: true, moved: true, now: 100.1))
-        XCTAssertNil(mac.note(hidden: true, moved: true, now: 100.16))
+        // Movements that say nothing either way (the pointer was not asked to move) do not add up to a hold.
+        for step in 0..<500 { XCTAssertNil(mac.note(hidden: true, moved: true, followed: nil, now: 80 + Double(step) * 0.008)) }
+        // Held in place but showing (something else is moving the pointer, such as someone at the Mac): not a capture.
+        for step in 0..<500 { XCTAssertNil(mac.note(hidden: false, moved: true, followed: false, now: 90 + Double(step) * 0.008)) }
         XCTAssertFalse(mac.held)
+    }
+    func testAHeldPointerThatStartsGoingWhereItIsPutIsGivenBackEvenIfStillHidden() {
+        // A wrong capture must undo itself: the pointer follows again, so the hold ends without waiting for it to show.
+        var mac = PointerHoldDetector()
+        for step in 0..<PointerHoldDetector.provenAfter { _ = mac.note(hidden: false, moved: true, followed: true, now: -1 + Double(step) * 0.008) }
+        for step in 0..<30 { _ = mac.note(hidden: true, moved: true, followed: false, now: Double(step) * 0.008) }
+        XCTAssertTrue(mac.held)
+        var released: Double?
+        for step in 0..<100 where released == nil {
+            let now = 1 + Double(step) * 0.008
+            if mac.note(hidden: true, moved: true, followed: true, now: now) == false { released = now }
+        }
+        XCTAssertEqual(released ?? 0, 1.304, accuracy: 0.001)
+        // While the game keeps putting it back, it stays held.
+        for step in 0..<30 { _ = mac.note(hidden: true, moved: true, followed: false, now: 3 + Double(step) * 0.008) }
+        XCTAssertTrue(mac.held)
+        for step in 0..<1_000 { XCTAssertNil(mac.note(hidden: true, moved: true, followed: step % 9 == 0, now: 4 + Double(step) * 0.008)) }
+        XCTAssertTrue(mac.held)
+    }
+    func testWhetherThePointerWentWhereItWasPut() {
+        var pointer = PointerFollowing()
+        XCTAssertNil(pointer.followed(actual: CGPoint(x: 10, y: 10)))                       // nothing sent yet
+        pointer.sent(target: CGPoint(x: 100, y: 100), from: CGPoint(x: 10, y: 10))
+        XCTAssertEqual(pointer.followed(actual: CGPoint(x: 100, y: 101)), true)
+        // The reading may trail the newest movement: an earlier target still counts as followed.
+        pointer.sent(target: CGPoint(x: 140, y: 100), from: CGPoint(x: 100, y: 100))
+        pointer.sent(target: CGPoint(x: 180, y: 100), from: CGPoint(x: 140, y: 100))
+        XCTAssertEqual(pointer.followed(actual: CGPoint(x: 140, y: 100)), true)
+        // A game put it back in the middle of its window.
+        XCTAssertEqual(pointer.followed(actual: CGPoint(x: 688, y: 516)), false)
+        // A movement that sends the pointer where it already is says nothing about the next reading.
+        pointer.sent(target: CGPoint(x: 688, y: 517), from: CGPoint(x: 688, y: 516))
+        XCTAssertNil(pointer.followed(actual: CGPoint(x: 688, y: 516)))
+        // Slow aiming, then a quick turn, in a game that puts the pointer back in the middle every time: the small
+        // movements say nothing, and the large one shows the pointer did not stay where it was sent.
+        var game = PointerFollowing()
+        let middle = CGPoint(x: 688, y: 516)
+        for small in [1.0, 2.0, -1.0, 2.0] {
+            XCTAssertNotEqual(game.followed(actual: middle), true)
+            game.sent(target: CGPoint(x: middle.x + small, y: middle.y), from: middle)
+        }
+        game.sent(target: CGPoint(x: middle.x + 25, y: middle.y - 9), from: middle)
+        XCTAssertEqual(game.followed(actual: middle), false)
     }
 }

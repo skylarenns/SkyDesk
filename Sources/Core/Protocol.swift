@@ -118,10 +118,13 @@ public enum StreamFeature {
     /// The Mac tells the iPad when an app has taken the mouse (`pointerHeld`), so the iPad can capture its
     /// pointer and give it back by itself.
     public static let pointerHeldSignal = 65_536
+    /// The iPad may open a fifth channel (Hello.Role.microphone) and send its microphone, which the Mac plays
+    /// into a loopback sound device so that Mac apps can use it as their microphone.
+    public static let microphone = 131_072
 }
 
 public struct Hello: Codable {
-    public enum Role: String, Codable { case control, video, files, audio }
+    public enum Role: String, Codable { case control, video, files, audio, microphone }
     public let session: UUID
     public let role: Role
     public let display: ClientDisplay?
@@ -196,6 +199,9 @@ public struct StreamInfo: Codable {
     public let hostName: String?
     /// Identifies this Mac across its addresses (build 37), so one device key serves them all.
     public var hostID: UUID?
+    /// With StreamFeature.microphone: the Mac sound device the iPad's microphone is played into, which is what
+    /// the user must choose as the microphone in Mac apps.
+    public var microphoneName: String?
     public init(width: Int, height: Int, fps: Int, bitrate: Int, displayName: String, inputEnabled: Bool,
                 textInputEnabled: Bool? = nil, displayBlankingSupported: Bool? = nil, features: Int? = nil, hostName: String? = nil) {
         self.width = width; self.height = height; self.fps = fps; self.bitrate = bitrate

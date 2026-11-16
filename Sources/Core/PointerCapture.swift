@@ -74,38 +74,82 @@ public struct DeltaCoalescer: Equatable {
 /// Mac side: notices that an app has taken the mouse, so the iPad can capture its pointer by itself (build 48,
 /// user request 2026-11-15: "can u make game mouse be automatic?").
 ///
-/// An app that takes the mouse hides the Mac's pointer and keeps it hidden while the mouse moves. Other things
-/// hide it too, but only until it moves: typing, and a video player after a few idle seconds. So the pointer
-/// counts as held when it is still hidden after the iPad has been moving it for a moment, and as given back
-/// once it has been showing for a moment.
+/// Build 48 took "the pointer stays hidden while the iPad moves it" as the sign. That is wrong on a Mac driven
+/// from an iPad: after typing, macOS hides the pointer until the *real* mouse moves, and movement injected by
+/// SkyDesk does not count, so the pointer read as hidden through ordinary use in a browser, the iPad captured
+/// its pointer for nothing and never gave it back (2026-11-15 23:01, "this thing genuinely broke my mouse").
+///
+/// Since build 49 two things must both be true: the pointer is hidden, and it does not go where it is put. An
+/// app that has taken the mouse holds the pointer in place or puts it back after every movement; in ordinary
+/// use the pointer lands exactly where the last movement sent it. The pointer is given back as soon as it
+/// shows again, or once it has gone where it was put for a while. When in doubt, it is not held.
 public struct PointerHoldDetector: Equatable {
     public private(set) var held = false
-    /// Hidden through this many seconds of movement, and at least this many moves, before it counts as held.
-    public static let holdAfter = 0.15, movesNeeded = 4
+    /// Hidden and not following through this many seconds and movements before it counts as held.
+    public static let holdAfter = 0.15, movesNeeded = 6
     /// Showing for this long before it counts as given back (a game may flash it for a frame).
     public static let releaseAfter = 0.2
-    private var hiddenSince: Double?
-    private var moves = 0
+    /// Or following again through this many movements over this long.
+    public static let followsNeeded = 12, followAfter = 0.3
+    /// "The pointer did not go where it was put" only means something on a Mac where it has been seen to go
+    /// where it was put: this many such movements must have been seen first, in this session. If the reading
+    /// never matches for some other reason, nothing is ever captured by itself.
+    public static let provenAfter = 20
+    public private(set) var proven = 0
+    private var since: Double?
+    private var count = 0
     private var shownSince: Double?
     public init() {}
-    /// Call for every pointer movement from the iPad (`moved`) and on a timer while held (`moved` false).
-    /// Returns the new state when it changes, otherwise nil.
-    public mutating func note(hidden: Bool, moved: Bool, now: Double) -> Bool? {
+    /// Call for every pointer movement from the iPad (`moved`), and on a timer while held (`moved` false).
+    /// `followed`: whether the pointer was found where a recent movement had put it; nil when that says nothing
+    /// (no movement was asked for, or this is the first). Returns the new state when it changes, otherwise nil.
+    public mutating func note(hidden: Bool, moved: Bool, followed: Bool?, now: Double) -> Bool? {
         if held {
-            guard !hidden else { shownSince = nil; return nil }
-            let since = shownSince ?? now; shownSince = since
-            guard now - since >= Self.releaseAfter else { return nil }
+            if !hidden {
+                let start = shownSince ?? now; shownSince = start
+                if now - start >= Self.releaseAfter { reset(); return false }
+            } else { shownSince = nil }
+            guard moved, let followed else { return nil }
+            guard followed else { since = nil; count = 0; return nil }
+            let start = since ?? now; since = start; count += 1
+            guard count >= Self.followsNeeded, now - start >= Self.followAfter else { return nil }
             reset(); return false
         }
-        guard hidden else { hiddenSince = nil; moves = 0; return nil }
-        // The count starts with the first movement while hidden, not when the pointer was hidden: a pointer that
-        // has been hidden for minutes over a film must still get its chance to reappear.
-        guard moved else { return nil }
-        let since = hiddenSince ?? now; hiddenSince = since
-        moves += 1
-        guard now - since >= Self.holdAfter, moves >= Self.movesNeeded else { return nil }
-        held = true; shownSince = nil
+        if moved, followed == true, proven < Self.provenAfter { proven += 1 }
+        // One movement that landed where it was sent, or a pointer that shows, ends any suspicion.
+        guard hidden, followed != true else { since = nil; count = 0; return nil }
+        guard moved, followed == false, proven >= Self.provenAfter else { return nil }
+        let start = since ?? now; since = start; count += 1
+        guard count >= Self.movesNeeded, now - start >= Self.holdAfter else { return nil }
+        held = true; since = nil; count = 0; shownSince = nil
         return true
     }
-    public mutating func reset() { held = false; hiddenSince = nil; moves = 0; shownSince = nil }
+    /// Ends a hold; what the session has proven so far is kept.
+    public mutating func reset() { held = false; since = nil; count = 0; shownSince = nil }
+}
+
+/// Mac side: whether the pointer went where it was put. The pointer's position is read just before each new
+/// movement and compared with where the last few movements sent it (the last few, because the position read
+/// may trail the newest one by a moment).
+public struct PointerFollowing: Equatable {
+    private var targets: [CGPoint] = []
+    private var asked = false
+    public static let tolerance = 3.0
+    public init() {}
+    /// `actual`: where the pointer is now, before the next movement is posted.
+    public func followed(actual: CGPoint) -> Bool? {
+        guard asked, !targets.isEmpty else { return nil }
+        return targets.contains { hypot($0.x - actual.x, $0.y - actual.y) <= Self.tolerance }
+    }
+    /// `target`: where the movement about to be posted sends the pointer.
+    public mutating func sent(target: CGPoint, from actual: CGPoint) {
+        // A movement that sends the pointer (nearly) where it already is proves nothing about the next reading,
+        // and must not be remembered either: a game holding the pointer in the middle of its window would
+        // otherwise seem to follow, because the middle is where every small movement started.
+        asked = hypot(target.x - actual.x, target.y - actual.y) > Self.tolerance
+        guard asked else { return }
+        targets.append(target)
+        if targets.count > 3 { targets.removeFirst() }
+    }
+    public mutating func reset() { targets = []; asked = false }
 }

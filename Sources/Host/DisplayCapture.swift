@@ -27,7 +27,8 @@ final class DisplayCapture: NSObject, SCStreamOutput, SCStreamDelegate {
 
     init(display: SCDisplay, longestEdge: Int, fps: Int, bitrate: Int, inputEnabled: Bool,
          lowLatencyRateControl: Bool, nativeDesktop: Bool = false, clientFeatures: Int = 0, hostName: String? = nil,
-         clipboard: Bool = false, files: Bool = false, audio: Bool = false, chroma444: Bool = false, preferSpeed: Bool = false) throws {
+         clipboard: Bool = false, files: Bool = false, audio: Bool = false, chroma444: Bool = false, preferSpeed: Bool = false,
+         microphone: Bool = false) throws {
         window = .streaming(fps: fps)
         markIdleGaps = clientFeatures & StreamFeature.idleGapFlags != 0
         let mode = CGDisplayCopyDisplayMode(display.displayID)
@@ -37,7 +38,7 @@ final class DisplayCapture: NSObject, SCStreamOutput, SCStreamDelegate {
                           displayName: nativeDesktop ? "iPad Retina desktop" : "Display \(display.displayID)",
                           inputEnabled: inputEnabled, textInputEnabled: inputEnabled,
                           displayBlankingSupported: nativeDesktop && inputEnabled,
-                          features: Self.features(client: clientFeatures, inputEnabled: inputEnabled, clipboard: clipboard, files: files, audio: audio, chroma444: chroma444), hostName: hostName)
+                          features: Self.features(client: clientFeatures, inputEnabled: inputEnabled, clipboard: clipboard, files: files, audio: audio, chroma444: chroma444, microphone: microphone), hostName: hostName)
         try info.validate()
         let full = (info.features ?? 0) & StreamFeature.chroma444 != 0
         encoder = try HEVCEncoder(width: info.width, height: info.height, fps: fps, bitrate: bitrate,
@@ -64,7 +65,7 @@ final class DisplayCapture: NSObject, SCStreamOutput, SCStreamDelegate {
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
         self.stream = stream
     }
-    private static func features(client: Int, inputEnabled: Bool, clipboard: Bool, files: Bool, audio: Bool, chroma444: Bool) -> Int? {
+    private static func features(client: Int, inputEnabled: Bool, clipboard: Bool, files: Bool, audio: Bool, chroma444: Bool, microphone: Bool) -> Int? {
         var value = client & StreamFeature.idleGapFlags != 0 ? StreamFeature.idleGapFlags | StreamFeature.clientStatsLog : 0
         // Without remote input the iPad never moves the pointer, so the video must keep showing it.
         if inputEnabled, client & StreamFeature.localCursor != 0 { value |= StreamFeature.localCursor }
@@ -80,6 +81,7 @@ final class DisplayCapture: NSObject, SCStreamOutput, SCStreamDelegate {
         if clipboard, client & StreamFeature.clipboardSync != 0 { value |= StreamFeature.clipboardSync }
         if files, client & StreamFeature.fileTransfer != 0 { value |= StreamFeature.fileTransfer }
         if audio, client & StreamFeature.audio != 0 { value |= StreamFeature.audio }
+        if microphone, client & StreamFeature.microphone != 0 { value |= StreamFeature.microphone }
         if chroma444, client & StreamFeature.chroma444 != 0 { value |= StreamFeature.chroma444 }
         if client & StreamFeature.deviceKeys != 0 { value |= StreamFeature.deviceKeys }
         if client & StreamFeature.datagramVideo != 0 { value |= StreamFeature.datagramVideo }
