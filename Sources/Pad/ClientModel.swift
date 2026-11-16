@@ -185,20 +185,49 @@ final class ClientModel: ObservableObject {
     @Published var capturedPointerSpeed = UserDefaults.standard.object(forKey: "capturedPointerSpeed") as? Double ?? 1 {
         didSet { UserDefaults.standard.set(capturedPointerSpeed, forKey: "capturedPointerSpeed") }
     }
-    func setPointerCaptured(_ wanted: Bool, quietly: Bool = false) {
-        guard wanted != pointerCaptured else { return }
-        if wanted, !canCapturePointer {
-            notice = info?.inputEnabled == true ? "Update SkyDesk Host on the Mac to capture the mouse for games."
-                                                : "Remote input is off on the Mac, so the mouse can't be captured."
-            return
+    /// Capture by itself when the Mac reports that an app has taken the mouse, and release when it gives it back
+    /// (build 48). The toolbar button and Control-Option-G still do it by hand.
+    @Published var autoCapturePointer = UserDefaults.standard.object(forKey: "autoCapturePointer") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(autoCapturePointer, forKey: "autoCapturePointer"); updatePointerCapture(announce: false) }
+    }
+    private var captureByHand = false
+    /// The Mac's word on whether an app there holds the mouse (StreamFeature.pointerHeldSignal).
+    private var macHoldsPointer = false
+    /// The user released a capture the Mac asked for; it stays released until the app gives the mouse back.
+    private var autoCaptureDeclined = false
+    /// The toolbar button and Control-Option-G.
+    func toggleGameMouse() {
+        if pointerCaptured {
+            captureByHand = false
+            if macHoldsPointer { autoCaptureDeclined = true }
+        } else {
+            guard canCapturePointer else {
+                notice = info?.inputEnabled == true ? "Update SkyDesk Host on the Mac to capture the mouse for games."
+                                                    : "Remote input is off on the Mac, so the mouse can't be captured."
+                return
+            }
+            captureByHand = true; autoCaptureDeclined = false
         }
+        updatePointerCapture(announce: true)
+    }
+    private func notePointerHeld(_ held: Bool) {
+        macHoldsPointer = held
+        if !held { autoCaptureDeclined = false }
+        updatePointerCapture(announce: held)
+    }
+    private func updatePointerCapture(announce: Bool) {
+        let automatic = autoCapturePointer && macHoldsPointer && !autoCaptureDeclined
+        let wanted = canCapturePointer && !inBackground && (captureByHand || automatic)
+        guard wanted != pointerCaptured else { return }
         pointerCaptured = wanted
         // The iPad no longer knows where the Mac's pointer is, so the Mac draws it into the picture meanwhile
         // (and a game that hides it hides it there too). The user's own choice comes back on release.
         if localPointer, let info, (info.features ?? 0) & StreamFeature.liveCursorToggle != 0 {
             control?.send(.setLocalCursor(!wanted)); localCursorActive = !wanted
         }
-        if !quietly { notice = wanted ? "Mouse captured for games. Control-Option-G or the toolbar releases it." : "Mouse released." }
+        guard announce else { return }
+        if wanted { notice = (captureByHand ? "Mouse captured for games." : "The Mac app took the mouse, so it is captured.") + " Control-Option-G or the toolbar releases it." }
+        else if !macHoldsPointer || autoCaptureDeclined { notice = "Mouse released." }
     }
     @Published var syncClipboard = UserDefaults.standard.object(forKey: "syncClipboard") as? Bool ?? true {
         didSet { UserDefaults.standard.set(syncClipboard, forKey: "syncClipboard") }
@@ -548,7 +577,7 @@ final class ClientModel: ObservableObject {
         var features = StreamFeature.idleGapFlags | StreamFeature.pauseVideo | StreamFeature.liveCursorToggle
             | StreamFeature.clipboardSync | StreamFeature.fileTransfer | StreamFeature.scrollMomentum | StreamFeature.remoteUpdate
             | StreamFeature.gestures | StreamFeature.audio | StreamFeature.deviceKeys | StreamFeature.updateSignals
-            | StreamFeature.relativeMouse
+            | StreamFeature.relativeMouse | StreamFeature.pointerHeldSignal
         if localPointer { features |= StreamFeature.localCursor }
         if datagramVideo { features |= StreamFeature.datagramVideo }
         if sharperColour, Self.canDecodeFullColour, !UserDefaults.standard.bool(forKey: Self.colourFailedKey) { features |= StreamFeature.chroma444 }
@@ -654,6 +683,8 @@ final class ClientModel: ObservableObject {
                     self.verifyAndInstall(manifest)
                 case .updateDownload(let finished):
                     self.noteUpdateDownload(finished: finished)
+                case .pointerHeld(let held):
+                    self.notePointerHeld(held)
                 case .failure(let reason):
                     self.changingMacDisplay = false
                     if self.updateState == .preparing { self.updateState = .failed(reason) }
@@ -797,6 +828,7 @@ final class ClientModel: ObservableObject {
         control?.close(); video?.close(); control = nil; video = nil
         videoQueue = nil; videoGate = nil; decoder = nil; activeTarget = nil; activeCredential = nil
         clipboard = nil; localCursorActive = false; pointerCaptured = false
+        captureByHand = false; macHoldsPointer = false; autoCaptureDeclined = false
         fileEngine?.close(reason: "Disconnected from the Mac."); fileEngine = nil
         files?.close(); files = nil; filesReady = false
         closeAudio()
@@ -819,7 +851,7 @@ final class ClientModel: ObservableObject {
         inBackground = true
         pasteboardCountWhenLeft = UIPasteboard.general.changeCount
         // iPadOS gives the pointer back when the app leaves the screen; a game must not keep a stale capture.
-        setPointerCaptured(false, quietly: true)
+        captureByHand = false; updatePointerCapture(announce: false)
         releaseInput()
         // Mid-update, hold nothing: iPadOS installs only once SkyDesk has really stopped, and the background task
         // that keeps a session alive for ~30 s delayed that until the user had already come back (2026-11-13).
@@ -851,6 +883,7 @@ final class ClientModel: ObservableObject {
     func enterForeground() {
         guard inBackground else { return }
         inBackground = false
+        updatePointerCapture(announce: false)
         Breadcrumb.heartbeat()
         endBackgroundTask()
         let age = mailbox.statistics.lastPongAge().map { Double($0) / 1_000_000_000 }

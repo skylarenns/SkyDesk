@@ -435,7 +435,7 @@ private struct StreamView: View {
                 } label: { ToolLabel(title: "Shortcuts", icon: "command") }
                 if client.canCapturePointer {
                     ToolButton(title: client.pointerCaptured ? "Release mouse" : "Game mouse", icon: "gamecontroller",
-                               active: client.pointerCaptured) { client.setPointerCaptured(!client.pointerCaptured) }
+                               active: client.pointerCaptured) { client.toggleGameMouse() }
                         .accessibilityHint("For games that take the mouse: the pointer is held and movement is sent as distance. Control-Option-G does the same.")
                 }
                 if info.displayBlankingSupported == true {
@@ -470,6 +470,7 @@ private struct StreamView: View {
                             Picker("Pointer size", selection: $client.pointerScale) {
                                 Text("Small").tag(0.75); Text("Medium (Mac size)").tag(1.0); Text("Large").tag(1.5); Text("Extra large").tag(2.0)
                             }.pickerStyle(.menu).disabled(!client.localPointer)
+                            Toggle("Game mouse by itself when a Mac app takes the mouse", isOn: $client.autoCapturePointer)
                             Picker("Game mouse speed", selection: $client.capturedPointerSpeed) {
                                 Text("Half").tag(0.5); Text("Slower").tag(0.75); Text("Normal").tag(1.0)
                                 Text("Faster").tag(1.5); Text("Double").tag(2.0); Text("Triple").tag(3.0)

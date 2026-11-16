@@ -70,3 +70,42 @@ public struct DeltaCoalescer: Equatable {
     }
     public mutating func reset() { x = 0; y = 0; lastSent = nil }
 }
+
+/// Mac side: notices that an app has taken the mouse, so the iPad can capture its pointer by itself (build 48,
+/// user request 2026-11-15: "can u make game mouse be automatic?").
+///
+/// An app that takes the mouse hides the Mac's pointer and keeps it hidden while the mouse moves. Other things
+/// hide it too, but only until it moves: typing, and a video player after a few idle seconds. So the pointer
+/// counts as held when it is still hidden after the iPad has been moving it for a moment, and as given back
+/// once it has been showing for a moment.
+public struct PointerHoldDetector: Equatable {
+    public private(set) var held = false
+    /// Hidden through this many seconds of movement, and at least this many moves, before it counts as held.
+    public static let holdAfter = 0.15, movesNeeded = 4
+    /// Showing for this long before it counts as given back (a game may flash it for a frame).
+    public static let releaseAfter = 0.2
+    private var hiddenSince: Double?
+    private var moves = 0
+    private var shownSince: Double?
+    public init() {}
+    /// Call for every pointer movement from the iPad (`moved`) and on a timer while held (`moved` false).
+    /// Returns the new state when it changes, otherwise nil.
+    public mutating func note(hidden: Bool, moved: Bool, now: Double) -> Bool? {
+        if held {
+            guard !hidden else { shownSince = nil; return nil }
+            let since = shownSince ?? now; shownSince = since
+            guard now - since >= Self.releaseAfter else { return nil }
+            reset(); return false
+        }
+        guard hidden else { hiddenSince = nil; moves = 0; return nil }
+        // The count starts with the first movement while hidden, not when the pointer was hidden: a pointer that
+        // has been hidden for minutes over a film must still get its chance to reappear.
+        guard moved else { return nil }
+        let since = hiddenSince ?? now; hiddenSince = since
+        moves += 1
+        guard now - since >= Self.holdAfter, moves >= Self.movesNeeded else { return nil }
+        held = true; shownSince = nil
+        return true
+    }
+    public mutating func reset() { held = false; hiddenSince = nil; moves = 0; shownSince = nil }
+}

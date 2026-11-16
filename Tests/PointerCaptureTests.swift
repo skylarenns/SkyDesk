@@ -55,4 +55,39 @@ final class PointerCaptureTests: XCTestCase {
         let sent = try JSONDecoder().decode(InputEvent.self, from: JSONEncoder().encode(InputEvent(kind: .move, x: 3, y: -4, relative: true)))
         XCTAssertEqual(sent.relative, true)
     }
+    func testAnAppThatKeepsThePointerHiddenWhileItMovesHasTakenTheMouse() {
+        var mac = PointerHoldDetector()
+        // Moves 8 ms apart with the pointer hidden throughout: held once 150 ms and four moves have passed.
+        var changes: [(Double, Bool)] = []
+        for step in 0..<40 { let now = Double(step) * 0.008; if let held = mac.note(hidden: true, moved: true, now: now) { changes.append((now, held)) } }
+        XCTAssertEqual(changes.count, 1); XCTAssertEqual(changes.first?.1, true)
+        XCTAssertEqual(changes.first?.0 ?? 0, 0.152, accuracy: 0.001)
+        // Given back once the pointer has been showing for a fifth of a second, movement or not; one flash does not count.
+        XCTAssertNil(mac.note(hidden: false, moved: false, now: 1.00))
+        XCTAssertNil(mac.note(hidden: true, moved: false, now: 1.05))
+        XCTAssertNil(mac.note(hidden: false, moved: false, now: 1.10))
+        XCTAssertNil(mac.note(hidden: false, moved: true, now: 1.25))
+        XCTAssertEqual(mac.note(hidden: false, moved: false, now: 1.31), false)
+        XCTAssertFalse(mac.held)
+    }
+    func testAPointerHiddenOnlyUntilItMovesIsNotHeld() {
+        // A film has hidden the pointer for a minute; nothing moves, so nothing is concluded.
+        var mac = PointerHoldDetector()
+        for second in 0..<60 { XCTAssertNil(mac.note(hidden: true, moved: false, now: Double(second))) }
+        // The first movement finds it still hidden; the player shows it within a frame or two.
+        XCTAssertNil(mac.note(hidden: true, moved: true, now: 60.000))
+        XCTAssertNil(mac.note(hidden: true, moved: true, now: 60.008))
+        for step in 2..<100 { XCTAssertNil(mac.note(hidden: false, moved: true, now: 60 + Double(step) * 0.008)) }
+        // Typing hides it again and again between short movements: each time the count starts over.
+        for burst in 0..<20 {
+            let start = 70 + Double(burst)
+            XCTAssertNil(mac.note(hidden: true, moved: true, now: start))
+            XCTAssertNil(mac.note(hidden: false, moved: true, now: start + 0.008))
+            XCTAssertNil(mac.note(hidden: false, moved: true, now: start + 0.3))
+        }
+        // Three quick moves in 150 ms are not enough either.
+        XCTAssertNil(mac.note(hidden: true, moved: true, now: 100.0)); XCTAssertNil(mac.note(hidden: true, moved: true, now: 100.1))
+        XCTAssertNil(mac.note(hidden: true, moved: true, now: 100.16))
+        XCTAssertFalse(mac.held)
+    }
 }

@@ -100,7 +100,7 @@ final class HostAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         view.cacheDisplay(in: view.bounds, to: image)
         try? image.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: picture))
         let items = NSApp.windows.filter { $0.className.contains("StatusBar") }.count
-        let summary = "headline=\(host.headline) menuBarItems=\(items) content=\(Int(view.bounds.width))x\(Int(view.bounds.height)) "
+        let summary = "headline=\(host.headline) menuBarItems=\(items) content=\(Int(view.bounds.width))x\(Int(view.bounds.height)) pointerVisible=\(SkyDeskPointerIsVisible()) "
             + "loginStatus=\(SMAppService.mainApp.status.rawValue) policy=\(NSApp.activationPolicy().rawValue)\n"
         try? summary.write(toFile: picture + ".txt", atomically: true, encoding: .utf8)
         // SKYDESK_SMOKE_AUDIO=1 also reads the Mac's sound for 1.5 s, never silencing it, and reports what arrived.

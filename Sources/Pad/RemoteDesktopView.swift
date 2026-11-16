@@ -22,7 +22,7 @@ struct RemoteDesktopView: UIViewRepresentable {
         view.sendGesture = { [weak client] in client?.gesture($0) }
         client.drawNote = { [weak view] in view?.drawNote ?? "" }
         view.desktopSwipe = { [weak client] in client?.desktopSwipe($0) }
-        view.toggleCapture = { [weak client] in if let client { client.setPointerCaptured(!client.pointerCaptured) } }
+        view.toggleCapture = { [weak client] in client?.toggleGameMouse() }
         return view
     }
     func updateUIView(_ view: DesktopMetalView, context: Context) {

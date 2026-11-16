@@ -115,6 +115,9 @@ public enum StreamFeature {
     /// The iPad may capture the pointer and send movement as distances (`InputEvent.relative`) for games and
     /// other apps that take the mouse (PointerCapture.swift).
     public static let relativeMouse = 32_768
+    /// The Mac tells the iPad when an app has taken the mouse (`pointerHeld`), so the iPad can capture its
+    /// pointer and give it back by itself.
+    public static let pointerHeldSignal = 65_536
 }
 
 public struct Hello: Codable {
@@ -277,6 +280,8 @@ public enum ControlMessage: Codable {
     case updateDownload(Bool)
     /// iPad → Mac: send the update certificate profile (arrives over the file channel).
     case updateCertificateRequest
+    /// Mac → iPad, only with StreamFeature.pointerHeldSignal: an app on the Mac has taken the mouse (true) or given it back.
+    case pointerHeld(Bool)
     /// iPad → Mac, only with StreamFeature.gestures.
     case gesture(GestureEvent)
     /// iPad → Mac, only with StreamFeature.deviceKeys, answered by `deviceKey`.

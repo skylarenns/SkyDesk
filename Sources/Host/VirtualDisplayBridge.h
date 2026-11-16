@@ -12,4 +12,7 @@ NS_ASSUME_NONNULL_BEGIN
 - (BOOL)activateWithError:(NSError **)error;
 - (void)invalidate;
 @end
+/// Whether the Mac's pointer is showing. Swift marks the underlying call unavailable; it still answers from the
+/// WindowServer's shared state for every app (checked on macOS 27: it follows other apps hiding the pointer).
+BOOL SkyDeskPointerIsVisible(void);
 NS_ASSUME_NONNULL_END

@@ -23,6 +23,7 @@ final class InputInjector {
         switch input.kind {
         case .move, .down, .up:
             if input.kind == .down { stopMomentum() }
+            if input.kind == .move { noteHold(moved: true) }
             if input.relative == true {
                 // Captured pointer: movement as distances, clicks wherever the Mac's pointer is (PointerCapture.swift).
                 guard let delta = capturedMove(input) else { return }
@@ -94,6 +95,22 @@ final class InputInjector {
     }
     private var relativePointer = RelativePointer()
     private var pointerCaptured = false
+    /// An app on the Mac took the mouse (true) or gave it back; nil while the iPad does not want to be told.
+    var onPointerHeld: ((Bool) -> Void)? { didSet { if onPointerHeld == nil { holdTimer?.invalidate(); holdTimer = nil; hold.reset() } } }
+    private var hold = PointerHoldDetector()
+    private var holdTimer: Timer?
+    private func noteHold(moved: Bool) {
+        guard let onPointerHeld else { return }
+        guard let held = hold.note(hidden: !SkyDeskPointerIsVisible(), moved: moved, now: CACurrentMediaTime()) else { return }
+        MetricsLog.shared.append("host  " + (held ? "an app has taken the mouse (pointer hidden while it moves)" : "the app gave the mouse back (pointer showing)"))
+        holdTimer?.invalidate(); holdTimer = nil
+        if held {
+            // Giving it back shows as the pointer reappearing, which may happen while nothing moves.
+            let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in MainActor.assumeIsolated { self?.noteHold(moved: false) } }
+            RunLoop.main.add(timer, forMode: .common); holdTimer = timer
+        }
+        onPointerHeld(held)
+    }
     /// Sets `location` for a captured-pointer event and returns the distance to report; nil = nothing to post yet.
     private func capturedMove(_ input: InputEvent) -> CGPoint? {
         // Where the pointer really is: the game may hold it in place or have put it somewhere itself.

@@ -521,6 +521,7 @@ final class HostModel: ObservableObject {
         fileRoute.set(nil, engine: nil)
         fileEngine?.close(reason: "The iPad disconnected."); fileEngine = nil; files = nil; filesReady = false
         current.forEach { $0.close() }
+        input.onPointerHeld = nil
         input.releaseAll()
         let old = capture; capture = nil
         let oldDisplay = virtualDisplay; virtualDisplay = nil
@@ -849,6 +850,12 @@ final class HostModel: ObservableObject {
                 }
                 let agreed = pipeline.info.features ?? 0
                 if agreed & StreamFeature.localCursor != 0 { startCursorMonitor() }
+                if agreed & StreamFeature.pointerHeldSignal != 0 {
+                    input.onPointerHeld = { [weak self, weak control] held in
+                        guard let self, self.generation == token, self.sessionID == sessionID else { return }
+                        control?.send(.pointerHeld(held))
+                    }
+                }
                 if agreed & StreamFeature.clipboardSync != 0 { startClipboardSync() }
                 if agreed & StreamFeature.remoteUpdate != 0 { offeredBuild = nil; offerUpdateIfNeeded() }
                 if adaptiveBitrate { startBitrateControl(maximum: pipeline.info.bitrate) }
