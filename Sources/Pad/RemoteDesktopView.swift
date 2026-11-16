@@ -376,6 +376,17 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
         if let p { pointer(.move, at: p) }
         pushAgainstEdge(onEdge ? p : nil)
     }
+    /// Where a press at `location` lands: the same place the pointer was shown while it hovered there. Near an edge
+    /// of the Mac desktop the hovering pointer is put exactly on the edge (build 43), so the Mac shows what is on
+    /// the edge, such as the arrows for resizing a window that reaches it. Until build 51 the press itself went to
+    /// the true position a few points further in, which is inside the window: the Mac's pointer hopped off the
+    /// edge as the button went down and the drag moved whatever was there instead of resizing (2026-11-16).
+    private func pressLocation(_ location: CGPoint) -> CGPoint {
+        guard !controlsFrame.contains(convert(location, to: nil)) else { return location }
+        let frame = DesktopGeometry.keyboardAdjustedFit(content: remoteSize, in: bounds, keyboardHeight: keyboardHeight, focus: focusRect)
+        guard frame.contains(location) else { return location }
+        return PointerEdges.snapped(location, in: frame).point
+    }
     private var edgePush: (point: CGPoint, left: Int)?
     private var edgePushTimer: Timer?
     /// A real mouse held against a screen edge keeps reporting movement; the iPad's pointer goes quiet. While the
@@ -397,8 +408,9 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
         if !keyboard.isFirstResponder { becomeFirstResponder() }
         syncModifiers(recognizer)
         if captured { capturedButton(button, down: true); capturedButton(button, down: false); return }
-        guard let p = point(recognizer.location(in: self)) else { return }
-        moveCursor(to: recognizer.location(in: self))
+        let location = pressLocation(recognizer.location(in: self))
+        guard let p = point(location) else { return }
+        moveCursor(to: location)
         pointer(.down, at: p, button: button); pointer(.up, at: p, button: button)
     }
     @objc private func dragged(_ recognizer: UIPanGestureRecognizer) {
@@ -409,7 +421,9 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
         case .began:
             if !keyboard.isFirstResponder { becomeFirstResponder() }
             let translation = recognizer.translation(in: self)
-            guard let p = point(CGPoint(x: location.x - translation.x, y: location.y - translation.y)) else { return }
+            // The press happened where the drag began, and counts as on an edge exactly when the hovering pointer did.
+            guard let p = point(pressLocation(CGPoint(x: location.x - translation.x, y: location.y - translation.y))) else { return }
+            pushAgainstEdge(nil)
             dragActive = true; pointer(.down, at: p)
         case .changed:
             if dragActive, let p = point(location) { moveCursor(to: location); pointer(.move, at: p) }

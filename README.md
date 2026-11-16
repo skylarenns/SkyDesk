@@ -2,7 +2,7 @@
 
 A native Apple remote desktop for one person's own devices. **SkyDesk Host** runs in the Mac's menu bar, captures a display and streams it as hardware-encoded HEVC. **SkyDesk** on the iPad decodes it in hardware, draws it with Metal and sends back keyboard, trackpad, touch and gesture input. The same link carries clipboard text, files in both directions, the Mac's sound, and updates of both apps. The two devices talk to each other directly: there is no account, relay or server.
 
-This file describes the code at **build 50** (`CURRENT_PROJECT_VERSION` in `project.yml`). [VERIFICATION.md](VERIFICATION.md) is the dated record of the first builds and does not describe the current state.
+This file describes the code at **build 51** (`CURRENT_PROJECT_VERSION` in `project.yml`). [VERIFICATION.md](VERIFICATION.md) is the dated record of the first builds and does not describe the current state.
 
 **No end-to-end performance figure has been measured.** 120 FPS is the default target frame rate, not a verified result. The delays the iPad shows are estimates added up from parts (see [Statistics](#statistics)); nobody has yet filmed an input and its response to check them.
 
@@ -25,13 +25,14 @@ This file describes the code at **build 50** (`CURRENT_PROJECT_VERSION` in `proj
 | 48 (the pointer is captured by itself when a Mac app takes the mouse, and given back when the app shows the pointer again) | Installed on 2026-11-15 and **wrong**: 92 seconds after connecting it captured the pointer during ordinary use of a browser and did not give it back ("this thing genuinely broke my mouse"). On a Mac driven from an iPad the pointer often reads as hidden: after typing, macOS hides it until the real mouse moves, and injected movement does not count. The 25 s of "hidden" taken as evidence for this build was that, not an app holding the mouse. |
 | 49 (automatic capture needs the pointer hidden *and* not going where it is put, and undoes itself when the pointer follows again; the Mac side of the microphone, unused until the iPad side exists) | Built and unit-tested. Not run with a game. It also rests on an assumption that has not been measured here: that in ordinary use the pointer's position, read back, is where the last movement put it. If that is false nothing is captured automatically at all, because the check must first be seen to work in each session. |
 | 50 (microphone: the iPad's microphone is sent to the Mac and played into a loopback sound device, which Mac apps use as their microphone) | Built. The Mac side is unit-tested, including playing into BlackHole on this Mac (silence, so nothing was heard). **The iPad side has not been run**: there is no microphone path in the simulator worth trusting, so capture, the permission prompt and what it does to the sound being played are untried. |
+| 51 (a press near an edge of the desktop lands on the edge, where the hovering pointer was shown, so a window that reaches the edge can be resized from it) | Built. Not run on the real devices; the fault it answers was reported there (the resize arrows showed, the drag moved something else). |
 
 Not yet confirmed on real hardware, even in the installed builds:
 
 - that the Mac's speakers really are silent while the iPad plays its sound (the log says the Mac asked for that; nobody has yet confirmed it by ear);
 - pinch and rotate actually reaching Mac apps (a unit test shows AppKit reads the injected events as magnify and rotate events, nothing more).
 
-`swift test` runs 178 tests with no failures (last run 2026-11-15 on the build 50 sources). Tests use the Mac's hardware encoder and loopback connections; they never capture the screen.
+`swift test` runs 178 tests with no failures (last run 2026-11-16 on the build 51 sources). Tests use the Mac's hardware encoder and loopback connections; they never capture the screen.
 
 ## Requirements
 
@@ -329,7 +330,7 @@ iPad   VideoToolbox HEVC           hardware only
 
 ### Input
 
-Input events travel as small JSON messages on the control connection and are replayed on the Mac as Core Graphics events, each marked as remote so iPad only mode can tell them from someone at the Mac. Pointer positions are fractions of the desktop, mapped through the same aspect-fit and keyboard shift the renderer uses. Since build 43 a pointer within a few points of the iPad's edge is sent as exactly on the desktop's edge, and while it rests there both sides repeat the move with a push towards that edge, because sidebars, the menu bar and the Dock open on pressure against an edge, not on position. Pings and frame acknowledgements are answered on the network queue of each side, not the main thread, so interface work does not distort them.
+Input events travel as small JSON messages on the control connection and are replayed on the Mac as Core Graphics events, each marked as remote so iPad only mode can tell them from someone at the Mac. Pointer positions are fractions of the desktop, mapped through the same aspect-fit and keyboard shift the renderer uses. Since build 43 a pointer within a few points of the iPad's edge is sent as exactly on the desktop's edge (and since build 51 so is a press there, which before went to the true position a few points in and so missed whatever the edge had shown, such as a window's resize arrows), and while it rests there both sides repeat the move with a push towards that edge, because sidebars, the menu bar and the Dock open on pressure against an edge, not on position. Pings and frame acknowledgements are answered on the network queue of each side, not the main thread, so interface work does not distort them.
 
 **Captured pointer (build 47).** Games and some other apps take the mouse: they hide the pointer and read how far the mouse moved, so a position is no use to them and the view would stop turning once the iPad's pointer reached the edge of the screen. **Game mouse** in the toolbar, or Control-Option-G, captures the pointer; the same again (or leaving SkyDesk) releases it.
 
@@ -389,7 +390,7 @@ That refusal happens after the handshake because it cannot happen in it: Apple's
 ## Tests and checks
 
 ```sh
-swift test                                  # 178 tests at build 50 (about 30 s; several open loopback sockets) (about 20 s; a few open loopback sockets)
+swift test                                  # 178 tests at build 51 (about 30 s; several open loopback sockets) (about 20 s; a few open loopback sockets)
 swift run skydesk-check --frames 120        # synthetic frames, hardware HEVC, encrypted loopback
 swift run skydesk-check --width 1920 --height 1200 --frames 240 --low-latency
 ```
