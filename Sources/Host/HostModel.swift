@@ -527,6 +527,7 @@ final class HostModel: ObservableObject {
         if keptDesktop?.display !== display, virtualDisplay !== display { display.invalidate() }
     }
     private func disconnect(_ end: KeptDesktop.SessionEnd = .hostEnded) {
+        hostCPU.reset()
         generation = UUID()
         ContinuityLink.resume()
         let padOnly = displayController.isSettled && (keptDesktop != nil || (virtualDisplay != nil && sessionShape != nil))
@@ -1244,6 +1245,8 @@ final class HostModel: ObservableObject {
         input.displayBounds = bounds
         focusMonitor?.updateBounds(bounds)
     }
+    /// SkyDesk Host's own processor use (build 58).
+    private var hostCPU = CPUMeter()
     private func tick() {
         // Once, shortly after launch: the microphone device should be there before a Mac app looks for it.
         if !soundOutputsRead {
@@ -1269,7 +1272,11 @@ final class HostModel: ObservableObject {
         if let controller = bitrateController, controller.target < controller.maximum {
             metrics += String(format: " · bitrate limited to %.1f Mbps by the network", Double(controller.target) / 1e6)
         }
-        MetricsLog.shared.append(String(format: "host  %@ · %.1f Mbps encoded", metrics, Double(stats.bytes) * 8 / elapsed / 1_000_000)
+        hostCPU.sample(wall: CACurrentMediaTime(), cpu: ProcessCPU.seconds())
+        let usage = " · host CPU " + (hostCPU.recent.map { String(format: "%.0f%%", $0) } ?? "-")
+            + (hostCPU.average.map { String(format: " (avg %.0f%%)", $0) } ?? "")
+            + (GPUUsage.percent().map { String(format: " · Mac GPU %.0f%%", $0) } ?? "")
+        MetricsLog.shared.append(String(format: "host  %@ · %.1f Mbps encoded", metrics, Double(stats.bytes) * 8 / elapsed / 1_000_000) + usage
                                  + (audio?.statisticsText().map { " · " + $0 } ?? "")
                                  + (mic.map { let counts = $0.statistics(); return " · mic \(counts.packets) arrived, \(counts.played) played, ran dry \(counts.ranDry), dropped \(counts.dropped)" } ?? ""))
         if let age = capture.window.oldestAge(), age > 5_000_000_000 { disconnect(.padLeft); status = "Video stalled; reconnect the iPad." }

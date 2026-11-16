@@ -319,6 +319,15 @@ final class ClientModel: ObservableObject {
     /// The session runs through a VPN tunnel (WireGuard and the like), so the toolbar shows that instead of Wi-Fi.
     private var usingVPN = false
     private var statsTick = 0
+    // Usage (build 58): how long SkyDesk has been on screen since it was opened, the session's length, the
+    // battery used in it and this app's processor use. Only read on the main thread.
+    private static let opened = CACurrentMediaTime()
+    private var onScreenBefore = 0.0
+    private var onScreenSince: Double? = ClientModel.opened
+    private var sessionStarted: Double?
+    private var drain = BatteryDrain()
+    private var cpu = CPUMeter()
+    private var onScreen: Double { onScreenBefore + (onScreenSince.map { CACurrentMediaTime() - $0 } ?? 0) }
     private var awaitingTextFocus = false
     private var activeTarget: ConnectTarget?
     /// Where to reconnect when the app returns to the foreground.
@@ -636,6 +645,7 @@ final class ClientModel: ObservableObject {
                 case .welcome(let info):
                     try info.validate()
                     self.info = info; self.connecting = false; self.status = "Connected"
+                    self.sessionStarted = CACurrentMediaTime(); self.drain.reset(); self.cpu.reset()
                     self.clearAutoDeadline()
                     if let path = control?.connection.currentPath {
                         switch LinkKind.of(interfaces: path.availableInterfaces.map(\.name), wifi: path.usesInterfaceType(.wifi),
@@ -870,7 +880,7 @@ final class ClientModel: ObservableObject {
         closeAudio()
         closeMicrophone(); micEndpoint = nil
         if sendMicrophone { sendMicrophone = false }
-        info = nil; connecting = false
+        info = nil; connecting = false; sessionStarted = nil
         if let reason { status = reason }
         textFocus = .none; keyboardWanted = false; awaitingTextFocus = false; lastTapRect = nil; remoteCursor = nil
         macDisplayBlanked = false; changingMacDisplay = false; usingCable = false; usingVPN = false
@@ -887,6 +897,7 @@ final class ClientModel: ObservableObject {
     /// During that time the link stays up with video paused; after it, the session ends and resumes on return.
     func enterBackground() {
         inBackground = true
+        if let since = onScreenSince { onScreenBefore += CACurrentMediaTime() - since; onScreenSince = nil }
         pasteboardCountWhenLeft = UIPasteboard.general.changeCount
         // iPadOS gives the pointer back when the app leaves the screen; a game must not keep a stale capture.
         captureByHand = false; updatePointerCapture(announce: false)
@@ -922,6 +933,7 @@ final class ClientModel: ObservableObject {
     func enterForeground() {
         guard inBackground else { return }
         inBackground = false
+        onScreenSince = CACurrentMediaTime()
         updatePointerCapture(announce: false)
         Breadcrumb.heartbeat()
         endBackgroundTask()
@@ -1371,13 +1383,22 @@ final class ClientModel: ObservableObject {
         stats.update(headline: StatisticsText.headline(values), network: StatisticsText.network(values),
                      display: StatisticsText.total(values), details: StatisticsText.pipeline(values),
                      corner: StatisticsText.corner(values, build: Self.ownBuild))
+        let now = CACurrentMediaTime()
+        let battery = BatteryMonitor.shared
+        drain.sample(percent: battery.percent, charging: battery.charging, now: now)
+        cpu.sample(wall: now, cpu: ProcessCPU.seconds())
+        let session = sessionStarted.map { now - $0 }
+        stats.setPower(UsageText.summary(battery: battery.percent, drain: drain, session: session, cpu: cpu))
         statsTick += 1
         if statsTick % 2 == 0, (info?.features ?? 0) & StreamFeature.clientStatsLog != 0 {
             let note = drawNote?() ?? ""
             control?.send(.clientStats(StatisticsText.logLine(values, link: usingCable ? "cable" : usingVPN ? "vpn" : networkSymbol)
                                        + " video=" + videoPath + (videoOrder.map { " rebuilt=\($0.rebuilt)" } ?? "") + (note.isEmpty ? "" : " " + note)
                                        + (audioPlayer.map { " " + $0.statisticsText() } ?? "")
-                                       + " bat=" + (BatteryMonitor.shared.percent.map(String.init) ?? "-") + "/" + BatteryMonitor.shared.source))
+                                       + " bat=" + (battery.percent.map(String.init) ?? "-") + "/" + battery.source + (battery.charging ? "+" : "")
+                                       + " " + UsageText.logFields(open: onScreen, session: session, drain: drain, cpu: cpu,
+                                                                   thermal: ProcessInfo.processInfo.thermalState.rawValue,
+                                                                   lowPower: ProcessInfo.processInfo.isLowPowerModeEnabled)))
         }
         #if targetEnvironment(simulator)
         stats.metrics = "SIMULATOR (GPU completion only) · " + stats.metrics
@@ -1392,6 +1413,9 @@ final class StreamStatsModel: ObservableObject {
     @Published var displayTiming = ""
     @Published var timingDetails = ""
     @Published var corner = ""
+    /// Battery, drain and processor use (build 58).
+    @Published var power = ""
+    func setPower(_ value: String) { if power != value { power = value } }
     func update(headline: String, network: String, display: String, details: String, corner: String) {
         if self.corner != corner { self.corner = corner }
         if metrics != headline { metrics = headline }

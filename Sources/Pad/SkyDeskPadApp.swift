@@ -544,6 +544,7 @@ private struct StatsHUD: View {
             Text(stats.metrics).font(.system(.callout, design: .monospaced).bold())
             Text(stats.networkTiming).font(.system(.caption, design: .monospaced))
             Text(stats.displayTiming).font(.system(.caption, design: .monospaced))
+            if !stats.power.isEmpty { Text(stats.power).font(.system(.caption, design: .monospaced)) }
             if details {
                 Text(stats.timingDetails).font(.system(.caption2, design: .monospaced))
                 Text(StatisticsText.explanation).font(.caption2).multilineTextAlignment(.center).frame(maxWidth: 520)
