@@ -55,15 +55,31 @@ final class HostModel: ObservableObject {
     /// The iPad may send its microphone (build 49). It is played into `microphoneTarget`, a loopback sound device
     /// that Mac apps then use as their microphone (MicPlayback.swift).
     @Published var allowMicrophone = UserDefaults.standard.object(forKey: "allowMicrophone") as? Bool ?? true {
-        didSet { UserDefaults.standard.set(allowMicrophone, forKey: "allowMicrophone") }
+        didSet { UserDefaults.standard.set(allowMicrophone, forKey: "allowMicrophone"); updateMicrophoneAlias() }
     }
     /// The chosen device's identifier; empty = the first loopback device found.
     @Published var microphoneDeviceUID = UserDefaults.standard.string(forKey: "microphoneDeviceUID") ?? "" {
-        didSet { UserDefaults.standard.set(microphoneDeviceUID, forKey: "microphoneDeviceUID") }
+        didSet { UserDefaults.standard.set(microphoneDeviceUID, forKey: "microphoneDeviceUID"); updateMicrophoneAlias() }
     }
     @Published private(set) var soundOutputs: [SoundOutput] = []
     var microphoneTarget: SoundOutput? { SoundOutputs.microphoneTarget(saved: microphoneDeviceUID, among: soundOutputs) }
-    func refreshSoundOutputs() { soundOutputs = SoundOutputs.all() }
+    func refreshSoundOutputs() { soundOutputs = SoundOutputs.all(); updateMicrophoneAlias() }
+    /// The loopback device under the name "SkyDesk Microphone", so it is easy to find in Mac apps.
+    private let microphoneAlias = MicrophoneAlias()
+    @Published private(set) var microphoneName: String?
+    /// The development self-check runs beside the real host and must leave its sound device alone.
+    private static let selfCheck = ProcessInfo.processInfo.environment["SKYDESK_SMOKE_PNG"] != nil
+    private var soundOutputsRead = false
+    private func updateMicrophoneAlias() {
+        guard !Self.selfCheck else { return }
+        let target = allowMicrophone ? microphoneTarget : nil
+        let named = microphoneAlias.update(target: target)
+        let name = named ? microphoneAlias.name : target?.name
+        if name != microphoneName {
+            microphoneName = name
+            MetricsLog.shared.append("host  microphone device for Mac apps: " + (name.map { named ? "\($0) (stands for \(target?.name ?? "?"))" : $0 } ?? "none"))
+        }
+    }
     private var micChannel: SecureChannel?
     private var mic: MicPlayback?
     private let micRoute = MicRoute()
@@ -879,7 +895,7 @@ final class HostModel: ObservableObject {
                 input.displayBounds = CGDisplayBounds(display.displayID)
                 var welcome = pipeline.info
                 if (welcome.features ?? 0) & StreamFeature.deviceKeys != 0 { welcome.hostID = hostID }
-                if (welcome.features ?? 0) & StreamFeature.microphone != 0 { welcome.microphoneName = microphoneTarget?.name }
+                if (welcome.features ?? 0) & StreamFeature.microphone != 0 { welcome.microphoneName = microphoneName ?? microphoneTarget?.name }
                 control.send(.welcome(welcome))
                 // iPad only is already on, so the iPad shows it that way and does not ask for the switch again.
                 if resumedKept { control.send(.macDisplayBlanked(true)) }
@@ -1229,6 +1245,8 @@ final class HostModel: ObservableObject {
         focusMonitor?.updateBounds(bounds)
     }
     private func tick() {
+        // Once, shortly after launch: the microphone device should be there before a Mac app looks for it.
+        if !soundOutputsRead { soundOutputsRead = true; refreshSoundOutputs() }
         refreshPermissions()
         checkForUpdate()
         if allowInput && !inputAllowed && capture != nil { input.releaseAll(); displayController.restore(reason: "remote input permission lost") }

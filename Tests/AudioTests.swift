@@ -187,4 +187,29 @@ final class AudioTests: XCTestCase {
         XCTAssertNotNil(failure)
         playback.stop(); playback.drain()
     }
+
+    func testTheLoopbackDeviceCanBeListedUnderSkyDesksName() throws {
+        guard let loopback = SoundOutputs.microphoneTarget(saved: nil, among: SoundOutputs.all()) else { throw XCTSkip("No loopback sound device here.") }
+        // Its own name and identifier, so a running SkyDesk Host's device is left alone.
+        let alias = MicrophoneAlias(name: "SkyDesk Microphone (test)", uid: "com.skylar.skydesk.microphone.test")
+        defer { alias.remove() }
+        let input = SoundOutputs.defaultDevice(input: true), output = SoundOutputs.defaultDevice(input: false)
+        XCTAssertTrue(alias.update(target: loopback))
+        let made = try XCTUnwrap(alias.device)
+        XCTAssertEqual(SoundOutputs.name(made), "SkyDesk Microphone (test)")
+        XCTAssertGreaterThan(SoundOutputs.inputChannels(made), 0, "Mac apps must be able to record from it")
+        // The Mac keeps using the microphone and speakers it used before.
+        XCTAssertEqual(SoundOutputs.defaultDevice(input: true), input); XCTAssertEqual(SoundOutputs.defaultDevice(input: false), output)
+        // It is not offered as a place to play the microphone into, and asking again changes nothing.
+        XCTAssertFalse(SoundOutputs.all().contains { $0.uid == alias.uid })
+        XCTAssertTrue(alias.update(target: loopback)); XCTAssertEqual(alias.device, made)
+        // One left behind by an earlier run is replaced, not doubled.
+        let later = MicrophoneAlias(name: alias.name, uid: alias.uid)
+        XCTAssertTrue(later.update(target: loopback))
+        XCTAssertEqual(SoundOutputs.identifiers().filter { $0.uid == alias.uid }.count, 1)
+        // A pair of speakers never gets a microphone's name, and the name goes when the microphone is switched off.
+        XCTAssertFalse(later.update(target: SoundOutput(id: output, uid: "speakers", name: "MacBook Pro Speakers")))
+        XCTAssertNil(later.device)
+        XCTAssertTrue(later.update(target: loopback)); XCTAssertFalse(later.update(target: nil)); XCTAssertNil(alias.device)
+    }
 }

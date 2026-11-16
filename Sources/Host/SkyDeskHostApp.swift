@@ -504,7 +504,7 @@ private struct HostView: View {
                         Text(host.soundOutputs.first(where: { SoundOutputs.isLoopback($0.name) }).map { "Automatic (\($0.name))" } ?? "Automatic (no loopback device found)").tag("")
                         ForEach(host.soundOutputs) { Text($0.name).tag($0.uid) }
                     }
-                    Text(host.microphoneTarget.map { "In the Mac app that should hear you, choose “\($0.name)” as the microphone. The iPad decides when its microphone is on." }
+                    Text(host.microphoneTarget.map { "In the Mac app that should hear you, choose “\(host.microphoneName ?? $0.name)” as the microphone. The iPad decides when its microphone is on." }
                          ?? "This needs a loopback sound device, such as the free BlackHole: what is played into it comes out as a microphone for Mac apps.")
                         .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 }

@@ -31,7 +31,7 @@ Not yet confirmed on real hardware, even in the installed builds:
 - that the Mac's speakers really are silent while the iPad plays its sound (the log says the Mac asked for that; nobody has yet confirmed it by ear);
 - pinch and rotate actually reaching Mac apps (a unit test shows AppKit reads the injected events as magnify and rotate events, nothing more).
 
-`swift test` runs 177 tests with no failures (last run 2026-11-15 on the build 50 sources). Tests use the Mac's hardware encoder and loopback connections; they never capture the screen.
+`swift test` runs 178 tests with no failures (last run 2026-11-15 on the build 50 sources). Tests use the Mac's hardware encoder and loopback connections; they never capture the screen.
 
 ## Requirements
 
@@ -229,7 +229,9 @@ A small readout in the bottom-right corner is always shown: received bitrate, th
 
 The iPad keeps a little sound in hand (a cushion, 30 ms to start with) so uneven arrival does not break it up; when it runs dry the cushion is rebuilt slightly larger, and a backlog far above it is thrown away. Since build 46 "in hand" is read from the player's own clock (scheduled, not yet taken by the output) and the cushion is sized to how much the iPad's output takes at once, which iPadOS decides. Before that, sound counted as in hand until it had been heard, which includes the whole way to the speaker: running dry went unnoticed and sound merely on its way looked like a backlog. Both sides now log sound once a second. The iPad's line ends with `snd=` packets arrived, `gap=` longest wait between two (ms; they are sent 10 ms apart), `under=` times it ran dry, `flush=` backlogs thrown away, `reb=` engine rebuilds, `int=` interruptions, `wait=`/`cush=` sound in hand and the cushion (ms), `io=` how much the output takes at once (ms), `lat=` its delay to the speaker (ms), `out=` the output in use. The Mac's line ends with packets sent, capture buffers dropped, and the longest wait between two capture buffers.
 
-**Microphone (build 50).** macOS has no way for an app to be a microphone; that takes a sound driver. A loopback device is such a driver (BlackHole is a free one): what is played into it comes out of it as a microphone. With "Let the iPad send its microphone to this Mac" on (the default) and such a device present, the iPad offers **More › Send iPad microphone to Mac**. It is off at the start of every session and has to be switched on each time. The iPad then records its own microphone, sends it as one channel of Opus on a fifth connection, and the Mac plays it into the device chosen under "Play it into" (by default the first loopback device). In the Mac app that should hear you, choose that device as the microphone; the iPad names it when the microphone is switched on.
+**Microphone (build 50).** macOS has no way for an app to be a microphone; that takes a sound driver. A loopback device is such a driver (BlackHole is a free one): what is played into it comes out of it as a microphone. With "Let the iPad send its microphone to this Mac" on (the default) and such a device present, the iPad offers **More › Send iPad microphone to Mac**. It is off at the start of every session and has to be switched on each time. The iPad then records its own microphone, sends it as one channel of Opus on a fifth connection, and the Mac plays it into the device chosen under "Play it into" (by default the first loopback device). In the Mac app that should hear you, choose **SkyDesk Microphone**; the iPad names it when the microphone is switched on.
+
+"SkyDesk Microphone" is the loopback device under SkyDesk's own name, so it is easy to find in a list (it is an aggregate device with the loopback device as its only member; no driver is installed, and the loopback device stays listed under its own name too). The host makes it shortly after launch while the microphone is allowed and a loopback device is the target, and removes it when the microphone is switched off. macOS keeps it listed after the host quits, so a Mac app's choice survives SkyDesk restarting; it is then simply silent.
 
 - The iPad's built-in microphone is used even with Bluetooth headphones connected, on purpose: using the headphones' microphone switches them to their headset mode, and everything played through them then sounds like a phone call.
 - Without headphones the iPad's microphone also hears the Mac's sound coming out of the iPad's speaker, and whoever is listening on the Mac hears it back. There is no echo cancelling.
@@ -387,7 +389,7 @@ That refusal happens after the handshake because it cannot happen in it: Apple's
 ## Tests and checks
 
 ```sh
-swift test                                  # 177 tests at build 50 (about 30 s; several open loopback sockets) (about 20 s; a few open loopback sockets)
+swift test                                  # 178 tests at build 50 (about 30 s; several open loopback sockets) (about 20 s; a few open loopback sockets)
 swift run skydesk-check --frames 120        # synthetic frames, hardware HEVC, encrypted loopback
 swift run skydesk-check --width 1920 --height 1200 --frames 240 --low-latency
 ```

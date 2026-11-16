@@ -37,8 +37,30 @@ public enum SoundOutputs {
             return SoundOutput(id: id, uid: uid, name: name)
         }
     }
-    private static func outputChannels(_ id: AudioDeviceID) -> Int {
-        var address = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyStreamConfiguration, mScope: kAudioDevicePropertyScopeOutput,
+    private static func outputChannels(_ id: AudioDeviceID) -> Int { channels(id, scope: kAudioDevicePropertyScopeOutput) }
+    static func inputChannels(_ id: AudioDeviceID) -> Int { channels(id, scope: kAudioDevicePropertyScopeInput) }
+    /// Every sound device's number and identifier, whatever it is for.
+    static func identifiers() -> [(id: AudioDeviceID, uid: String)] {
+        var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDevices, mScope: kAudioObjectPropertyScopeGlobal,
+                                                 mElement: kAudioObjectPropertyElementMain)
+        var size: UInt32 = 0
+        let system = AudioObjectID(kAudioObjectSystemObject)
+        guard AudioObjectGetPropertyDataSize(system, &address, 0, nil, &size) == noErr, size > 0 else { return [] }
+        var ids = [AudioDeviceID](repeating: 0, count: Int(size) / MemoryLayout<AudioDeviceID>.size)
+        guard AudioObjectGetPropertyData(system, &address, 0, nil, &size, &ids) == noErr else { return [] }
+        return ids.compactMap { id in text(id, kAudioDevicePropertyDeviceUID).map { (id, $0) } }
+    }
+    static func name(_ id: AudioDeviceID) -> String? { text(id, kAudioObjectPropertyName) }
+    /// The Mac's current default input or output device.
+    static func defaultDevice(input: Bool) -> AudioDeviceID {
+        var address = AudioObjectPropertyAddress(mSelector: input ? kAudioHardwarePropertyDefaultInputDevice : kAudioHardwarePropertyDefaultOutputDevice,
+                                                 mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        var device = AudioDeviceID(kAudioObjectUnknown); var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &device)
+        return device
+    }
+    private static func channels(_ id: AudioDeviceID, scope: AudioObjectPropertyScope) -> Int {
+        var address = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyStreamConfiguration, mScope: scope,
                                                  mElement: kAudioObjectPropertyElementMain)
         var size: UInt32 = 0
         guard AudioObjectGetPropertyDataSize(id, &address, 0, nil, &size) == noErr, size > 0 else { return 0 }
@@ -54,6 +76,62 @@ public enum SoundOutputs {
         var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
         guard AudioObjectGetPropertyData(id, &address, 0, nil, &size, &value) == noErr, let value else { return nil }
         return value.takeRetainedValue() as String
+    }
+}
+
+/// The loopback device under SkyDesk's own name (user request 2026-11-15: "can u make it named SkyDesk so i can
+/// see it easier"). Mac apps list it as "SkyDesk Microphone" beside "BlackHole 2ch"; both are the same sound.
+///
+/// It is an aggregate device with the loopback device as its only member, which any app may create; no driver
+/// is installed. macOS keeps it after the app that made it has quit (checked: it was still listed, and another
+/// process could remove it), so an app's microphone choice survives SkyDesk restarting, and a leftover one is
+/// taken over or replaced here.
+public final class MicrophoneAlias {
+    public let name: String
+    public let uid: String
+    private var member: String?
+    public init(name: String = "SkyDesk Microphone", uid: String = "com.skylar.skydesk.microphone") { self.name = name; self.uid = uid }
+    /// The alias as it stands now, if there is one.
+    public var device: AudioDeviceID? { SoundOutputs.identifiers().first { $0.uid == uid }?.id }
+    /// Makes the alias stand for `target`, or removes it (nil, or a device that is not a loopback device: giving a
+    /// pair of speakers a microphone's name would be a lie). Returns whether the alias exists afterwards.
+    @discardableResult
+    public func update(target: SoundOutput?) -> Bool {
+        guard let target, SoundOutputs.isLoopback(target.name), SoundOutputs.inputChannels(target.id) > 0 else { remove(); return false }
+        if member == target.uid, device != nil { return true }
+        // One left by an earlier run may stand for another device; start again rather than guess.
+        remove()
+        let composition: [String: Any] = [
+            kAudioAggregateDeviceNameKey: name,
+            kAudioAggregateDeviceUIDKey: uid,
+            kAudioAggregateDeviceMainSubDeviceKey: target.uid,
+            kAudioAggregateDeviceIsPrivateKey: false,
+            kAudioAggregateDeviceIsStackedKey: false,
+            kAudioAggregateDeviceSubDeviceListKey: [[kAudioSubDeviceUIDKey: target.uid]]
+        ]
+        // Making a device must not change which microphone or speakers the Mac uses by default.
+        let input = SoundOutputs.defaultDevice(input: true), output = SoundOutputs.defaultDevice(input: false)
+        var made = AudioObjectID(kAudioObjectUnknown)
+        guard AudioHardwareCreateAggregateDevice(composition as CFDictionary, &made) == noErr else { member = nil; return false }
+        member = target.uid
+        Self.restoreDefault(input: true, to: input, unless: made)
+        Self.restoreDefault(input: false, to: output, unless: made)
+        return true
+    }
+    public func remove() {
+        member = nil
+        let stale = SoundOutputs.identifiers().filter { $0.uid == uid }
+        guard !stale.isEmpty else { return }
+        for entry in stale { AudioHardwareDestroyAggregateDevice(entry.id) }
+        // The list of devices follows a moment later; a new one under the same identifier must wait for that.
+        for _ in 0..<40 where device != nil { usleep(25_000) }
+    }
+    private static func restoreDefault(input: Bool, to before: AudioDeviceID, unless made: AudioDeviceID) {
+        guard before != kAudioObjectUnknown, SoundOutputs.defaultDevice(input: input) == made else { return }
+        var address = AudioObjectPropertyAddress(mSelector: input ? kAudioHardwarePropertyDefaultInputDevice : kAudioHardwarePropertyDefaultOutputDevice,
+                                                 mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        var device = before
+        AudioObjectSetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, UInt32(MemoryLayout<AudioDeviceID>.size), &device)
     }
 }
 
