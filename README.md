@@ -2,7 +2,7 @@
 
 A native Apple remote desktop for one person's own devices. **SkyDesk Host** runs in the Mac's menu bar, captures a display and streams it as hardware-encoded HEVC. **SkyDesk** on the iPad decodes it in hardware, draws it with Metal and sends back keyboard, trackpad, touch and gesture input. The same link carries clipboard text, files in both directions, the Mac's sound, and updates of both apps. The two devices talk to each other directly: there is no account, relay or server.
 
-Source: [github.com/Skytheredhead/SkyDesk](https://github.com/Skytheredhead/SkyDesk). The project has no licence file yet, so the default copyright rules apply to the code.
+Source: [github.com/skylarenns/SkyDesk](https://github.com/skylarenns/SkyDesk). The project has no licence file yet, so the default copyright rules apply to the code.
 
 This file describes the code at **build 58** (`CURRENT_PROJECT_VERSION` in `project.yml`). [VERIFICATION.md](VERIFICATION.md) is the dated record of the first builds and does not describe the current state.
 
@@ -52,7 +52,7 @@ Not yet confirmed on real hardware, even in the installed builds:
 ## Build and first install
 
 ```sh
-git clone https://github.com/Skytheredhead/SkyDesk.git
+git clone https://github.com/skylarenns/SkyDesk.git
 cd SkyDesk
 ```
 
