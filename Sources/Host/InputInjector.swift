@@ -48,9 +48,9 @@ final class InputInjector {
             // The same for the other three edges (build 43): a move that stays on an edge is a push against it, which
             // is what a real mouse held there reports and what edge-triggered things on the Mac wait for.
             if input.kind == .move, displayBounds.contains(previous) {
-                if input.x <= Self.onEdge, previous.x <= displayBounds.minX + 1 { location.x = displayBounds.minX; delta.x = min(delta.x, -8); notePush("left") }
-                if input.x >= 1 - Self.onEdge, previous.x >= displayBounds.maxX - 2 { location.x = displayBounds.maxX - 1; delta.x = max(delta.x, 8); notePush("right") }
-                if input.y <= Self.onEdge, previous.y <= displayBounds.minY + 1 { location.y = displayBounds.minY; delta.y = min(delta.y, -8); notePush("top") }
+                if input.x <= Self.onEdge, previous.x <= displayBounds.minX + 1 { location.x = displayBounds.minX; delta.x = min(delta.x, -8); notePush("left", input) }
+                if input.x >= 1 - Self.onEdge, previous.x >= displayBounds.maxX - 2 { location.x = displayBounds.maxX - 1; delta.x = max(delta.x, 8); notePush("right", input) }
+                if input.y <= Self.onEdge, previous.y <= displayBounds.minY + 1 { location.y = displayBounds.minY; delta.y = min(delta.y, -8); notePush("top", input) }
             }
             postPointer(input, delta: delta, flags: flags)
         case .scroll:
@@ -152,11 +152,11 @@ final class InputInjector {
     static let onEdge = 0.0005
     private var lastPushNote = 0.0
     /// For the log, at most once every five seconds: proof that the iPad's pointer really reached an edge.
-    private func notePush(_ edge: String) {
+    private func notePush(_ edge: String, _ input: InputEvent) {
         let now = CACurrentMediaTime()
         guard now - lastPushNote >= 5 else { return }
         lastPushNote = now
-        MetricsLog.shared.append("host  pointer pushed against the \(edge) edge")
+        MetricsLog.shared.append(String(format: "host  pointer pushed against the %@ edge (at %.3f, %.3f of the desktop)", edge, input.x, input.y))
     }
     /// Normalised y at or below which a pointer move counts as resting on the bottom edge (about 5 points).
     static let bottomEdge = 0.995

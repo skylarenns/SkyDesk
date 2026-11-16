@@ -65,6 +65,13 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
     private var mouseObservers: [NSObjectProtocol] = []
     private var lastDeviceMove: CFTimeInterval = 0
     private var lastHover: CGPoint?
+    /// Where the hovering pointer last really was (build 61). When the pointer rests, iPadOS hides it and ends the
+    /// hover, and the location reported with that end was not where the pointer had been: the Mac's pointer was
+    /// pushed into the top-left corner while the iPad's sat still mid-screen, which pulled down the menu bar of a
+    /// full-screen app (user report 2026-11-16; the log showed "pushed against the left/top edge" every few seconds).
+    private var hoverAt: CGPoint?
+    /// For the log: hovers ended, and the furthest an end's reported location was from the real last position.
+    private var hoverEnds = 0, hoverEndJump = 0.0
     private var deviceButtons: Set<Int> = []
     /// Scrolling may reach the app from the gesture recognisers, from the mouse itself, or from both at once;
     /// whichever reports first during a capture keeps it, so nothing scrolls twice.
@@ -244,8 +251,8 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
     /// For the diagnostic log: the display link's real rate, and how drawing on arrival is going.
     var gpuSeconds: Double? { renderer?.gpuSeconds }
     var drawNote: String {
-        String(format: "hz=%.0f early=%d/%d margin=%.1f dragfix=%.1f/%d", refreshHz, pacer.hits, pacer.misses, pacer.margin * 1_000,
-               dragStartError, dragStarts)
+        String(format: "hz=%.0f early=%d/%d margin=%.1f dragfix=%.1f/%d hoverend=%d/%.0f", refreshHz, pacer.hits, pacer.misses, pacer.margin * 1_000,
+               dragStartError, dragStarts, hoverEnds, hoverEndJump)
     }
     /// A frame finished decoding. If nothing has been drawn for the coming refresh and there is still time to
     /// make it, draw now; otherwise the next tick takes it, as before.
@@ -370,6 +377,14 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
             capturedMove(dx: location.x - last.x, dy: location.y - last.y)
             return
         }
+        if leaving {
+            // Only the last real position counts, and only a pointer that was already near an edge left through it.
+            hoverEnds += 1
+            if let last = hoverAt { hoverEndJump = max(hoverEndJump, hypot(location.x - last.x, location.y - last.y)) }
+            guard let last = hoverAt else { moveCursor(to: nil); pushAgainstEdge(nil); return }
+            hoverAt = nil
+            location = last
+        } else { hoverAt = location }
         // Near an edge of the Mac desktop the pointer counts as on it; a pointer that leaves the picture close to
         // an edge went out through that edge. (Not under the toolbar, which is not part of the desktop.)
         var onEdge = false
