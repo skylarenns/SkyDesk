@@ -71,6 +71,12 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
     private var scrollOwner = ScrollOwner.undecided
     private weak var dragRecognizer: UIPanGestureRecognizer?
     private var dragFromPointer = false
+    /// Where the finger or pointer went down for the drag now being recognised (build 56). The pan recogniser
+    /// starts only after some movement, and the start worked out from its translation came out about one
+    /// character along in text (user report 2026-11-16: "always a character off" when selecting).
+    private var dragTouchDown: CGPoint?
+    /// For the log: how far the old estimate of the start was from the real one, last drag and how many drags.
+    private var dragStartError = 0.0, dragStarts = 0
     private var swallowedKeys: Set<Int> = []
     private var gestureSteps = GestureSteps()
     private var activeGestures: Set<GestureEvent.Kind> = []
@@ -236,7 +242,8 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
     private var refreshHz = 0.0
     /// For the diagnostic log: the display link's real rate, and how drawing on arrival is going.
     var drawNote: String {
-        String(format: "hz=%.0f early=%d/%d margin=%.1f", refreshHz, pacer.hits, pacer.misses, pacer.margin * 1_000)
+        String(format: "hz=%.0f early=%d/%d margin=%.1f dragfix=%.1f/%d", refreshHz, pacer.hits, pacer.misses, pacer.margin * 1_000,
+               dragStartError, dragStarts)
     }
     /// A frame finished decoding. If nothing has been drawn for the coming refresh and there is still time to
     /// make it, draw now; otherwise the next tick takes it, as before.
@@ -421,8 +428,12 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
         case .began:
             if !keyboard.isFirstResponder { becomeFirstResponder() }
             let translation = recognizer.translation(in: self)
+            let estimate = CGPoint(x: location.x - translation.x, y: location.y - translation.y)
+            let start = dragTouchDown ?? estimate
+            dragTouchDown = nil
+            dragStartError = hypot(start.x - estimate.x, start.y - estimate.y); dragStarts += 1
             // The press happened where the drag began, and counts as on an edge exactly when the hovering pointer did.
-            guard let p = point(pressLocation(CGPoint(x: location.x - translation.x, y: location.y - translation.y))) else { return }
+            guard let p = point(pressLocation(start)) else { return }
             pushAgainstEdge(nil)
             dragActive = true; pointer(.down, at: p)
         case .changed:
@@ -605,7 +616,7 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
         let fromPointer = touch.type == .indirectPointer
         // Held by iPadOS, the mouse reports its own buttons (deviceButton); these would be the same clicks again.
         if captured, pointerLocked, fromPointer { return false }
-        if gestureRecognizer === dragRecognizer { dragFromPointer = fromPointer }
+        if gestureRecognizer === dragRecognizer { dragFromPointer = fromPointer; dragTouchDown = touch.location(in: self) }
         return true
     }
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
