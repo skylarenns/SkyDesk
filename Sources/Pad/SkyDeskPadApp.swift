@@ -482,8 +482,7 @@ private struct StreamView: View {
                             Toggle("Detailed statistics", isOn: $client.showTimingDetails)
                             Toggle("Sharpen text", isOn: $client.sharpenText)
                             Toggle("Sharper colour (4:4:4, more data)", isOn: $client.sharperColour)
-                            Toggle("Low-delay display (experimental)", isOn: $client.lowDelayDisplay)
-                            Toggle("Show frames sooner (less delay)", isOn: $client.presentOnArrival).disabled(client.lowDelayDisplay)
+                            Toggle("Show frames sooner (less delay)", isOn: $client.presentOnArrival)
                             Toggle("Video over UDP (faster recovery)", isOn: $client.datagramVideo)
                             Toggle("Use USB cable when plugged in", isOn: $client.preferCable)
                             Section("SkyDesk build \(ClientModel.ownBuild)") { EmptyView() }
