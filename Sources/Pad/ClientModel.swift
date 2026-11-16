@@ -1,3 +1,4 @@
+import AVFoundation
 import SwiftUI
 import Network
 import UIKit
@@ -272,6 +273,34 @@ final class ClientModel: ObservableObject {
     var drawGPUSeconds: (() -> Double?)?
     private var gpu = CPUMeter()
     private var audioPlayer: AudioPlayer?
+    /// The iPad's volume as iPadOS reports it (build 62, user report 2026-11-16: "I turn it down and it turns
+    /// itself back up", also with SkyDesk not in front). Every change is logged with SkyDesk's state at the time.
+    private var volumeWatch: NSKeyValueObservation?
+    private var volumeLog: [String] = []
+    private func watchVolume() {
+        guard volumeWatch == nil else { return }
+        let session = AVAudioSession.sharedInstance()
+        noteVolume(session.outputVolume, why: "start")
+        volumeWatch = session.observe(\.outputVolume, options: [.new]) { [weak self] _, change in
+            guard let value = change.newValue else { return }
+            DispatchQueue.main.async { self?.noteVolume(value, why: "change") }
+        }
+    }
+    private func noteVolume(_ value: Float, why: String) {
+        let app: String
+        switch UIApplication.shared.applicationState {
+        case .active: app = "front"
+        case .inactive: app = "inactive"
+        default: app = "background"
+        }
+        let line = String(format: "volume %@ %.2f app=%@ sound=%@ ", why, value, app, audioPlayer == nil ? "off" : "on") + PadAudioSession.state
+        // Sent now when connected; kept (the last 20) and sent on the next connection otherwise.
+        if let control, (info?.features ?? 0) & StreamFeature.clientStatsLog != 0 { control.send(.clientStats(line)) }
+        else { volumeLog.append(Self.clock() + " " + line); if volumeLog.count > 20 { volumeLog.removeFirst() } }
+    }
+    private static func clock() -> String {
+        let formatter = DateFormatter(); formatter.dateFormat = "HH:mm:ss"; return formatter.string(from: Date())
+    }
     /// Newest first.
     @Published var transfers: [FileTransferEngine.Progress] = []
     @Published var filesReady = false
@@ -649,7 +678,12 @@ final class ClientModel: ObservableObject {
                     try info.validate()
                     self.info = info; self.connecting = false; self.status = "Connected"
                     self.sessionStarted = CACurrentMediaTime(); self.drain.reset(); self.cpu.reset(); self.gpu.reset()
-                    if (info.features ?? 0) & StreamFeature.clientStatsLog != 0 { self.control?.send(.clientStats(BatteryMonitor.diagnosis())) }
+                    if (info.features ?? 0) & StreamFeature.clientStatsLog != 0 {
+                        self.control?.send(.clientStats(BatteryMonitor.diagnosis()))
+                        for line in self.volumeLog { self.control?.send(.clientStats("earlier, at " + line)) }
+                        self.volumeLog = []
+                    }
+                    self.watchVolume()
                     self.clearAutoDeadline()
                     if let path = control?.connection.currentPath {
                         switch LinkKind.of(interfaces: path.availableInterfaces.map(\.name), wifi: path.usesInterfaceType(.wifi),

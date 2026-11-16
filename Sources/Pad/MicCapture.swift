@@ -4,6 +4,15 @@ import AVFoundation
 /// Whoever starts or stops says so here, and the session is set up for what is in use at that moment.
 enum PadAudioSession {
     private static let lock = NSLock()
+    /// For the volume log (build 62): how often the session was switched on or off, and its state now.
+    private(set) static var activations = 0, deactivations = 0
+    static var state: String {
+        let session = AVAudioSession.sharedInstance()
+        lock.lock(); defer { lock.unlock() }
+        return "category=\(session.category.rawValue.replacingOccurrences(of: "AVAudioSessionCategory", with: "")) "
+            + "playing=\(playing) recording=\(recording) on=\(activations)/off=\(deactivations) "
+            + "others=\(session.isOtherAudioPlaying) route=\(session.currentRoute.outputs.first?.portType.rawValue ?? "-")"
+    }
     private static var playing = false, recording = false
     static func set(playing: Bool? = nil, recording: Bool? = nil) throws {
         lock.lock(); defer { lock.unlock() }
@@ -11,6 +20,7 @@ enum PadAudioSession {
         if let recording { self.recording = recording }
         let session = AVAudioSession.sharedInstance()
         guard self.playing || self.recording else {
+            deactivations += 1
             try? session.setActive(false, options: [.notifyOthersOnDeactivation]); return
         }
         // Mixes with whatever the iPad itself is playing instead of stopping it. With the microphone on, sound
@@ -22,6 +32,7 @@ enum PadAudioSession {
             try session.setCategory(category, mode: .default, options: options)
         }
         try? session.setPreferredIOBufferDuration(0.005)
+        activations += 1
         try session.setActive(true)
     }
 }
