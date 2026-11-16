@@ -2,6 +2,8 @@
 
 A native Apple remote desktop for one person's own devices. **SkyDesk Host** runs in the Mac's menu bar, captures a display and streams it as hardware-encoded HEVC. **SkyDesk** on the iPad decodes it in hardware, draws it with Metal and sends back keyboard, trackpad, touch and gesture input. The same link carries clipboard text, files in both directions, the Mac's sound, and updates of both apps. The two devices talk to each other directly: there is no account, relay or server.
 
+Source: [github.com/Skytheredhead/SkyDesk](https://github.com/Skytheredhead/SkyDesk). The project has no licence file yet, so the default copyright rules apply to the code.
+
 This file describes the code at **build 58** (`CURRENT_PROJECT_VERSION` in `project.yml`). [VERIFICATION.md](VERIFICATION.md) is the dated record of the first builds and does not describe the current state.
 
 **No end-to-end performance figure has been measured.** 120 FPS is the default target frame rate, not a verified result. The delays the iPad shows are estimates added up from parts (see [Statistics](#statistics)); nobody has yet filmed an input and its response to check them.
@@ -48,6 +50,11 @@ Not yet confirmed on real hardware, even in the installed builds:
 - Network: the iPad must reach the Mac on TCP **48772**. Video also uses UDP **48772** when it gets through (build 38); if it does not, everything stays on TCP. Updates are served on TCP **48773** for a few minutes at a time.
 
 ## Build and first install
+
+```sh
+git clone https://github.com/Skytheredhead/SkyDesk.git
+cd SkyDesk
+```
 
 ```sh
 ./scripts/build.sh
