@@ -2,7 +2,7 @@
 
 A native Apple remote desktop for one person's own devices. **SkyDesk Host** runs in the Mac's menu bar, captures a display and streams it as hardware-encoded HEVC. **SkyDesk** on the iPad decodes it in hardware, draws it with Metal and sends back keyboard, trackpad, touch and gesture input. The same link carries clipboard text, files in both directions, the Mac's sound, and updates of both apps. The two devices talk to each other directly: there is no account, relay or server.
 
-This file describes the code at **build 52** (`CURRENT_PROJECT_VERSION` in `project.yml`). [VERIFICATION.md](VERIFICATION.md) is the dated record of the first builds and does not describe the current state.
+This file describes the code at **build 55** (`CURRENT_PROJECT_VERSION` in `project.yml`). [VERIFICATION.md](VERIFICATION.md) is the dated record of the first builds and does not describe the current state.
 
 **No end-to-end performance figure has been measured.** 120 FPS is the default target frame rate, not a verified result. The delays the iPad shows are estimates added up from parts (see [Statistics](#statistics)); nobody has yet filmed an input and its response to check them.
 
@@ -27,6 +27,8 @@ This file describes the code at **build 52** (`CURRENT_PROJECT_VERSION` in `proj
 | 50 (microphone: the iPad's microphone is sent to the Mac and played into a loopback sound device, which Mac apps use as their microphone) | Built. The Mac side is unit-tested, including playing into BlackHole on this Mac (silence, so nothing was heard). **The iPad side has not been run**: there is no microphone path in the simulator worth trusting, so capture, the permission prompt and what it does to the sound being played are untried. |
 | 51 (a press near an edge of the desktop lands on the edge, where the hovering pointer was shown, so a window that reaches the edge can be resized from it) | Built. Not run on the real devices; the fault it answers was reported there (the resize arrows showed, the drag moved something else). |
 | 52 (the Mac's keyboard backlight is off while the iPad is its only display, and returns to its level with the Mac's display) | Built. The mechanism was run on this Mac by hand during a live iPad-only session: set to nothing it stayed dark through 20 s of typing from the iPad, and went back to 0.60. The switching inside the host (on entering and leaving iPad only) has not been run. |
+| 53 and 54 | 53 drew video with CAMetalDisplayLink; measured slower on the iPad (local display 23.2 ms against 16.6) and reverted by 54. 54 installed on 2026-11-16. |
+| 55 (toolbar starts folded with the update button kept outside the fold; double-tap glides the toolbar back; a one-time tip after a new install; "Show small stats" in More; the iPad's battery read to 1 % where iPadOS allows; Disconnect's title level with the others; automatic game mouse also needs the pointer held in one place) | Built and unit-tested; staged. The exact battery figure comes from a power-source call iPadOS does not publish: the iPad's log line shows `bat=N/iops` if it works and `/uidevice` (5 % steps) if not. The stricter capture answers a false capture in ordinary use on build 54 (14:18:11, released by itself after 3.5 s) and has not been tried with a game. |
 
 Not yet confirmed on real hardware, even in the installed builds:
 

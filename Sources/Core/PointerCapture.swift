@@ -83,10 +83,22 @@ public struct DeltaCoalescer: Equatable {
 /// app that has taken the mouse holds the pointer in place or puts it back after every movement; in ordinary
 /// use the pointer lands exactly where the last movement sent it. The pointer is given back as soon as it
 /// shows again, or once it has gone where it was put for a while. When in doubt, it is not held.
+///
+/// Since build 55 the pointer must also be found *in one place* while it fails to follow. Build 54 captured for
+/// nothing during ordinary use (2026-11-16 14:18:11, released by itself 3.5 s later): "hidden" says little on
+/// macOS 27 (CGCursorIsVisible reads hidden nearly all the time), and a reading of the pointer's position that
+/// trails the movements by more than a few events also counts as "not where it was put". A trailing reading
+/// moves along with the pointer; a game that holds the mouse keeps putting it back in the same spot.
 public struct PointerHoldDetector: Equatable {
     public private(set) var held = false
     /// Hidden and not following through this many seconds and movements before it counts as held.
-    public static let holdAfter = 0.15, movesNeeded = 6
+    public static let holdAfter = 0.3, movesNeeded = 10
+    /// While suspected, every reading of the pointer must stay this close (points) to the first one.
+    public static let stillRadius = 16.0
+    /// How far the pointer's readings strayed from the first one during the hold just found (for the log).
+    public private(set) var lastWander = 0.0
+    private var anchor: CGPoint?
+    private var wander = 0.0
     /// Showing for this long before it counts as given back (a game may flash it for a frame).
     public static let releaseAfter = 0.2
     /// Or following again through this many movements over this long.
@@ -103,7 +115,8 @@ public struct PointerHoldDetector: Equatable {
     /// Call for every pointer movement from the iPad (`moved`), and on a timer while held (`moved` false).
     /// `followed`: whether the pointer was found where a recent movement had put it; nil when that says nothing
     /// (no movement was asked for, or this is the first). Returns the new state when it changes, otherwise nil.
-    public mutating func note(hidden: Bool, moved: Bool, followed: Bool?, now: Double) -> Bool? {
+    /// `actual`: where the pointer was read before this movement; without it, nothing new counts toward a hold.
+    public mutating func note(hidden: Bool, moved: Bool, followed: Bool?, actual: CGPoint? = nil, now: Double) -> Bool? {
         if held {
             if !hidden {
                 let start = shownSince ?? now; shownSince = start
@@ -117,15 +130,23 @@ public struct PointerHoldDetector: Equatable {
         }
         if moved, followed == true, proven < Self.provenAfter { proven += 1 }
         // One movement that landed where it was sent, or a pointer that shows, ends any suspicion.
-        guard hidden, followed != true else { since = nil; count = 0; return nil }
-        guard moved, followed == false, proven >= Self.provenAfter else { return nil }
+        guard hidden, followed != true else { clearSuspicion(); return nil }
+        guard moved, followed == false, proven >= Self.provenAfter, let actual else { return nil }
+        // Held in place: the readings stay together. One that has moved away starts the count again from there.
+        if let anchor {
+            let distance = hypot(actual.x - anchor.x, actual.y - anchor.y)
+            if distance > Self.stillRadius { clearSuspicion() } else { wander = max(wander, distance) }
+        }
+        if anchor == nil { anchor = actual; wander = 0 }
         let start = since ?? now; since = start; count += 1
         guard count >= Self.movesNeeded, now - start >= Self.holdAfter else { return nil }
-        held = true; since = nil; count = 0; shownSince = nil
+        lastWander = wander
+        held = true; clearSuspicion(); shownSince = nil
         return true
     }
+    private mutating func clearSuspicion() { since = nil; count = 0; anchor = nil; wander = 0 }
     /// Ends a hold; what the session has proven so far is kept.
-    public mutating func reset() { held = false; since = nil; count = 0; shownSince = nil }
+    public mutating func reset() { held = false; clearSuspicion(); shownSince = nil }
 }
 
 /// Mac side: whether the pointer went where it was put. The pointer's position is read just before each new

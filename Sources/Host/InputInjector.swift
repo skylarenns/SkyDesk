@@ -25,7 +25,7 @@ final class InputInjector {
             if input.kind == .down { stopMomentum() }
             // For the automatic capture: was the pointer found where the last movements put it?
             let actual = input.kind == .move && onPointerHeld != nil ? CGEvent(source: nil)?.location : nil
-            if let actual { noteHold(moved: true, followed: following.followed(actual: actual)) }
+            if let actual { noteHold(moved: true, followed: following.followed(actual: actual), actual: actual) }
             defer { if let actual { following.sent(target: location, from: actual) } }
             if input.relative == true {
                 // Captured pointer: movement as distances, clicks wherever the Mac's pointer is (PointerCapture.swift).
@@ -105,11 +105,12 @@ final class InputInjector {
     private var hold = PointerHoldDetector()
     private var following = PointerFollowing()
     private var holdTimer: Timer?
-    private func noteHold(moved: Bool, followed: Bool? = nil) {
+    private func noteHold(moved: Bool, followed: Bool? = nil, actual: CGPoint? = nil) {
         guard let onPointerHeld else { return }
         let hidden = !SkyDeskPointerIsVisible()
-        guard let held = hold.note(hidden: hidden, moved: moved, followed: followed, now: CACurrentMediaTime()) else { return }
-        MetricsLog.shared.append("host  " + (held ? "an app has taken the mouse (pointer hidden and held in place)"
+        guard let held = hold.note(hidden: hidden, moved: moved, followed: followed, actual: actual, now: CACurrentMediaTime()) else { return }
+        let evidence = actual.map { String(format: " at %.0f,%.0f, readings within %.1f pt", $0.x, $0.y, hold.lastWander) } ?? ""
+        MetricsLog.shared.append("host  " + (held ? "an app has taken the mouse (pointer hidden and held in place\(evidence))"
                                                   : "the app gave the mouse back (" + (hidden ? "the pointer goes where it is put again" : "pointer showing") + ")"))
         holdTimer?.invalidate(); holdTimer = nil
         if held {

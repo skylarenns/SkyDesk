@@ -287,6 +287,18 @@ final class ClientModel: ObservableObject {
     @Published var showStats = UserDefaults.standard.object(forKey: "showStats") as? Bool ?? true {
         didSet { UserDefaults.standard.set(showStats, forKey: "showStats") }
     }
+    /// The bitrate and delay figures in the bottom-right corner (build 55: can be hidden from More).
+    @Published var showSmallStats = UserDefaults.standard.object(forKey: "showSmallStats") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(showSmallStats, forKey: "showSmallStats") }
+    }
+    /// "Double-tap the bar to put it back" is shown once, in the first session after a new install (not after an
+    /// update: an install that has run before has `lastRunBuild` set).
+    @Published var showRecenterTip = UserDefaults.standard.bool(forKey: ClientModel.recenterTipKey)
+    static let recenterTipKey = "recenterTipPending"
+    func recenterTipSeen() {
+        showRecenterTip = false
+        UserDefaults.standard.set(false, forKey: Self.recenterTipKey)
+    }
     @Published var macDisplayBlanked = false
     @Published var changingMacDisplay = false
     @Published var networkSymbol = "network"
@@ -322,6 +334,9 @@ final class ClientModel: ObservableObject {
     private var probe: AddressProbe?
 
     init() {
+        // Read the install's history first: on a new install this marks the one-time tip as due.
+        _ = Self.launchedNewBuild
+        showRecenterTip = UserDefaults.standard.bool(forKey: Self.recenterTipKey)
         if recents.entries.isEmpty { manualHost = UserDefaults.standard.string(forKey: "lastManualHost") ?? "" }
     }
 
@@ -523,6 +538,7 @@ final class ClientModel: ObservableObject {
     private static let launchedNewBuild: Bool = {
         let last = UserDefaults.standard.integer(forKey: "lastRunBuild")
         UserDefaults.standard.set(ClientModel.ownBuild, forKey: "lastRunBuild")
+        if last == 0 { UserDefaults.standard.set(true, forKey: recenterTipKey) }
         return last != 0 && last != ClientModel.ownBuild
     }()
     private var justUpdated = ClientModel.launchedNewBuild
@@ -1360,7 +1376,8 @@ final class ClientModel: ObservableObject {
             let note = drawNote?() ?? ""
             control?.send(.clientStats(StatisticsText.logLine(values, link: usingCable ? "cable" : usingVPN ? "vpn" : networkSymbol)
                                        + " video=" + videoPath + (videoOrder.map { " rebuilt=\($0.rebuilt)" } ?? "") + (note.isEmpty ? "" : " " + note)
-                                       + (audioPlayer.map { " " + $0.statisticsText() } ?? "")))
+                                       + (audioPlayer.map { " " + $0.statisticsText() } ?? "")
+                                       + " bat=" + (BatteryMonitor.shared.percent.map(String.init) ?? "-") + "/" + BatteryMonitor.shared.source))
         }
         #if targetEnvironment(simulator)
         stats.metrics = "SIMULATOR (GPU completion only) · " + stats.metrics

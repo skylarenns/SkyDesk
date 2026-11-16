@@ -62,9 +62,15 @@ final class PointerCaptureTests: XCTestCase {
         for step in 0..<PointerHoldDetector.provenAfter { XCTAssertNil(mac.note(hidden: false, moved: true, followed: true, now: -5 + Double(step) * 0.008)) }
         // Moves 8 ms apart, pointer hidden, and each time found somewhere other than where it was sent.
         var changes: [(Double, Bool)] = []
-        for step in 0..<40 { let now = Double(step) * 0.008; if let held = mac.note(hidden: true, moved: true, followed: false, now: now) { changes.append((now, held)) } }
+        // The game puts it back in the middle of its window each time (a point or two either way).
+        let middle = CGPoint(x: 688, y: 516)
+        for step in 0..<40 {
+            let now = Double(step) * 0.008
+            let actual = CGPoint(x: middle.x + Double(step % 3), y: middle.y - Double(step % 2))
+            if let held = mac.note(hidden: true, moved: true, followed: false, actual: actual, now: now) { changes.append((now, held)) }
+        }
         XCTAssertEqual(changes.count, 1); XCTAssertEqual(changes.first?.1, true)
-        XCTAssertEqual(changes.first?.0 ?? 0, 0.152, accuracy: 0.001)
+        XCTAssertEqual(changes.first?.0 ?? 0, 0.304, accuracy: 0.001)
         // Given back once the pointer has been showing for a fifth of a second, movement or not; one flash does not count.
         XCTAssertNil(mac.note(hidden: false, moved: false, followed: nil, now: 1.00))
         XCTAssertNil(mac.note(hidden: true, moved: false, followed: nil, now: 1.05))
@@ -88,11 +94,25 @@ final class PointerCaptureTests: XCTestCase {
         for step in 0..<500 { XCTAssertNil(mac.note(hidden: false, moved: true, followed: false, now: 90 + Double(step) * 0.008)) }
         XCTAssertFalse(mac.held)
     }
+    func testAPositionReadingThatTrailsTheMovementIsNotAHold() {
+        // Build 54, 2026-11-16 14:18:11: ordinary use, pointer read as hidden, and its position read back behind
+        // the movements, so none of the readings matched where it had been sent. The readings still moved along
+        // with the pointer, which a game holding the mouse never lets happen.
+        var mac = PointerHoldDetector()
+        for step in 0..<PointerHoldDetector.provenAfter { _ = mac.note(hidden: true, moved: true, followed: true, actual: .zero, now: -1 + Double(step) * 0.008) }
+        for step in 0..<2_000 {
+            let actual = CGPoint(x: 200 + Double(step % 400) * 3, y: 300 + Double(step % 200))
+            XCTAssertNil(mac.note(hidden: true, moved: true, followed: false, actual: actual, now: Double(step) * 0.008))
+        }
+        // Without a position reading nothing counts toward a hold either.
+        for step in 0..<500 { XCTAssertNil(mac.note(hidden: true, moved: true, followed: false, now: 20 + Double(step) * 0.008)) }
+        XCTAssertFalse(mac.held)
+    }
     func testAHeldPointerThatStartsGoingWhereItIsPutIsGivenBackEvenIfStillHidden() {
         // A wrong capture must undo itself: the pointer follows again, so the hold ends without waiting for it to show.
         var mac = PointerHoldDetector()
         for step in 0..<PointerHoldDetector.provenAfter { _ = mac.note(hidden: false, moved: true, followed: true, now: -1 + Double(step) * 0.008) }
-        for step in 0..<30 { _ = mac.note(hidden: true, moved: true, followed: false, now: Double(step) * 0.008) }
+        for step in 0..<40 { _ = mac.note(hidden: true, moved: true, followed: false, actual: CGPoint(x: 688, y: 516), now: Double(step) * 0.008) }
         XCTAssertTrue(mac.held)
         var released: Double?
         for step in 0..<100 where released == nil {
@@ -101,7 +121,7 @@ final class PointerCaptureTests: XCTestCase {
         }
         XCTAssertEqual(released ?? 0, 1.304, accuracy: 0.001)
         // While the game keeps putting it back, it stays held.
-        for step in 0..<30 { _ = mac.note(hidden: true, moved: true, followed: false, now: 3 + Double(step) * 0.008) }
+        for step in 0..<40 { _ = mac.note(hidden: true, moved: true, followed: false, actual: CGPoint(x: 688, y: 516), now: 3 + Double(step) * 0.008) }
         XCTAssertTrue(mac.held)
         for step in 0..<1_000 { XCTAssertNil(mac.note(hidden: true, moved: true, followed: step % 9 == 0, now: 4 + Double(step) * 0.008)) }
         XCTAssertTrue(mac.held)

@@ -304,7 +304,8 @@ private struct HostCard: View {
 private struct StreamView: View {
     @ObservedObject var client: ClientModel
     let info: StreamInfo
-    @State private var expanded = true
+    /// Starts folded (build 55): only the clock, network, battery and, when there is one, the update button.
+    @State private var expanded = false
     @State private var controlsFrame = CGRect.zero
     @State private var containerSize = CGSize.zero
     @State private var pickingFiles = false
@@ -313,6 +314,9 @@ private struct StreamView: View {
     /// Where the user dragged the toolbar to; double-tap (or double-click) puts it back.
     @AppStorage("toolbarOffsetX") private var savedX = 0.0
     @AppStorage("toolbarOffsetY") private var savedY = 0.0
+    /// The position actually drawn. A change to @AppStorage reaches the view outside the animation that made it,
+    /// so the double-tap used to jump straight back (user report, build 54); this copy animates, and is saved.
+    @State private var offset: CGSize?
     @GestureState private var dragging = CGSize.zero
     var body: some View {
         ZStack(alignment: .top) {
@@ -324,14 +328,15 @@ private struct StreamView: View {
                         Color.clear.preference(key: ControlsFramePreference.self, value: proxy.frame(in: .global))
                     })
                     .gesture(moveToolbar)
-                    .onTapGesture(count: 2) { withAnimation(.snappy) { savedX = 0; savedY = 0 } }
+                    .onTapGesture(count: 2) { recenter() }
+                if client.showRecenterTip { recenterTip }
                 if !activeTransfers.isEmpty { transferList }
                 if client.showStats { stats }
                 if !info.inputEnabled {
                     Text("View only: remote input is off on the Mac").font(.caption).padding(8).background(.thinMaterial, in: Capsule())
                 }
             }
-            .offset(x: savedX + dragging.width, y: savedY + dragging.height)
+            .offset(x: position.width + dragging.width, y: position.height + dragging.height)
             .padding(.top, 8).fixedSize(horizontal: false, vertical: true).zIndex(10)
             if dropTargeted {
                 RoundedRectangle(cornerRadius: 20).stroke(aqua, style: StrokeStyle(lineWidth: 4, dash: [10, 8])).padding(12)
@@ -340,7 +345,7 @@ private struct StreamView: View {
                     .allowsHitTesting(false).zIndex(20)
             }
         }
-        .overlay(alignment: .bottomTrailing) { CornerReadout(stats: client.stats) }
+        .overlay(alignment: .bottomTrailing) { if client.showSmallStats { CornerReadout(stats: client.stats) } }
         .background(GeometryReader { proxy in Color.clear.preference(key: ContainerSizePreference.self, value: proxy.size) })
         .onPreferenceChange(ContainerSizePreference.self) { containerSize = $0 }
         .persistentSystemOverlays(.hidden).ignoresSafeArea(.keyboard)
@@ -352,6 +357,27 @@ private struct StreamView: View {
         .sheet(isPresented: $showingUpdate) { UpdateSheet(client: client) }
     }
 
+    private var position: CGSize { offset ?? CGSize(width: savedX, height: savedY) }
+    private func place(_ value: CGSize) { offset = value; savedX = value.width; savedY = value.height }
+    /// Glides back to the top middle on an ease-in-out curve instead of jumping.
+    private func recenter() {
+        if offset == nil { offset = position }
+        withAnimation(.timingCurve(0.4, 0, 0.2, 1, duration: 0.45)) { offset = .zero }
+        savedX = 0; savedY = 0
+        if client.showRecenterTip { withAnimation(.easeOut(duration: 0.2)) { client.recenterTipSeen() } }
+    }
+    /// Shown once after a new install, under the toolbar; a tap or the first double-tap puts it away.
+    private var recenterTip: some View {
+        Label("Drag the bar to move it. Double-tap or double-click it to bring it back to the middle.", systemImage: "hand.tap")
+            .font(.callout).padding(.horizontal, 14).padding(.vertical, 10)
+            .background(.regularMaterial, in: Capsule())
+            .onTapGesture { withAnimation(.easeOut(duration: 0.2)) { client.recenterTipSeen() } }
+            .task {
+                try? await Task.sleep(nanoseconds: 12_000_000_000)
+                withAnimation(.easeOut(duration: 0.3)) { client.recenterTipSeen() }
+            }
+            .transition(.opacity)
+    }
     /// Drag the toolbar anywhere (finger or iPad pointer); it is kept fully on screen.
     private var moveToolbar: some Gesture {
         DragGesture(minimumDistance: 6, coordinateSpace: .global)
@@ -364,7 +390,7 @@ private struct StreamView: View {
                     if frame.minX < 0 { dx -= frame.minX } else if frame.maxX > containerSize.width { dx -= frame.maxX - containerSize.width }
                     if frame.minY < 0 { dy -= frame.minY } else if frame.maxY > containerSize.height { dy -= frame.maxY - containerSize.height }
                 }
-                savedX += dx; savedY += dy
+                place(CGSize(width: position.width + dx, height: position.height + dy))
             }
     }
     private var activeTransfers: [FileTransferEngine.Progress] {
@@ -405,11 +431,14 @@ private struct StreamView: View {
                 .accessibilityLabel("Drag to move the toolbar. Double-tap to put it back.")
             SessionStatusView(networkSymbol: client.networkSymbol, networkDescription: client.networkDescription)
                 .padding(.horizontal, 8)
-            if expanded {
+            if expanded || client.updateBuild != nil {
                 Divider().frame(height: 28).padding(.horizontal, 4)
-                if client.updateBuild != nil {
-                    ToolButton(title: "Update", icon: "arrow.down.circle.fill", active: true) { showingUpdate = true }
-                }
+            }
+            // Shown folded too, so a waiting update is never hidden behind the chevron.
+            if client.updateBuild != nil {
+                ToolButton(title: "Update", icon: "arrow.down.circle.fill", active: true) { showingUpdate = true }
+            }
+            if expanded {
                 ToolButton(title: client.keyboardWanted ? "Hide keys" : "Keyboard",
                            icon: client.keyboardWanted ? "keyboard.chevron.compact.down" : "keyboard",
                            active: client.keyboardWanted) { client.toggleKeyboard() }
@@ -465,6 +494,7 @@ private struct StreamView: View {
                     }
                     Section {
                         Toggle("Show statistics", isOn: $client.showStats)
+                        Toggle("Show small stats", isOn: $client.showSmallStats)
                         // Settings in a submenu keep More short enough that it never scrolls under the pointer.
                         Menu {
                             Toggle("Start in iPad only mode", isOn: $client.startIPadOnly)
@@ -622,8 +652,9 @@ private struct ToolLabel: View {
     var busy = false
     var body: some View {
         VStack(spacing: 1) {
-            if busy { ProgressView().controlSize(.small).frame(height: 20) }
-            else { Image(systemName: icon).font(.system(size: 17, weight: .medium)) }
+            // One height for every icon: a short symbol (Disconnect's ×) used to lift its title above the others.
+            if busy { ProgressView().controlSize(.small).frame(height: 22) }
+            else { Image(systemName: icon).font(.system(size: 17, weight: .medium)).frame(height: 22) }
             Text(title).font(.system(size: 10, weight: .medium)).lineLimit(1)
         }
         .foregroundStyle(active ? Color.black : Color.primary)
@@ -675,11 +706,10 @@ struct AppMark: View {
 private struct SessionStatusView: View {
     let networkSymbol: String
     let networkDescription: String
-    @State private var battery = UIDevice.current.batteryLevel
-    @State private var charging = UIDevice.current.batteryState == .charging || UIDevice.current.batteryState == .full
+    @ObservedObject private var battery = BatteryMonitor.shared
     private var batterySymbol: String {
-        if charging { return "battery.100percent.bolt" }
-        let level = max(0, min(100, Int((battery * 100).rounded())))
+        if battery.charging { return "battery.100percent.bolt" }
+        let level = max(0, min(100, battery.percent ?? 0))
         return "battery.\(min(100, ((level + 12) / 25) * 25))percent"
     }
     var body: some View {
@@ -692,16 +722,12 @@ private struct SessionStatusView: View {
                 Image(systemName: networkSymbol).accessibilityLabel(networkDescription)
                 HStack(spacing: 3) {
                     Image(systemName: batterySymbol)
-                    Text(battery < 0 ? "—" : "\(Int((battery * 100).rounded()))%")
+                    Text(battery.percent.map { "\($0)%" } ?? "—")
                         .font(.caption.monospacedDigit())
-                }.accessibilityLabel(battery < 0 ? "Battery unavailable" : "Battery \(Int((battery * 100).rounded())) percent")
+                }.accessibilityLabel(battery.percent.map { "Battery \($0) percent" } ?? "Battery unavailable")
             }.fixedSize()
         }
-        .onReceive(NotificationCenter.default.publisher(for: UIDevice.batteryLevelDidChangeNotification)) { _ in
-            battery = UIDevice.current.batteryLevel
-        }
-        .onReceive(NotificationCenter.default.publisher(for: UIDevice.batteryStateDidChangeNotification)) { _ in
-            charging = UIDevice.current.batteryState == .charging || UIDevice.current.batteryState == .full
-        }
+        .onAppear { BatteryMonitor.shared.start() }
+        .onDisappear { BatteryMonitor.shared.stop() }
     }
 }
