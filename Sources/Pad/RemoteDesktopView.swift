@@ -21,6 +21,7 @@ struct RemoteDesktopView: UIViewRepresentable {
         view.sendMomentum = { [weak client] in client?.scrollMomentum($0) }
         view.sendGesture = { [weak client] in client?.gesture($0) }
         client.drawNote = { [weak view] in view?.drawNote ?? "" }
+        client.drawGPUSeconds = { [weak view] in view?.gpuSeconds }
         view.desktopSwipe = { [weak client] in client?.desktopSwipe($0) }
         view.toggleCapture = { [weak client] in client?.toggleGameMouse() }
         return view
@@ -241,6 +242,7 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
     }
     private var refreshHz = 0.0
     /// For the diagnostic log: the display link's real rate, and how drawing on arrival is going.
+    var gpuSeconds: Double? { renderer?.gpuSeconds }
     var drawNote: String {
         String(format: "hz=%.0f early=%d/%d margin=%.1f dragfix=%.1f/%d", refreshHz, pacer.hits, pacer.misses, pacer.margin * 1_000,
                dragStartError, dragStarts)

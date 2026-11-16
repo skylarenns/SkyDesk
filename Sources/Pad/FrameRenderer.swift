@@ -55,6 +55,11 @@ final class FrameRenderer: NSObject, MTKViewDelegate {
     private var keyboardFraction: CGFloat = 0
     private var focusRect: CGRect?
     private let inFlight = DispatchSemaphore(value: 2)
+    /// GPU time spent on this renderer's command buffers so far, in seconds (build 60). Written on Metal's
+    /// completion thread, read on the main thread.
+    private let gpuLock = NSLock()
+    private var gpuTotal = 0.0
+    var gpuSeconds: Double { gpuLock.withLock { gpuTotal } }
     /// Counts frames handed to the display; the view compares it before and after a draw.
     private(set) var submitted = 0
     /// Set just before a draw to learn when that frame reaches the screen (host clock, seconds). Used once.
@@ -115,7 +120,11 @@ final class FrameRenderer: NSObject, MTKViewDelegate {
             }
             #endif
         }
-        command.addCompletedHandler { [inFlight] _ in inFlight.signal() }
+        command.addCompletedHandler { [inFlight, weak self] buffer in
+            let busy = buffer.gpuEndTime - buffer.gpuStartTime
+            if busy > 0, busy < 1, let self { self.gpuLock.withLock { self.gpuTotal += busy } }
+            inFlight.signal()
+        }
         Breadcrumb.mark("draw:commit")
         command.present(drawable)
         command.commit()

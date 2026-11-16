@@ -268,6 +268,9 @@ final class ClientModel: ObservableObject {
     var microphoneAvailable: Bool { (info?.features ?? 0) & StreamFeature.microphone != 0 }
     /// Set by the stream view: a few words about its drawing for the diagnostic log.
     var drawNote: (() -> String)?
+    /// GPU seconds spent on drawing the stream so far (build 60).
+    var drawGPUSeconds: (() -> Double?)?
+    private var gpu = CPUMeter()
     private var audioPlayer: AudioPlayer?
     /// Newest first.
     @Published var transfers: [FileTransferEngine.Progress] = []
@@ -645,7 +648,7 @@ final class ClientModel: ObservableObject {
                 case .welcome(let info):
                     try info.validate()
                     self.info = info; self.connecting = false; self.status = "Connected"
-                    self.sessionStarted = CACurrentMediaTime(); self.drain.reset(); self.cpu.reset()
+                    self.sessionStarted = CACurrentMediaTime(); self.drain.reset(); self.cpu.reset(); self.gpu.reset()
                     if (info.features ?? 0) & StreamFeature.clientStatsLog != 0 { self.control?.send(.clientStats(BatteryMonitor.diagnosis())) }
                     self.clearAutoDeadline()
                     if let path = control?.connection.currentPath {
@@ -1388,8 +1391,9 @@ final class ClientModel: ObservableObject {
         let battery = BatteryMonitor.shared
         drain.sample(percent: battery.percent, charging: battery.charging, now: now)
         cpu.sample(wall: now, cpu: ProcessCPU.seconds())
+        if let busy = drawGPUSeconds?() ?? nil { gpu.sample(wall: now, cpu: busy) }
         let session = sessionStarted.map { now - $0 }
-        stats.setPower(UsageText.summary(battery: battery.percent, drain: drain, session: session, cpu: cpu))
+        stats.setPower(UsageText.summary(battery: battery.percent, drain: drain, session: session, cpu: cpu, gpu: gpu))
         statsTick += 1
         if statsTick % 2 == 0, (info?.features ?? 0) & StreamFeature.clientStatsLog != 0 {
             let note = drawNote?() ?? ""
@@ -1397,7 +1401,7 @@ final class ClientModel: ObservableObject {
                                        + " video=" + videoPath + (videoOrder.map { " rebuilt=\($0.rebuilt)" } ?? "") + (note.isEmpty ? "" : " " + note)
                                        + (audioPlayer.map { " " + $0.statisticsText() } ?? "")
                                        + " bat=" + (battery.percent.map(String.init) ?? "-") + "/" + battery.source + (battery.charging ? "+" : "")
-                                       + " " + UsageText.logFields(open: onScreen, session: session, drain: drain, cpu: cpu,
+                                       + " " + UsageText.logFields(open: onScreen, session: session, drain: drain, cpu: cpu, gpu: gpu,
                                                                    thermal: ProcessInfo.processInfo.thermalState.rawValue,
                                                                    lowPower: ProcessInfo.processInfo.isLowPowerModeEnabled)))
         }

@@ -67,7 +67,9 @@ public struct BatteryDrain: Equatable {
 
 public enum UsageText {
     /// For the iPad's per-second log line.
-    public static func logFields(open: Double, session: Double?, drain: BatteryDrain, cpu: CPUMeter, thermal: Int, lowPower: Bool) -> String {
+    /// `gpu`: GPU time spent on SkyDesk's own drawing, as a share of wall time (build 60); nil when not measured.
+    public static func logFields(open: Double, session: Double?, drain: BatteryDrain, cpu: CPUMeter, gpu: CPUMeter? = nil,
+                                 thermal: Int, lowPower: Bool) -> String {
         var text = String(format: "open=%.1fm", open / 60)
         if let session { text += String(format: " sess=%.1fm", session / 60) }
         if let used = drain.used, let minutes = drain.minutes {
@@ -75,11 +77,12 @@ public enum UsageText {
             if let rate = drain.perHour { text += String(format: " rate=%.1f%%/h", rate) }
         } else { text += " drain=charging" }
         text += " cpu=" + (cpu.recent.map { String(format: "%.0f", $0) } ?? "-") + "/" + (cpu.average.map { String(format: "%.0f", $0) } ?? "-")
+        if let gpu { text += " gpu=" + (gpu.recent.map { String(format: "%.1f", $0) } ?? "-") + "/" + (gpu.average.map { String(format: "%.1f", $0) } ?? "-") }
         text += " therm=\(thermal)" + (lowPower ? " lowpower" : "")
         return text
     }
     /// One line for the statistics box.
-    public static func summary(battery: Int?, drain: BatteryDrain, session: Double?, cpu: CPUMeter) -> String {
+    public static func summary(battery: Int?, drain: BatteryDrain, session: Double?, cpu: CPUMeter, gpu: CPUMeter? = nil) -> String {
         var parts: [String] = []
         if let battery { parts.append("Battery \(battery)%") }
         if let used = drain.used, let minutes = drain.minutes {
@@ -87,6 +90,7 @@ public enum UsageText {
         } else if battery != nil { parts.append("charging") }
         if let session { parts.append(String(format: "session %.0f min", session / 60)) }
         if let recent = cpu.recent { parts.append(String(format: "iPad CPU %.0f%%", recent) + (cpu.average.map { String(format: " (avg %.0f%%)", $0) } ?? "")) }
+        if let recent = gpu?.recent { parts.append(String(format: "iPad GPU (drawing) %.1f%%", recent)) }
         return parts.joined(separator: " · ")
     }
 }

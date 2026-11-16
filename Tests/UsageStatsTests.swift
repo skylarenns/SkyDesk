@@ -32,4 +32,12 @@ final class UsageStatsTests: XCTestCase {
         XCTAssertEqual(UsageText.logFields(open: 1_500, session: 1_200, drain: drain, cpu: cpu, thermal: 1, lowPower: false),
                        "open=25.0m sess=20.0m drain=3%/20m rate=9.0%/h cpu=20/20 therm=1")
     }
+    func testGPUShareInTheLogLine() {
+        var drain = BatteryDrain(); var cpu = CPUMeter(); var gpu = CPUMeter()
+        drain.sample(percent: 90, charging: false, now: 0)
+        cpu.sample(wall: 0, cpu: 0); cpu.sample(wall: 1, cpu: 0.2)
+        gpu.sample(wall: 0, cpu: 0); gpu.sample(wall: 1, cpu: 0.012)   // 12 ms of GPU work in a second
+        XCTAssertEqual(UsageText.logFields(open: 60, session: 60, drain: drain, cpu: cpu, gpu: gpu, thermal: 0, lowPower: false),
+                       "open=1.0m sess=1.0m drain=0%/0m cpu=20/20 gpu=1.2/1.2 therm=0")
+    }
 }
