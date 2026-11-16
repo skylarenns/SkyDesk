@@ -92,4 +92,32 @@ final class AudioTests: XCTestCase {
         jitter.restart()
         XCTAssertEqual(jitter.next(waiting: 5_000), .playAfterSilence(frames: 1_440))
     }
+
+    func testTheCushionCoversWhatTheOutputTakesAtOnce() {
+        // 5 ms at a time (what SkyDesk asks for): the plain values.
+        var small = AudioJitter(deviceBufferMS: 5)
+        XCTAssertEqual(small.cushion, 1_440); XCTAssertEqual(small.largestCushion, 4_800); XCTAssertEqual(small.limit, 10_560)
+        // 85 ms at a time (iPadOS has been seen to choose this): 30 ms waiting would run dry on every take.
+        let large = AudioJitter(deviceBufferMS: 85)
+        XCTAssertEqual(large.cushion, 6_600)                                            // 137.5 ms
+        XCTAssertGreaterThan(large.largestCushion, large.cushion)
+        XCTAssertGreaterThan(large.limit, large.largestCushion + 48 * 85)               // a full take above the cushion is not "too far behind"
+        // The output changes mid-session: a bigger take needs the cushion rebuilt now, a smaller one does not.
+        XCTAssertFalse(small.setDeviceBuffer(ms: 5.3))
+        XCTAssertTrue(small.setDeviceBuffer(ms: 21.3)); XCTAssertEqual(small.cushion, 2_013)   // 41.95 ms
+        XCTAssertFalse(small.setDeviceBuffer(ms: 5)); XCTAssertEqual(small.cushion, 2_013)     // never shrinks mid-session
+        XCTAssertEqual(small.limit, 10_560)
+    }
+
+    func testSoundHealthLineCountsOneSecondThenStartsAgain() {
+        var health = AudioHealth()
+        health.output = "Bluetooth A2DP"; health.deviceBufferMS = 21.3; health.outputLatencyMS = 180.4
+        for index in 0..<100 { health.arrived(now: UInt64(index) * 10_000_000 + (index == 50 ? 34_000_000 : 0)) }
+        health.underrun(); health.underrun(); health.flushed(); health.rebuilt(); health.interrupted()
+        health.waitingMS = 42; health.cushionMS = 50
+        XCTAssertEqual(health.drain(), "snd=100 gap=44 under=2 flush=1 reb=1 int=1 wait=42 cush=50 io=21 lat=180 out=BluetoothA2DP")
+        XCTAssertEqual(health.drain(), "snd=0 gap=0 under=0 flush=0 reb=0 int=0 wait=42 cush=50 io=21 lat=180 out=BluetoothA2DP")
+        // The round trip is still found in a line that carries the sound figures after it.
+        XCTAssertEqual(StatisticsText.roundTrip(fromLogLine: "shown=60 rtt=4.9/7.0 display=16.2 video=udp " + health.drain()), 4.9)
+    }
 }

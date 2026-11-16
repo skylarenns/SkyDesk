@@ -167,6 +167,10 @@ final class HostAudio {
         guard #available(macOS 14.2, *), let worker = worker as? AudioCaptureWorker else { return }
         worker.set(running: !stopped && !paused, muted: heardSound && padPlaying && !paused, force: force)
     }
+    func statisticsText() -> String? {
+        guard #available(macOS 14.2, *), let worker = worker as? AudioCaptureWorker else { return nil }
+        return worker.statisticsText()
+    }
     private static var outputAddress: AudioObjectPropertyAddress {
         AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice, mScope: kAudioObjectPropertyScopeGlobal,
                                    mElement: kAudioObjectPropertyElementMain)
@@ -230,12 +234,14 @@ final class AudioCaptureWorker: @unchecked Sendable {
                     state.heard = true
                     DispatchQueue.main.async { MainActor.assumeIsolated { self?.onHeard?() } }
                 }
+                state.captured(now: monotonicNanos())
                 // A stalled link drops sound instead of queueing it: late sound is worse than a gap.
-                guard channel.backlogBytes < 24_000, let packets = try? encoder.encode(buffer) else { return }
+                guard channel.backlogBytes < 24_000, let packets = try? encoder.encode(buffer) else { state.dropped(); return }
                 for bytes in packets {
                     state.sequence &+= 1
                     channel.send(AudioPacket(sequence: state.sequence, bytes: bytes).packet())
                 }
+                state.sent(packets.count)
             }
             self.tap = tap
             MetricsLog.shared.append("host  sound capture on (\(Int(format.sampleRate)) Hz, " + (muted ? "Mac speakers silenced" : "Mac speakers still playing") + ")")
@@ -246,6 +252,8 @@ final class AudioCaptureWorker: @unchecked Sendable {
             DispatchQueue.main.async { MainActor.assumeIsolated { self.onFailure?("The Mac's sound couldn't be captured: \(reason)") } }
         }
     }
+    /// For the once-a-second log line: nil while nothing is being captured.
+    func statisticsText() -> String? { state.drain() }
     static func peak(_ buffer: AVAudioPCMBuffer) -> Float {
         guard buffer.format.commonFormat == .pcmFormatFloat32, let data = buffer.floatChannelData, buffer.frameLength > 0 else { return 0 }
         var value: Float = 0
@@ -255,8 +263,26 @@ final class AudioCaptureWorker: @unchecked Sendable {
     }
 }
 
-/// Touched only on the tap's queue.
+/// `sequence` and `heard` are touched only on the tap's queue; the counts are read from the main thread too.
 private final class AudioSendState: @unchecked Sendable {
     var sequence: UInt64 = 0
     var heard = false
+    private let lock = NSLock()
+    private var buffers = 0, packets = 0, drops = 0
+    private var longestGap = 0.0
+    private var last: UInt64?
+    func captured(now: UInt64) {
+        lock.lock(); buffers += 1
+        if let last, now > last { longestGap = max(longestGap, Double(now - last) / 1_000_000) }
+        last = now; lock.unlock()
+    }
+    func sent(_ count: Int) { lock.lock(); packets += count; lock.unlock() }
+    func dropped() { lock.lock(); drops += 1; lock.unlock() }
+    /// Sound packets sent, capture buffers not sent (stalled link or a failed encode), and the longest wait
+    /// between two capture buffers, since the last call.
+    func drain() -> String? {
+        lock.lock(); defer { buffers = 0; packets = 0; drops = 0; longestGap = 0; lock.unlock() }
+        guard buffers > 0 else { return nil }
+        return String(format: "sound %d sent, %d dropped, longest capture gap %.0f ms", packets, drops, longestGap)
+    }
 }

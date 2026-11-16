@@ -19,6 +19,13 @@ final class KeptDesktopTests: XCTestCase {
         // The Mac cannot replace itself while iPad only is on; keeping the desktop would hold the update back.
         XCTAssertFalse(KeptDesktop.shouldKeep(setting: true, padOnly: true, end: .padLeft, macUpdateWaiting: true))
     }
+    func testTheDesktopIsKeptForAWhileByDefaultNotForEver() {
+        XCTAssertEqual(KeptDesktop.limit(minutes: KeptDesktop.defaultMinutes), 600)
+        XCTAssertTrue(KeptDesktop.choices.contains(KeptDesktop.defaultMinutes))
+        XCTAssertNil(KeptDesktop.limit(minutes: KeptDesktop.forever))
+        XCTAssertNil(KeptDesktop.limit(minutes: 0))
+        XCTAssertEqual(Set(KeptDesktop.choices.map(KeptDesktop.label)).count, KeptDesktop.choices.count)
+    }
     func testOnlyTheSameDesktopIsReused() {
         XCTAssertTrue(KeptDesktop.canReuse(kept: pad, wanted: pad, padOnly: true))
         XCTAssertFalse(KeptDesktop.canReuse(kept: nil, wanted: pad, padOnly: true))

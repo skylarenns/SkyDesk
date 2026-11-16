@@ -1237,7 +1237,8 @@ final class ClientModel: ObservableObject {
         if statsTick % 2 == 0, (info?.features ?? 0) & StreamFeature.clientStatsLog != 0 {
             let note = drawNote?() ?? ""
             control?.send(.clientStats(StatisticsText.logLine(values, link: usingCable ? "cable" : usingVPN ? "vpn" : networkSymbol)
-                                       + " video=" + videoPath + (videoOrder.map { " rebuilt=\($0.rebuilt)" } ?? "") + (note.isEmpty ? "" : " " + note)))
+                                       + " video=" + videoPath + (videoOrder.map { " rebuilt=\($0.rebuilt)" } ?? "") + (note.isEmpty ? "" : " " + note)
+                                       + (audioPlayer.map { " " + $0.statisticsText() } ?? "")))
         }
         #if targetEnvironment(simulator)
         stats.metrics = "SIMULATOR (GPU completion only) · " + stats.metrics

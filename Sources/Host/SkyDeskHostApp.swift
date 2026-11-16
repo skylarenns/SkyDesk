@@ -504,9 +504,10 @@ private struct HostView: View {
             // Applies at once, so it is not part of the group that waits for the next connection.
             Toggle("Keep this Mac awake while SkyDesk is ready (it won't sleep on its own)", isOn: $host.keepAwake)
                 .frame(maxWidth: .infinity, alignment: .leading).padding(.top, 10)
-            Toggle("Stay in iPad only mode when the iPad disconnects", isOn: $host.keepPadDesktop)
-                .frame(maxWidth: .infinity, alignment: .leading).padding(.top, 4)
-            Text("The Mac's display stays off and the iPad gets its desktop back the moment it reconnects. Any key or click on the Mac brings the Mac's display back. The Mac stays awake while it waits.")
+            Picker("When the iPad disconnects", selection: $host.keepPadDesktopMinutes) {
+                ForEach(KeptDesktop.choices, id: \.self) { Text(KeptDesktop.label(minutes: $0)).tag($0) }
+            }.padding(.top, 4)
+            Text("While it stays in iPad only, the Mac's display is off and the iPad gets its desktop back the moment it reconnects. Any key or click on the Mac brings the Mac's display back sooner. The Mac stays awake while it waits.")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
         } label: { Text("Display & quality").font(.headline) }
     }

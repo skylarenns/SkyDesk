@@ -2,7 +2,7 @@
 
 A native Apple remote desktop for one person's own devices. **SkyDesk Host** runs in the Mac's menu bar, captures a display and streams it as hardware-encoded HEVC. **SkyDesk** on the iPad decodes it in hardware, draws it with Metal and sends back keyboard, trackpad, touch and gesture input. The same link carries clipboard text, files in both directions, the Mac's sound, and updates of both apps. The two devices talk to each other directly: there is no account, relay or server.
 
-This file describes the code at **build 45** (`CURRENT_PROJECT_VERSION` in `project.yml`). [VERIFICATION.md](VERIFICATION.md) is the dated record of the first builds and does not describe the current state.
+This file describes the code at **build 46** (`CURRENT_PROJECT_VERSION` in `project.yml`). [VERIFICATION.md](VERIFICATION.md) is the dated record of the first builds and does not describe the current state.
 
 **No end-to-end performance figure has been measured.** 120 FPS is the default target frame rate, not a verified result. The delays the iPad shows are estimates added up from parts (see [Statistics](#statistics)); nobody has yet filmed an input and its response to check them.
 
@@ -18,15 +18,16 @@ This file describes the code at **build 45** (`CURRENT_PROJECT_VERSION` in `proj
 | 41 (parity packets on slow links, connections without forward secrecy refused, no automatic use of the saved password, Dock brought over while iPad only waits, refused connections logged) | Installed on 2026-11-14. Sessions connect and use the forward-secret exchange and UDP. **The Dock did not come over during the wait**: the injected pointer push was sent on time and did nothing. The iPad's own address probe was logged as a refused connection. Parity and the VPN fix have not been exercised (no VPN session yet). |
 | 42 (the iPad's desktop is made the main display during the wait, which is what moves the Dock; the address probe is no longer logged as a refusal) | Installed on 2026-11-14. The display log shows the iPad's desktop made main during the wait. |
 | 43 (the pointer snaps to the desktop's edges and keeps pushing against them, for sidebars and bars that open on an edge) | The Mac app installed itself on 2026-11-15; the iPad stayed on 42 because Apple's install prompt was answered after SkyDesk had already closed. The edge behaviour has not been tried on the real devices. |
-| 44 (the iPad stays open until the Mac sees iPadOS fetch the update; the Mac only follows an iPad that did) | Built and unit-tested. The install prompt itself only exists on a real iPad, so the new wait has not been run end to end. |
-| 45 (optional: the Mac stays in iPad only mode when the iPad disconnects, and the returning iPad carries on with the same desktop) | Built and unit-tested. **None of its display handling has been run**: it only happens with the Mac's displays switched off, which is not tried from the development machine. Off by default. |
+| 44 (the iPad stays open until the Mac sees iPadOS fetch the update; the Mac only follows an iPad that did) | Installed on 2026-11-15 (through build 43's three-second flow; the new wait is first used when updating from 44). The install prompt itself only exists on a real iPad, so the new wait had not been run end to end before that. |
+| 45 (the Mac stays in iPad only mode for a while when the iPad disconnects, and the returning iPad carries on with the same desktop) | Never staged on its own; it ships inside build 46. **None of its display handling has been run**: it only happens with the Mac's displays switched off, which is not tried from the development machine. |
+| 46 (build 45's kept desktop, now for ten minutes by default; the iPad's sound player measures the sound it has in hand by the player's own clock and sizes its cushion to the iPad's output; sound figures in the log on both sides) | Built and unit-tested. The new measure was checked with silent sound on the Mac (a stall is noticed on the first packet after it). Whether it ends the cut-outs heard on 2026-11-15 is not known: those were never measured, which is what the new log figures are for. |
 
 Not yet confirmed on real hardware, even in the installed builds:
 
 - that the Mac's speakers really are silent while the iPad plays its sound (the log says the Mac asked for that; nobody has yet confirmed it by ear);
 - pinch and rotate actually reaching Mac apps (a unit test shows AppKit reads the injected events as magnify and rotate events, nothing more).
 
-`swift test` runs 162 tests with no failures (last run 2026-11-15 on the build 45 sources). Tests use the Mac's hardware encoder and loopback connections; they never capture the screen.
+`swift test` runs 165 tests with no failures (last run 2026-11-15 on the build 46 sources). Tests use the Mac's hardware encoder and loopback connections; they never capture the screen.
 
 ## Requirements
 
@@ -125,7 +126,7 @@ Only one iPad can be connected at a time.
 | Encode faster | On | Build 39. The encoder's fastest mode. Measured on the Mac alone at 2752 × 2064: with frames 62 ms apart (ordinary desktop use) 11.5 ms per frame instead of 16.8, and frames about twice the size; with frames 17 ms apart, no difference. Not yet measured in a real session. |
 | Low-latency rate control (experimental) | Off | A VideoToolbox encoder mode. Its effect depends on resolution and hardware; this file claims none. |
 | Keep this Mac awake while SkyDesk is ready | Off | Stops the Mac sleeping on its own while the port is open. It does not keep a closed MacBook awake. |
-| Stay in iPad only mode when the iPad disconnects | Off | See [iPad only mode](#ipad-only-mode). Applies at once; switching it off gives the Mac's displays back. |
+| When the iPad disconnects | Stay in iPad only for 10 minutes | Go back at once, stay for 1 minute, 10 minutes or 1 hour, or until someone uses the Mac. See [iPad only mode](#ipad-only-mode). Applies at once; choosing "at once" gives the Mac's displays back. |
 
 All of these are saved between launches (the first seven only since build 38; before that they returned to the defaults whenever the host restarted). Stream settings apply from the next connection; "Keep this Mac awake" applies at once.
 
@@ -222,6 +223,8 @@ A small readout in the bottom-right corner is always shown: received bitrate, th
 
 **Sound.** The Mac's sound is captured with a Core Audio process tap (everything the Mac plays except SkyDesk itself), compressed with Opus at 48 kHz stereo, and played on the iPad, mixed with whatever the iPad itself is playing. The Mac's own speakers are silenced only while two things are true: real sound has been captured, and the iPad reports that it is playing. At any other time, including when the iPad is in the background or the sound connection drops, the Mac plays its sound itself. No volume or mute setting is changed. Sound goes from the Mac to the iPad only; there is no microphone path.
 
+The iPad keeps a little sound in hand (a cushion, 30 ms to start with) so uneven arrival does not break it up; when it runs dry the cushion is rebuilt slightly larger, and a backlog far above it is thrown away. Since build 46 "in hand" is read from the player's own clock (scheduled, not yet taken by the output) and the cushion is sized to how much the iPad's output takes at once, which iPadOS decides. Before that, sound counted as in hand until it had been heard, which includes the whole way to the speaker: running dry went unnoticed and sound merely on its way looked like a backlog. Both sides now log sound once a second. The iPad's line ends with `snd=` packets arrived, `gap=` longest wait between two (ms; they are sent 10 ms apart), `under=` times it ran dry, `flush=` backlogs thrown away, `reb=` engine rebuilds, `int=` interruptions, `wait=`/`cush=` sound in hand and the cushion (ms), `io=` how much the output takes at once (ms), `lat=` its delay to the speaker (ms), `out=` the output in use. The Mac's line ends with packets sent, capture buffers dropped, and the longest wait between two capture buffers.
+
 ## iPad only mode
 
 **iPad only** makes the iPad the Mac's only display: it first moves existing windows onto the iPad desktop, then switches the Mac's other displays off at the WindowServer level. It is available with a separate iPad desktop, input allowed and Accessibility granted, and by default it starts by itself on every connection ("Start in iPad only mode").
@@ -234,7 +237,7 @@ Safeguards:
 - The Mac's display stays off for at least 5 seconds and on for at least 20 before it is switched again, because switching the built-in panel in quick succession once left it dark (2026-11-13). The toolbar shows **Switching…** while the Mac waits. Since build 42 the iPad's desktop is made the Mac's main display at the start of that wait, with every display still on and only their positions changed, so the Dock and new windows go to the iPad straight away; the Mac's own display is switched off when the wait is over, and a restore during the wait puts the arrangement back. (Build 41 tried to bring the Dock over by pushing the pointer against the bottom edge with injected events, which is also what "Show Dock here" does. On the real devices that did not move the Dock, so "Show Dock here" should be assumed not to work either.)
 - Only which displays are enabled and where they sit is changed; never resolution, brightness or mirroring. Display sleep is held off while the mode is on.
 
-**Staying in iPad only mode (build 45).** With "Stay in iPad only mode when the iPad disconnects" on, a session that ends because the iPad went away (it disconnected, was in the background too long, or stopped answering) leaves everything as it is: the iPad's display stays the Mac's only display, windows stay where they are, and the status reads "Waiting for your iPad. Its desktop is kept". When an iPad asking for the same size and refresh rate connects, the stream starts on that display and the iPad shows iPad only as already on; there is no switch and no wait. The kept desktop is given up, and the Mac's displays return, when someone uses the Mac's keyboard or trackpad, when the Mac sleeps, when sharing is stopped or the host quits, when the setting is switched off, when a different iPad (or mirroring) needs another display, and when a Mac update is waiting, because the Mac cannot replace itself while its displays are off. The helper process keeps watching throughout. The Mac does not sleep on its own while it waits, exactly as during a session, so on battery with the lid open it runs down.
+**Staying in iPad only mode (build 46).** Unless "When the iPad disconnects" is set to go back at once, a session that ends because the iPad went away (it disconnected, was in the background too long, or stopped answering) leaves everything as it is: the iPad's display stays the Mac's only display, windows stay where they are, and the status reads "Waiting for your iPad. Its desktop is kept". When an iPad asking for the same size and refresh rate connects, the stream starts on that display and the iPad shows iPad only as already on; there is no switch and no wait. The kept desktop is given up, and the Mac's displays return, when the chosen time runs out (ten minutes by default), when someone uses the Mac's keyboard or trackpad, when the Mac sleeps, when sharing is stopped or the host quits, when the setting is changed to go back at once, when a different iPad (or mirroring) needs another display, and when a Mac update is waiting, because the Mac cannot replace itself while its displays are off. The helper process keeps watching throughout. The Mac does not sleep on its own while it waits, exactly as during a session, so on battery with the lid open it runs down.
 
 This uses the private `SLSConfigureDisplayEnabled` call, behind an availability check. It is a convenience, not a security lock.
 
@@ -362,7 +365,7 @@ That refusal happens after the handshake because it cannot happen in it: Apple's
 ## Tests and checks
 
 ```sh
-swift test                                  # 162 tests at build 45 (about 30 s; several open loopback sockets) (about 20 s; a few open loopback sockets)
+swift test                                  # 165 tests at build 46 (about 30 s; several open loopback sockets) (about 20 s; a few open loopback sockets)
 swift run skydesk-check --frames 120        # synthetic frames, hardware HEVC, encrypted loopback
 swift run skydesk-check --width 1920 --height 1200 --frames 240 --low-latency
 ```

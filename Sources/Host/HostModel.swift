@@ -72,11 +72,26 @@ final class HostModel: ObservableObject {
     }
     /// Keep the Mac from going to sleep on its own while it is ready for the iPad (for use away from home).
     /// Stay in iPad only mode when the iPad goes away, so it gets its desktop back at once (KeptDesktop.swift).
-    @Published var keepPadDesktop = UserDefaults.standard.bool(forKey: "keepPadDesktop") {
+    /// Minutes; 0 = off, KeptDesktop.forever = until someone uses the Mac.
+    @Published var keepPadDesktopMinutes = (UserDefaults.standard.object(forKey: "keepPadDesktopMinutes") as? Int)
+        .flatMap({ KeptDesktop.choices.contains($0) ? $0 : nil }) ?? KeptDesktop.defaultMinutes {
         didSet {
-            UserDefaults.standard.set(keepPadDesktop, forKey: "keepPadDesktop")
-            if !keepPadDesktop { releaseKeptDesktop(reason: "keeping the iPad desktop was switched off") }
+            UserDefaults.standard.set(keepPadDesktopMinutes, forKey: "keepPadDesktopMinutes")
+            if keepPadDesktopMinutes == 0 { releaseKeptDesktop(reason: "keeping the iPad desktop was switched off") }
+            else if keptDesktop != nil { startKeptDesktopLimit() }
         }
+    }
+    private var keptDesktopLimit: DispatchWorkItem?
+    /// A kept desktop is given up after the chosen time, so a Mac left alone gets its display back.
+    private func startKeptDesktopLimit() {
+        keptDesktopLimit?.cancel(); keptDesktopLimit = nil
+        guard let seconds = KeptDesktop.limit(minutes: keepPadDesktopMinutes) else { return }
+        let minutes = keepPadDesktopMinutes
+        let work = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated { self?.releaseKeptDesktop(reason: "no iPad came back within \(minutes) min") }
+        }
+        keptDesktopLimit = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: work)
     }
     /// True while the iPad-only desktop is being kept with no iPad connected.
     @Published private(set) var desktopKept = false
@@ -464,6 +479,7 @@ final class HostModel: ObservableObject {
     private func keptDesktopEnded() {
         guard let kept = keptDesktop else { return }
         keptDesktop = nil; desktopKept = false
+        keptDesktopLimit?.cancel(); keptDesktopLimit = nil
         MetricsLog.shared.append("host  kept iPad desktop given up; the Mac's displays are back")
         let display = kept.display
         Task { display.invalidate() }
@@ -477,11 +493,12 @@ final class HostModel: ObservableObject {
         generation = UUID()
         ContinuityLink.resume()
         let padOnly = displayController.isSettled && (keptDesktop != nil || (virtualDisplay != nil && sessionShape != nil))
-        let keep = KeptDesktop.shouldKeep(setting: keepPadDesktop, padOnly: padOnly, end: end,
+        let keep = KeptDesktop.shouldKeep(setting: keepPadDesktopMinutes != 0, padOnly: padOnly, end: end,
                                           macUpdateWaiting: updateWhenPadDrops || macUpdateDue)
         if keep {
             if let display = virtualDisplay, let shape = sessionShape {
                 keptDesktop = (display, shape); desktopKept = true; virtualDisplay = nil
+                startKeptDesktopLimit()
                 MetricsLog.shared.append("host  iPad left; its desktop stays the Mac's only display until it returns or someone uses the Mac")
                 DisplayLog.write("kept: session ended with iPad only on; nothing restored")
             }
@@ -748,6 +765,7 @@ final class HostModel: ObservableObject {
                     if let kept = keptDesktop, KeptDesktop.canReuse(kept: kept.shape, wanted: shape, padOnly: displayController.isSettled) {
                         // The desktop this iPad left is still the Mac's only display: carry on with it as it is.
                         virtual = kept.display; keptDesktop = nil; desktopKept = false; resumedKept = true
+                        keptDesktopLimit?.cancel(); keptDesktopLimit = nil
                         virtualDisplay = virtual; sessionShape = shape
                         MetricsLog.shared.append("host  iPad returned to its kept desktop; no display switch needed")
                     } else {
@@ -1171,7 +1189,8 @@ final class HostModel: ObservableObject {
         if let controller = bitrateController, controller.target < controller.maximum {
             metrics += String(format: " · bitrate limited to %.1f Mbps by the network", Double(controller.target) / 1e6)
         }
-        MetricsLog.shared.append(String(format: "host  %@ · %.1f Mbps encoded", metrics, Double(stats.bytes) * 8 / elapsed / 1_000_000))
+        MetricsLog.shared.append(String(format: "host  %@ · %.1f Mbps encoded", metrics, Double(stats.bytes) * 8 / elapsed / 1_000_000)
+                                 + (audio?.statisticsText().map { " · " + $0 } ?? ""))
         if let age = capture.window.oldestAge(), age > 5_000_000_000 { disconnect(.padLeft); status = "Video stalled; reconnect the iPad." }
     }
 }
