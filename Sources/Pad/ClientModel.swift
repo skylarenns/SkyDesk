@@ -646,6 +646,7 @@ final class ClientModel: ObservableObject {
                     try info.validate()
                     self.info = info; self.connecting = false; self.status = "Connected"
                     self.sessionStarted = CACurrentMediaTime(); self.drain.reset(); self.cpu.reset()
+                    if (info.features ?? 0) & StreamFeature.clientStatsLog != 0 { self.control?.send(.clientStats(BatteryMonitor.diagnosis())) }
                     self.clearAutoDeadline()
                     if let path = control?.connection.currentPath {
                         switch LinkKind.of(interfaces: path.availableInterfaces.map(\.name), wifi: path.usesInterfaceType(.wifi),
