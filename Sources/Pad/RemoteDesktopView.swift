@@ -1,6 +1,10 @@
 import SwiftUI
 import MetalKit
 import UIKit
+import GameController
+
+/// The window's root controller: asked to have iPadOS hide the pointer and hold it still (captured pointer).
+protocol PointerLocking: AnyObject { var pointerLockWanted: Bool { get set } }
 
 struct RemoteDesktopView: UIViewRepresentable {
     @ObservedObject var client: ClientModel
@@ -18,6 +22,7 @@ struct RemoteDesktopView: UIViewRepresentable {
         view.sendGesture = { [weak client] in client?.gesture($0) }
         client.drawNote = { [weak view] in view?.drawNote ?? "" }
         view.desktopSwipe = { [weak client] in client?.desktopSwipe($0) }
+        view.toggleCapture = { [weak client] in if let client { client.setPointerCaptured(!client.pointerCaptured) } }
         return view
     }
     func updateUIView(_ view: DesktopMetalView, context: Context) {
@@ -28,9 +33,11 @@ struct RemoteDesktopView: UIViewRepresentable {
         view.setLocalCursorEnabled(client.localCursorActive)
         view.setPointerScale(client.pointerScale)
         view.setCursor(client.remoteCursor)
+        view.setPointerCapture(client.pointerCaptured, speed: client.capturedPointerSpeed)
         view.updateKeyboard(wanted: client.keyboardWanted, focus: client.textFocus, fallback: client.lastTapRect)
     }
     static func dismantleUIView(_ view: DesktopMetalView, coordinator: ()) {
+        view.setPointerCapture(false, speed: 1)
         view.releaseKeys(); view.stopDisplayLink()
         // Same rule as updateKeyboard: no responder change while SwiftUI is updating.
         DispatchQueue.main.async { view.endKeyboard() }
@@ -48,6 +55,23 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
     var sendMomentum: ((CGPoint) -> Void)?
     var sendGesture: ((GestureEvent) -> Void)?
     var desktopSwipe: ((ClientModel.DesktopSwipe) -> Void)?
+    /// Control-Option-G was pressed: capture the pointer, or give it back.
+    var toggleCapture: (() -> Void)?
+    private var captured = false
+    private var captureSpeed = 1.0
+    private var coalescer = DeltaCoalescer()
+    private var flushWork: DispatchWorkItem?
+    private var mouseObservers: [NSObjectProtocol] = []
+    private var lastDeviceMove: CFTimeInterval = 0
+    private var lastHover: CGPoint?
+    private var deviceButtons: Set<Int> = []
+    /// Scrolling may reach the app from the gesture recognisers, from the mouse itself, or from both at once;
+    /// whichever reports first during a capture keeps it, so nothing scrolls twice.
+    private enum ScrollOwner { case undecided, gestures, device }
+    private var scrollOwner = ScrollOwner.undecided
+    private weak var dragRecognizer: UIPanGestureRecognizer?
+    private var dragFromPointer = false
+    private var swallowedKeys: Set<Int> = []
     private var gestureSteps = GestureSteps()
     private var activeGestures: Set<GestureEvent.Kind> = []
     var controlsFrame: CGRect = .zero
@@ -126,7 +150,7 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
         addGestureRecognizer(hover)
         let drag = UIPanGestureRecognizer(target: self, action: #selector(dragged(_:)))
         drag.maximumNumberOfTouches = 1
-        addGestureRecognizer(drag)
+        addGestureRecognizer(drag); dragRecognizer = drag
         let tap = UITapGestureRecognizer(target: self, action: #selector(tapped(_:)))
         tap.require(toFail: drag)
         addGestureRecognizer(tap)
@@ -168,7 +192,8 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
     }
     required init(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     deinit {
-        repeatTimer?.invalidate(); edgePushTimer?.invalidate()
+        repeatTimer?.invalidate(); edgePushTimer?.invalidate(); flushWork?.cancel()
+        mouseObservers.forEach { NotificationCenter.default.removeObserver($0) }
         displayLink?.invalidate(); mailbox.onArrival(nil)
         if let deactivateObserver { NotificationCenter.default.removeObserver(deactivateObserver) }
         keyboardObservers.forEach { NotificationCenter.default.removeObserver($0) }
@@ -181,6 +206,7 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
             contentScaleFactor = window.screen.nativeScale
             startDisplayLink(rate: min(targetFPS, window.screen.maximumFramesPerSecond))
             becomeFirstResponder()
+            (window.rootViewController as? PointerLocking)?.pointerLockWanted = captured
         } else { stopDisplayLink(); releaseKeys() }
     }
     private func startDisplayLink(rate: Int) {
@@ -300,7 +326,7 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
     }
     func releaseKeys() {
         repeatTimer?.invalidate(); repeatTimer = nil; repeatKey = nil
-        heldKeys.removeAll(); modifiers = 0; dragActive = false
+        heldKeys.removeAll(); modifiers = 0; dragActive = false; deviceButtons.removeAll()
         activeGestures.removeAll()
         pushAgainstEdge(nil)
         releaseRemoteInput?()
@@ -327,6 +353,14 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
         syncModifiers(recognizer)
         var location = recognizer.location(in: self)
         let leaving = recognizer.state == .ended || recognizer.state == .cancelled || recognizer.state == .failed
+        if captured {
+            // Until iPadOS holds the pointer (or with a pointing device that does not report its own movement),
+            // movement is taken from how far the pointer itself went.
+            defer { lastHover = leaving ? nil : location }
+            guard CACurrentMediaTime() - lastDeviceMove > 0.5, let last = lastHover, !leaving else { return }
+            capturedMove(dx: location.x - last.x, dy: location.y - last.y)
+            return
+        }
         // Near an edge of the Mac desktop the pointer counts as on it; a pointer that leaves the picture close to
         // an edge went out through that edge. (Not under the toolbar, which is not part of the desktop.)
         var onEdge = false
@@ -362,12 +396,14 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
     private func click(_ recognizer: UITapGestureRecognizer, button: Int) {
         if !keyboard.isFirstResponder { becomeFirstResponder() }
         syncModifiers(recognizer)
+        if captured { capturedButton(button, down: true); capturedButton(button, down: false); return }
         guard let p = point(recognizer.location(in: self)) else { return }
         moveCursor(to: recognizer.location(in: self))
         pointer(.down, at: p, button: button); pointer(.up, at: p, button: button)
     }
     @objc private func dragged(_ recognizer: UIPanGestureRecognizer) {
         syncModifiers(recognizer)
+        if captured { capturedDrag(recognizer); return }
         let location = recognizer.location(in: self)
         switch recognizer.state {
         case .began:
@@ -384,8 +420,14 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
     }
     @objc private func scrolled(_ recognizer: UIPanGestureRecognizer) {
         syncModifiers(recognizer)
-        if recognizer.state == .began, dragActive { pointer(.up, at: lastPoint); dragActive = false }
-        if let p = point(recognizer.location(in: self)) { pointer(.move, at: p) }
+        if captured {
+            if scrollOwner == .undecided { scrollOwner = .gestures }
+            guard scrollOwner == .gestures else { return }
+            if recognizer.state == .began, dragActive { capturedButton(0, down: false); dragActive = false }
+        } else {
+            if recognizer.state == .began, dragActive { pointer(.up, at: lastPoint); dragActive = false }
+            if let p = point(recognizer.location(in: self)) { pointer(.move, at: p) }
+        }
         let delta = recognizer.translation(in: self)
         recognizer.setTranslation(.zero, in: self)
         let phase: Int
@@ -439,6 +481,119 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
         default: break
         }
     }
+    // MARK: Captured pointer (games)
+
+    /// iPadOS hides the pointer and holds it still only for a full-screen app in front, and says when it has.
+    private var pointerLocked: Bool { window?.windowScene?.pointerLockState?.isLocked == true }
+    func setPointerCapture(_ on: Bool, speed: Double) {
+        captureSpeed = max(0.1, min(10, speed))
+        guard on != captured else { return }
+        captured = on
+        (window?.rootViewController as? PointerLocking)?.pointerLockWanted = on
+        pushAgainstEdge(nil); lastHover = nil; scrollOwner = .undecided
+        flushWork?.cancel(); flushWork = nil; coalescer.reset()
+        if on {
+            if dragActive { pointer(.up, at: lastPoint); dragActive = false }
+            moveCursor(to: nil)
+            for mouse in GCMouse.mice() { attach(mouse) }
+            mouseObservers.append(NotificationCenter.default.addObserver(forName: .GCMouseDidConnect, object: nil, queue: .main) { [weak self] note in
+                if let mouse = note.object as? GCMouse { self?.attach(mouse) }
+            })
+        } else {
+            mouseObservers.forEach { NotificationCenter.default.removeObserver($0) }; mouseObservers = []
+            for mouse in GCMouse.mice() { detach(mouse) }
+            for button in deviceButtons.sorted() { capturedButton(button, down: false) }
+            deviceButtons.removeAll()
+            if dragActive { capturedButton(0, down: false); dragActive = false }
+        }
+    }
+    /// A mouse or trackpad reports its own movement and buttons here while the pointer is captured.
+    private func attach(_ mouse: GCMouse) {
+        guard captured, let input = mouse.mouseInput else { return }
+        mouse.handlerQueue = .main
+        input.mouseMovedHandler = { [weak self] _, dx, dy in
+            guard let self, self.captured else { return }
+            self.lastDeviceMove = CACurrentMediaTime()
+            // The mouse counts upwards as positive; the Mac's screen counts downwards.
+            self.capturedMove(dx: Double(dx), dy: -Double(dy))
+        }
+        input.leftButton.pressedChangedHandler = { [weak self] _, _, pressed in self?.deviceButton(0, pressed) }
+        input.rightButton?.pressedChangedHandler = { [weak self] _, _, pressed in self?.deviceButton(1, pressed) }
+        input.middleButton?.pressedChangedHandler = { [weak self] _, _, pressed in self?.deviceButton(2, pressed) }
+        input.scroll.valueChangedHandler = { [weak self] _, x, y in self?.deviceScroll(x: Double(x), y: Double(y)) }
+    }
+    private func detach(_ mouse: GCMouse) {
+        guard let input = mouse.mouseInput else { return }
+        input.mouseMovedHandler = nil; input.leftButton.pressedChangedHandler = nil
+        input.rightButton?.pressedChangedHandler = nil; input.middleButton?.pressedChangedHandler = nil
+        input.scroll.valueChangedHandler = nil
+    }
+    private func capturedMove(dx: Double, dy: Double) {
+        guard captured, dx != 0 || dy != 0 else { return }
+        switch coalescer.add(dx: dx * captureSpeed, dy: dy * captureSpeed, now: monotonicNanos()) {
+        case .send(let x, let y):
+            flushWork?.cancel(); flushWork = nil
+            sendInput?(InputEvent(kind: .move, x: x, y: y, modifiers: modifiers, relative: true))
+            flushCaptured()
+        case .wait(let nanoseconds):
+            guard flushWork == nil else { return }
+            let work = DispatchWorkItem { [weak self] in self?.flushWork = nil; self?.flushCaptured() }
+            flushWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + .nanoseconds(Int(nanoseconds)), execute: work)
+        }
+    }
+    /// Sends whatever movement is being held back; a click calls this first so it lands after the movement.
+    private func flushCaptured() {
+        while let part = coalescer.flush(now: monotonicNanos()) {
+            sendInput?(InputEvent(kind: .move, x: part.dx, y: part.dy, modifiers: modifiers, relative: true))
+        }
+    }
+    private func capturedButton(_ button: Int, down: Bool) {
+        flushWork?.cancel(); flushWork = nil; flushCaptured()
+        sendInput?(InputEvent(kind: down ? .down : .up, button: button, modifiers: modifiers, relative: true))
+    }
+    private func deviceButton(_ button: Int, _ pressed: Bool) {
+        guard captured, pressed != deviceButtons.contains(button) else { return }
+        // Clicks come from the mouse itself only while iPadOS holds the pointer; otherwise the recognisers have
+        // them, and taking both would click twice. A release is always passed on.
+        if pressed {
+            guard pointerLocked else { return }
+            if !keyboard.isFirstResponder { becomeFirstResponder() }
+            deviceButtons.insert(button)
+        } else { deviceButtons.remove(button) }
+        capturedButton(button, down: pressed)
+    }
+    private func deviceScroll(x: Double, y: Double) {
+        guard captured, x != 0 || y != 0 else { return }
+        if scrollOwner == .undecided { scrollOwner = .device }
+        guard scrollOwner == .device else { return }
+        sendInput?(InputEvent(kind: .scroll, x: max(-2_000, min(2_000, x * 10)), y: max(-2_000, min(2_000, -y * 10)), modifiers: modifiers))
+    }
+    private func capturedDrag(_ recognizer: UIPanGestureRecognizer) {
+        let moved = recognizer.translation(in: self)
+        recognizer.setTranslation(.zero, in: self)
+        // A mouse that reports its own movement is already being followed; a finger is followed from here.
+        let follow = !dragFromPointer || CACurrentMediaTime() - lastDeviceMove > 0.5
+        switch recognizer.state {
+        case .began:
+            if !keyboard.isFirstResponder { becomeFirstResponder() }
+            // A held mouse button drags. A finger on the glass only steers, as on a trackpad; a tap clicks.
+            if dragFromPointer { dragActive = true; capturedButton(0, down: true) }
+            if follow { capturedMove(dx: moved.x, dy: moved.y) }
+        case .changed:
+            if follow { capturedMove(dx: moved.x, dy: moved.y) }
+        case .ended, .cancelled, .failed:
+            if dragActive { capturedButton(0, down: false); dragActive = false }
+        default: break
+        }
+    }
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+        let fromPointer = touch.type == .indirectPointer
+        // Held by iPadOS, the mouse reports its own buttons (deviceButton); these would be the same clicks again.
+        if captured, pointerLocked, fromPointer { return false }
+        if gestureRecognizer === dragRecognizer { dragFromPointer = fromPointer }
+        return true
+    }
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
         if gestureRecognizer is UIHoverGestureRecognizer || other is UIHoverGestureRecognizer { return true }
         // Zooming and turning with the same two fingers, as on a Mac.
@@ -452,6 +607,10 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
         for press in presses {
             guard let key = press.key else { unhandled.insert(press); continue }
             let code = key.keyCode.rawValue
+            // Control-Option-G captures the pointer or gives it back; the G itself never reaches the Mac.
+            if code == 10, key.modifierFlags.intersection([.control, .alternate, .command, .shift]) == [.control, .alternate] {
+                swallowedKeys.insert(code); toggleCapture?(); continue
+            }
             modifiers = Self.flags(key.modifierFlags)
             heldKeys.insert(code)
             sendInput?(InputEvent(kind: .key, keyCode: code, isDown: true, modifiers: modifiers))
@@ -467,6 +626,7 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
         for press in presses {
             guard let key = press.key else { continue }
             let code = key.keyCode.rawValue
+            if swallowedKeys.remove(code) != nil { continue }
             modifiers = Self.flags(key.modifierFlags)
             heldKeys.remove(code)
             sendInput?(InputEvent(kind: .key, keyCode: code, isDown: false, modifiers: modifiers))

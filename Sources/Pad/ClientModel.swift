@@ -158,6 +158,8 @@ final class ClientModel: ObservableObject {
         didSet {
             UserDefaults.standard.set(localPointer, forKey: "localPointer")
             guard oldValue != localPointer, let info else { return }
+            // While the pointer is captured the Mac draws it; the new choice applies when it is released.
+            if pointerCaptured { return }
             if (info.features ?? 0) & StreamFeature.liveCursorToggle != 0 {
                 control?.send(.setLocalCursor(localPointer)); localCursorActive = localPointer
             } else { notice = "The pointer setting applies the next time you connect." }
@@ -175,6 +177,29 @@ final class ClientModel: ObservableObject {
     }
     /// What the current session actually does (negotiated at connect, then switched live).
     @Published var localCursorActive = false
+    /// The pointer is captured for a game: the mouse or trackpad sends how far it moved, not where the pointer is
+    /// (PointerCapture.swift). Off again whenever the session ends or SkyDesk leaves the screen.
+    @Published private(set) var pointerCaptured = false
+    var canCapturePointer: Bool { info?.inputEnabled == true && (info?.features ?? 0) & StreamFeature.relativeMouse != 0 }
+    /// How far the Mac's pointer moves for a given movement of the captured mouse.
+    @Published var capturedPointerSpeed = UserDefaults.standard.object(forKey: "capturedPointerSpeed") as? Double ?? 1 {
+        didSet { UserDefaults.standard.set(capturedPointerSpeed, forKey: "capturedPointerSpeed") }
+    }
+    func setPointerCaptured(_ wanted: Bool, quietly: Bool = false) {
+        guard wanted != pointerCaptured else { return }
+        if wanted, !canCapturePointer {
+            notice = info?.inputEnabled == true ? "Update SkyDesk Host on the Mac to capture the mouse for games."
+                                                : "Remote input is off on the Mac, so the mouse can't be captured."
+            return
+        }
+        pointerCaptured = wanted
+        // The iPad no longer knows where the Mac's pointer is, so the Mac draws it into the picture meanwhile
+        // (and a game that hides it hides it there too). The user's own choice comes back on release.
+        if localPointer, let info, (info.features ?? 0) & StreamFeature.liveCursorToggle != 0 {
+            control?.send(.setLocalCursor(!wanted)); localCursorActive = !wanted
+        }
+        if !quietly { notice = wanted ? "Mouse captured for games. Control-Option-G or the toolbar releases it." : "Mouse released." }
+    }
     @Published var syncClipboard = UserDefaults.standard.object(forKey: "syncClipboard") as? Bool ?? true {
         didSet { UserDefaults.standard.set(syncClipboard, forKey: "syncClipboard") }
     }
@@ -523,6 +548,7 @@ final class ClientModel: ObservableObject {
         var features = StreamFeature.idleGapFlags | StreamFeature.pauseVideo | StreamFeature.liveCursorToggle
             | StreamFeature.clipboardSync | StreamFeature.fileTransfer | StreamFeature.scrollMomentum | StreamFeature.remoteUpdate
             | StreamFeature.gestures | StreamFeature.audio | StreamFeature.deviceKeys | StreamFeature.updateSignals
+            | StreamFeature.relativeMouse
         if localPointer { features |= StreamFeature.localCursor }
         if datagramVideo { features |= StreamFeature.datagramVideo }
         if sharperColour, Self.canDecodeFullColour, !UserDefaults.standard.bool(forKey: Self.colourFailedKey) { features |= StreamFeature.chroma444 }
@@ -770,7 +796,7 @@ final class ClientModel: ObservableObject {
         videoOrder = nil; videoPath = "tcp"
         control?.close(); video?.close(); control = nil; video = nil
         videoQueue = nil; videoGate = nil; decoder = nil; activeTarget = nil; activeCredential = nil
-        clipboard = nil; localCursorActive = false
+        clipboard = nil; localCursorActive = false; pointerCaptured = false
         fileEngine?.close(reason: "Disconnected from the Mac."); fileEngine = nil
         files?.close(); files = nil; filesReady = false
         closeAudio()
@@ -792,6 +818,8 @@ final class ClientModel: ObservableObject {
     func enterBackground() {
         inBackground = true
         pasteboardCountWhenLeft = UIPasteboard.general.changeCount
+        // iPadOS gives the pointer back when the app leaves the screen; a game must not keep a stale capture.
+        setPointerCaptured(false, quietly: true)
         releaseInput()
         // Mid-update, hold nothing: iPadOS installs only once SkyDesk has really stopped, and the background task
         // that keeps a session alive for ~30 s delayed that until the user had already come back (2026-11-13).
@@ -914,7 +942,7 @@ final class ClientModel: ObservableObject {
     func input(_ event: InputEvent) {
         Breadcrumb.mark("input:\(event.kind.rawValue)"); defer { Breadcrumb.mark("input:end") }
         if info?.inputEnabled == true {
-            if event.kind == .up {
+            if event.kind == .up, event.relative != true {
                 awaitingTextFocus = true
                 lastTapRect = CGRect(x: event.x, y: event.y, width: 0, height: min(0.025, 1 - event.y))
             }
@@ -1270,7 +1298,10 @@ import CoreVideo
 extension ClientModel {
     func startDemo() {
         let mailbox = FrameMailbox(); self.mailbox = mailbox
-        info = StreamInfo(width: 1376, height: 1032, fps: 120, bitrate: 25_000_000, displayName: "Demo", inputEnabled: false)
+        // SKYDESK_DEMO=input shows the controls that need remote input (nothing is connected, so nothing is sent).
+        let withInput = ProcessInfo.processInfo.environment["SKYDESK_DEMO"] == "input"
+        info = StreamInfo(width: 1376, height: 1032, fps: 120, bitrate: 25_000_000, displayName: "Demo", inputEnabled: withInput,
+                          features: withInput ? StreamFeature.relativeMouse | StreamFeature.liveCursorToggle : nil)
         let queue = DispatchQueue(label: "skydesk.demo")
         let timer = DispatchSource.makeTimerSource(queue: queue)
         var sequence: UInt64 = 0

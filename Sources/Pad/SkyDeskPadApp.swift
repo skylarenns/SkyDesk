@@ -85,7 +85,11 @@ final class PadSceneDelegate: UIResponder, UIWindowSceneDelegate {
 /// Landscape only (user request, build 31). The supported-orientation answer is enough where iPadOS honours it.
 /// If the scene is ever seen in portrait anyway, iPadOS is ignoring that answer, so from then on the controller
 /// asks for landscape and holds it with the orientation lock (iPadOS 26+).
-final class LandscapeHostingController<Content: View>: UIHostingController<Content> {
+final class LandscapeHostingController<Content: View>: UIHostingController<Content>, PointerLocking {
+    /// Asks iPadOS to hide the pointer and hold it still, so a mouse or trackpad reports movement without end
+    /// (captured pointer, build 47). iPadOS grants it only to a full-screen app in front.
+    var pointerLockWanted = false { didSet { if oldValue != pointerLockWanted { setNeedsUpdateOfPrefersPointerLocked() } } }
+    override var prefersPointerLocked: Bool { pointerLockWanted }
     private var sawPortrait = false
     private var lockWanted = false
     private var lastRequest = Date.distantPast
@@ -429,6 +433,11 @@ private struct StreamView: View {
                     Divider()
                     Button("Release all keys") { client.releaseInput() }
                 } label: { ToolLabel(title: "Shortcuts", icon: "command") }
+                if client.canCapturePointer {
+                    ToolButton(title: client.pointerCaptured ? "Release mouse" : "Game mouse", icon: "gamecontroller",
+                               active: client.pointerCaptured) { client.setPointerCaptured(!client.pointerCaptured) }
+                        .accessibilityHint("For games that take the mouse: the pointer is held and movement is sent as distance. Control-Option-G does the same.")
+                }
                 if info.displayBlankingSupported == true {
                     // The Mac may hold a switch back for some seconds (minimum time between display changes).
                     ToolButton(title: client.changingMacDisplay ? "Switching…" : client.macDisplayBlanked ? "Restore Mac" : "iPad only",
@@ -461,6 +470,10 @@ private struct StreamView: View {
                             Picker("Pointer size", selection: $client.pointerScale) {
                                 Text("Small").tag(0.75); Text("Medium (Mac size)").tag(1.0); Text("Large").tag(1.5); Text("Extra large").tag(2.0)
                             }.pickerStyle(.menu).disabled(!client.localPointer)
+                            Picker("Game mouse speed", selection: $client.capturedPointerSpeed) {
+                                Text("Half").tag(0.5); Text("Slower").tag(0.75); Text("Normal").tag(1.0)
+                                Text("Faster").tag(1.5); Text("Double").tag(2.0); Text("Triple").tag(3.0)
+                            }.pickerStyle(.menu)
                             Toggle("Show keyboard for text fields", isOn: $client.automaticKeyboard)
                             Toggle("Detailed statistics", isOn: $client.showTimingDetails)
                             Toggle("Sharpen text", isOn: $client.sharpenText)

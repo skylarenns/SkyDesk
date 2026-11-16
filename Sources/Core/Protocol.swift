@@ -112,6 +112,9 @@ public enum StreamFeature {
     /// open until then. Before build 44 it closed three seconds after showing Apple's prompt whether or not the
     /// prompt had been answered, and a prompt answered late installed nothing (2026-11-15).
     public static let updateSignals = 16_384
+    /// The iPad may capture the pointer and send movement as distances (`InputEvent.relative`) for games and
+    /// other apps that take the mouse (PointerCapture.swift).
+    public static let relativeMouse = 32_768
 }
 
 public struct Hello: Codable {
@@ -217,16 +220,22 @@ public struct InputEvent: Codable, Equatable {
     public var modifiers: UInt = 0 // SkyDesk: shift=1, control=2, option=4, command=8, capsLock=16.
     /// Scroll only: ScrollPhase. Optional, so older hosts simply ignore it.
     public var phase: Int? = nil
+    /// Pointer events only, with StreamFeature.relativeMouse: the pointer is captured. A move's x and y are then
+    /// distances in Mac points (not a position), and a click happens wherever the Mac's pointer is.
+    public var relative: Bool? = nil
+    public static let largestRelativeMove = 2_000.0
     public init(kind: Kind, x: Double = 0, y: Double = 0, button: Int = 0,
-                keyCode: Int = 0, isDown: Bool = false, modifiers: UInt = 0, phase: Int? = nil) {
+                keyCode: Int = 0, isDown: Bool = false, modifiers: UInt = 0, phase: Int? = nil, relative: Bool? = nil) {
         self.kind = kind; self.x = x; self.y = y; self.button = button
-        self.keyCode = keyCode; self.isDown = isDown; self.modifiers = modifiers; self.phase = phase
+        self.keyCode = keyCode; self.isDown = isDown; self.modifiers = modifiers; self.phase = phase; self.relative = relative
     }
     public var isValid: Bool {
         guard x.isFinite, y.isFinite, (0...2).contains(button), (phase ?? 1) >= 1, (phase ?? 1) <= 3,
               (0...255).contains(keyCode), modifiers & ~31 == 0 else { return false }
         switch kind {
-        case .move, .down, .up: return (0...1).contains(x) && (0...1).contains(y)
+        case .move, .down, .up:
+            if relative == true { return abs(x) <= Self.largestRelativeMove && abs(y) <= Self.largestRelativeMove }
+            return (0...1).contains(x) && (0...1).contains(y)
         case .scroll: return abs(x) <= 2_000 && abs(y) <= 2_000
         case .key: return true
         }

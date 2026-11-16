@@ -23,6 +23,13 @@ final class InputInjector {
         switch input.kind {
         case .move, .down, .up:
             if input.kind == .down { stopMomentum() }
+            if input.relative == true {
+                // Captured pointer: movement as distances, clicks wherever the Mac's pointer is (PointerCapture.swift).
+                guard let delta = capturedMove(input) else { return }
+                postPointer(input, delta: delta, flags: flags)
+                return
+            }
+            if pointerCaptured { pointerCaptured = false; relativePointer.reset(); MetricsLog.shared.append("host  pointer released by the iPad") }
             let previous = location
             location = CGPoint(x: displayBounds.minX + input.x * max(0, displayBounds.width - 1),
                                y: displayBounds.minY + input.y * max(0, displayBounds.height - 1))
@@ -41,28 +48,7 @@ final class InputInjector {
                 if input.x >= 1 - Self.onEdge, previous.x >= displayBounds.maxX - 2 { location.x = displayBounds.maxX - 1; delta.x = max(delta.x, 8); notePush("right") }
                 if input.y <= Self.onEdge, previous.y <= displayBounds.minY + 1 { location.y = displayBounds.minY; delta.y = min(delta.y, -8); notePush("top") }
             }
-            let button = CGMouseButton(rawValue: UInt32(input.button)) ?? .left
-            var type: CGEventType = .mouseMoved
-            if input.kind == .down {
-                buttons.insert(input.button)
-                type = input.button == 0 ? .leftMouseDown : input.button == 1 ? .rightMouseDown : .otherMouseDown
-                let now = CACurrentMediaTime()
-                if now - lastClickTime < NSEvent.doubleClickInterval,
-                   hypot(location.x - lastClickLocation.x, location.y - lastClickLocation.y) < 6 {
-                    clickCount = min(3, clickCount + 1)
-                } else { clickCount = 1 }
-                lastClickTime = now; lastClickLocation = location
-            } else if input.kind == .up {
-                buttons.remove(input.button)
-                type = input.button == 0 ? .leftMouseUp : input.button == 1 ? .rightMouseUp : .otherMouseUp
-            } else if buttons.contains(0) { type = .leftMouseDragged }
-            else if buttons.contains(1) { type = .rightMouseDragged }
-            let event = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: location, mouseButton: button)
-            event?.flags = flags
-            event?.setIntegerValueField(.mouseEventDeltaX, value: Int64(delta.x.rounded()))
-            event?.setIntegerValueField(.mouseEventDeltaY, value: Int64(delta.y.rounded()))
-            if input.kind != .move { event?.setIntegerValueField(.mouseEventClickState, value: clickCount) }
-            Self.post(event)
+            postPointer(input, delta: delta, flags: flags)
         case .scroll:
             if input.phase == ScrollPhase.began || input.phase == nil { stopMomentum() }
             if input.phase == ScrollPhase.began { scrollSteps.reset() }
@@ -79,6 +65,44 @@ final class InputInjector {
             event?.setIntegerValueField(.keyboardEventAutorepeat, value: repeated ? 1 : 0)
             Self.post(event)
         }
+    }
+    /// Posts a move, press or release at `location`, reporting `delta` as the distance moved.
+    private func postPointer(_ input: InputEvent, delta: CGPoint, flags: CGEventFlags) {
+        var button = CGMouseButton(rawValue: UInt32(input.button)) ?? .left
+        var type: CGEventType = .mouseMoved
+        if input.kind == .down {
+            buttons.insert(input.button)
+            type = input.button == 0 ? .leftMouseDown : input.button == 1 ? .rightMouseDown : .otherMouseDown
+            let now = CACurrentMediaTime()
+            if now - lastClickTime < NSEvent.doubleClickInterval,
+               hypot(location.x - lastClickLocation.x, location.y - lastClickLocation.y) < 6 {
+                clickCount = min(3, clickCount + 1)
+            } else { clickCount = 1 }
+            lastClickTime = now; lastClickLocation = location
+        } else if input.kind == .up {
+            buttons.remove(input.button)
+            type = input.button == 0 ? .leftMouseUp : input.button == 1 ? .rightMouseUp : .otherMouseUp
+        } else if buttons.contains(0) { type = .leftMouseDragged; button = .left }
+        else if buttons.contains(1) { type = .rightMouseDragged; button = .right }
+        else if buttons.contains(2) { type = .otherMouseDragged; button = .center }
+        let event = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: location, mouseButton: button)
+        event?.flags = flags
+        event?.setIntegerValueField(.mouseEventDeltaX, value: Int64(delta.x.rounded()))
+        event?.setIntegerValueField(.mouseEventDeltaY, value: Int64(delta.y.rounded()))
+        if input.kind != .move { event?.setIntegerValueField(.mouseEventClickState, value: clickCount) }
+        Self.post(event)
+    }
+    private var relativePointer = RelativePointer()
+    private var pointerCaptured = false
+    /// Sets `location` for a captured-pointer event and returns the distance to report; nil = nothing to post yet.
+    private func capturedMove(_ input: InputEvent) -> CGPoint? {
+        // Where the pointer really is: the game may hold it in place or have put it somewhere itself.
+        let current = CGEvent(source: nil)?.location ?? location
+        if !pointerCaptured { pointerCaptured = true; MetricsLog.shared.append("host  pointer captured by the iPad: movement arrives as distances") }
+        guard input.kind == .move else { location = current; return .zero }
+        guard let step = relativePointer.step(dx: input.x, dy: input.y, from: current, in: displayBounds) else { return nil }
+        location = step.target
+        return CGPoint(x: step.dx, y: step.dy)
     }
     /// A pinch or rotation from the iPad, replayed as the Mac trackpad gesture for the app under the pointer.
     func handle(_ gesture: GestureEvent) {

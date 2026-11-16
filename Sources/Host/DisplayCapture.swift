@@ -72,6 +72,7 @@ final class DisplayCapture: NSObject, SCStreamOutput, SCStreamDelegate {
         if inputEnabled, client & StreamFeature.liveCursorToggle != 0 { value |= StreamFeature.liveCursorToggle }
         if inputEnabled, client & StreamFeature.scrollMomentum != 0 { value |= StreamFeature.scrollMomentum }
         if inputEnabled, client & StreamFeature.gestures != 0 { value |= StreamFeature.gestures }
+        if inputEnabled, client & StreamFeature.relativeMouse != 0 { value |= StreamFeature.relativeMouse }
         if client & StreamFeature.remoteUpdate != 0 { value |= StreamFeature.remoteUpdate }
         if clipboard, client & StreamFeature.clipboardSync != 0 { value |= StreamFeature.clipboardSync }
         if files, client & StreamFeature.fileTransfer != 0 { value |= StreamFeature.fileTransfer }

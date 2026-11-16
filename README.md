@@ -2,7 +2,7 @@
 
 A native Apple remote desktop for one person's own devices. **SkyDesk Host** runs in the Mac's menu bar, captures a display and streams it as hardware-encoded HEVC. **SkyDesk** on the iPad decodes it in hardware, draws it with Metal and sends back keyboard, trackpad, touch and gesture input. The same link carries clipboard text, files in both directions, the Mac's sound, and updates of both apps. The two devices talk to each other directly: there is no account, relay or server.
 
-This file describes the code at **build 46** (`CURRENT_PROJECT_VERSION` in `project.yml`). [VERIFICATION.md](VERIFICATION.md) is the dated record of the first builds and does not describe the current state.
+This file describes the code at **build 47** (`CURRENT_PROJECT_VERSION` in `project.yml`). [VERIFICATION.md](VERIFICATION.md) is the dated record of the first builds and does not describe the current state.
 
 **No end-to-end performance figure has been measured.** 120 FPS is the default target frame rate, not a verified result. The delays the iPad shows are estimates added up from parts (see [Statistics](#statistics)); nobody has yet filmed an input and its response to check them.
 
@@ -20,14 +20,15 @@ This file describes the code at **build 46** (`CURRENT_PROJECT_VERSION` in `proj
 | 43 (the pointer snaps to the desktop's edges and keeps pushing against them, for sidebars and bars that open on an edge) | The Mac app installed itself on 2026-11-15; the iPad stayed on 42 because Apple's install prompt was answered after SkyDesk had already closed. The edge behaviour has not been tried on the real devices. |
 | 44 (the iPad stays open until the Mac sees iPadOS fetch the update; the Mac only follows an iPad that did) | Installed on 2026-11-15 (through build 43's three-second flow; the new wait is first used when updating from 44). The install prompt itself only exists on a real iPad, so the new wait had not been run end to end before that. |
 | 45 (the Mac stays in iPad only mode for a while when the iPad disconnects, and the returning iPad carries on with the same desktop) | Never staged on its own; it ships inside build 46. **None of its display handling has been run**: it only happens with the Mac's displays switched off, which is not tried from the development machine. |
-| 46 (build 45's kept desktop, now for ten minutes by default; the iPad's sound player measures the sound it has in hand by the player's own clock and sizes its cushion to the iPad's output; sound figures in the log on both sides) | Built and unit-tested. The new measure was checked with silent sound on the Mac (a stall is noticed on the first packet after it). Whether it ends the cut-outs heard on 2026-11-15 is not known: those were never measured, which is what the new log figures are for. |
+| 46 (build 45's kept desktop, now for ten minutes by default; the iPad's sound player measures the sound it has in hand by the player's own clock and sizes its cushion to the iPad's output; sound figures in the log on both sides) | Installed on 2026-11-15. Its first log lines show the iPad playing through Bluetooth with 163 ms on the way to the speaker, which is the case the old count got wrong; in the first six minutes the sound ran dry twice and a backlog was dropped twice, all at the start. The kept desktop has not been reported on yet. |
+| 47 (captured pointer for games: the mouse or trackpad sends how far it moved, the Mac moves its pointer by that and reports it) | Built and unit-tested (the arithmetic only). **Nothing of it has been run with a mouse or a game**: iPadOS's pointer lock and mouse reporting do not exist in the simulator, and the Mac side would have meant moving the pointer during a live session. |
 
 Not yet confirmed on real hardware, even in the installed builds:
 
 - that the Mac's speakers really are silent while the iPad plays its sound (the log says the Mac asked for that; nobody has yet confirmed it by ear);
 - pinch and rotate actually reaching Mac apps (a unit test shows AppKit reads the injected events as magnify and rotate events, nothing more).
 
-`swift test` runs 165 tests with no failures (last run 2026-11-15 on the build 46 sources). Tests use the Mac's hardware encoder and loopback connections; they never capture the screen.
+`swift test` runs 170 tests with no failures (last run 2026-11-15 on the build 47 sources). Tests use the Mac's hardware encoder and loopback connections; they never capture the screen.
 
 ## Requirements
 
@@ -318,6 +319,15 @@ iPad   VideoToolbox HEVC           hardware only
 
 Input events travel as small JSON messages on the control connection and are replayed on the Mac as Core Graphics events, each marked as remote so iPad only mode can tell them from someone at the Mac. Pointer positions are fractions of the desktop, mapped through the same aspect-fit and keyboard shift the renderer uses. Since build 43 a pointer within a few points of the iPad's edge is sent as exactly on the desktop's edge, and while it rests there both sides repeat the move with a push towards that edge, because sidebars, the menu bar and the Dock open on pressure against an edge, not on position. Pings and frame acknowledgements are answered on the network queue of each side, not the main thread, so interface work does not distort them.
 
+**Captured pointer (build 47).** Games and some other apps take the mouse: they hide the pointer and read how far the mouse moved, so a position is no use to them and the view would stop turning once the iPad's pointer reached the edge of the screen. **Game mouse** in the toolbar, or Control-Option-G, captures the pointer; the same again (or leaving SkyDesk) releases it. While captured:
+
+- SkyDesk asks iPadOS to hide its pointer and hold it still, and reads movement, buttons and the wheel from the mouse or trackpad itself (the GameController framework). iPadOS grants this only to a full-screen app in front. Without it, or without such a device, movement is taken from how far the pointer went, and a finger on the screen steers like a trackpad (drag to move, tap to click, two-finger tap for the right button).
+- Movement is added up and sent at most every 4 ms as a distance in Mac points, scaled by "Game mouse speed" in Settings.
+- The Mac reads where its pointer really is, moves it by the distance (stopping at the edges of the iPad's desktop) and puts the distance in the event, which is what games read. Clicks happen wherever the Mac's pointer is.
+- The Mac draws its own pointer into the picture meanwhile, because the iPad no longer knows where it is; the "iPad pointer" setting comes back on release.
+
+Not covered: games that read the mouse or a controller straight from the hardware instead of from macOS events see nothing, since there is no hardware on the Mac's side. Which way the wheel turns in captured mode is taken from another project's reading of the same framework and has not been checked.
+
 ### Sound
 
 A fourth connection, so sound never waits behind video or files. Opus packets carry 10 ms each at 128 kbit/s. The iPad keeps a cushion of 30 ms of sound, grows it towards 100 ms each time playback runs dry, and throws the backlog away if more than 220 ms is waiting, rather than play late. The Mac drops sound instead of queueing it when the connection backs up. Nothing synchronises sound with the picture.
@@ -365,7 +375,7 @@ That refusal happens after the handshake because it cannot happen in it: Apple's
 ## Tests and checks
 
 ```sh
-swift test                                  # 165 tests at build 46 (about 30 s; several open loopback sockets) (about 20 s; a few open loopback sockets)
+swift test                                  # 170 tests at build 47 (about 30 s; several open loopback sockets) (about 20 s; a few open loopback sockets)
 swift run skydesk-check --frames 120        # synthetic frames, hardware HEVC, encrypted loopback
 swift run skydesk-check --width 1920 --height 1200 --frames 240 --low-latency
 ```
@@ -374,9 +384,9 @@ The tests cover message framing and hostile input, HEVC framing, 4:4:4 colour, g
 
 `skydesk-check` encodes generated pixels, sends them over an encrypted loopback connection and decodes them. It never captures the screen, reads the clipboard or injects input. Its frames are static and not paced by a display, so its timings prove nothing about sustained frame rate or latency. Its `tls` label reports the suite actually negotiated (since build 38).
 
-Two self-checks exist for development: starting the host with `SKYDESK_SMOKE_PNG=<file>` builds its window off screen, saves a picture and exits without opening the port or touching displays; `SKYDESK_DEMO=1` in the simulator shows the streaming screen with generated frames.
+Two self-checks exist for development: starting the host with `SKYDESK_SMOKE_PNG=<file>` builds its window off screen, saves a picture and exits without opening the port or touching displays; `SKYDESK_DEMO=1` in the simulator shows the streaming screen with generated frames (`SKYDESK_DEMO=input` also shows the controls that need remote input).
 
-Still to do on the real devices: open an edge sidebar (build 43); run one update through the new wait (build 44, from the build after it); disconnect and reconnect with the kept desktop on (build 45), then press a key on the Mac to see its display return; run build 41 through the VPN and see the bitrate stay up and parity switch on; switch 4:4:4 on once; compare the Late figure with video over UDP off and on; the three unconfirmed items under [Status](#status); and film an input and its response at high speed, with both screens in view, to check the delay estimates.
+Still to do on the real devices: play something that takes the mouse with Game mouse on (build 47): turning past the screen edge, both buttons, the wheel's direction, and the pointer in the game's menus; open an edge sidebar (build 43); run one update through the new wait (build 44, from the build after it); disconnect and reconnect with the kept desktop on (build 45), then press a key on the Mac to see its display return; run build 41 through the VPN and see the bitrate stay up and parity switch on; switch 4:4:4 on once; compare the Late figure with video over UDP off and on; the three unconfirmed items under [Status](#status); and film an input and its response at high speed, with both screens in view, to check the delay estimates.
 
 ## Source map
 
