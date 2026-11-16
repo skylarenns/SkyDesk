@@ -1246,7 +1246,11 @@ final class HostModel: ObservableObject {
     }
     private func tick() {
         // Once, shortly after launch: the microphone device should be there before a Mac app looks for it.
-        if !soundOutputsRead { soundOutputsRead = true; refreshSoundOutputs() }
+        if !soundOutputsRead {
+            soundOutputsRead = true; refreshSoundOutputs()
+            if !Self.selfCheck { displayController.restoreKeyboardLight() }
+        }
+        displayController.keepKeyboardDark()
         refreshPermissions()
         checkForUpdate()
         if allowInput && !inputAllowed && capture != nil { input.releaseAll(); displayController.restore(reason: "remote input permission lost") }

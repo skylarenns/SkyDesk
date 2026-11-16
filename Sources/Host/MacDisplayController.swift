@@ -89,6 +89,7 @@ final class MacDisplayController {
             guard verified else { throw DeskError.invalid("macOS did not switch to the iPad-only desktop.") }
             settledAt = CACurrentMediaTime() + Self.settleSeconds; localMoves = []
             changing = false; onChange?(true)
+            keepKeyboardDark()
             DisplayLog.write("exclusive: \(DisplayLog.displays())")
             observeApps()
             // The iPad desktop's origin just changed. Re-seat anything left off it, again
@@ -128,9 +129,38 @@ final class MacDisplayController {
         // if the host's display cache is stale or the host exits during restoration.
         recovery?.finish(); recovery = nil
         if assertion != 0 { IOPMAssertionRelease(assertion); assertion = 0 }
+        restoreKeyboardLight()
         capturedDisplay = 0
         onLayoutChange?()
         if changed { onChange?(false) }
+    }
+    // MARK: Keyboard backlight
+
+    /// macOS lights the Mac's keyboard whenever its keyboard is used, and typing from the iPad counts: in a dark
+    /// room the keyboard of a Mac nobody is sitting at lit up again every few seconds (2026-11-16: "why does my
+    /// laptops keyboard backlight keep turning on"). While the iPad is the only display the backlight is set to
+    /// nothing, for now and without saving, and the level it had comes back with the Mac's display. Checked on
+    /// this Mac: at nothing it stayed dark for 20 s of typing from the iPad, and went back to 0.60 afterwards.
+    private static let keyboardLightKey = "keyboardLightBeforeIPadOnly"
+    /// Called on entering iPad only and once a second while it lasts. Once is not enough: macOS itself switches
+    /// the backlight off in a bright room (it then reads as nothing, as it did minutes after the check above) and
+    /// brings it back at its old level when the room goes dark.
+    func keepKeyboardDark() {
+        guard isSettled else { return }
+        let level = SkyDeskKeyboardBacklight()
+        guard level > 0.001 else { return }
+        // Kept on disk too, so a host that crashed with the keyboard dark puts the light back at its next start.
+        UserDefaults.standard.set(Double(level), forKey: Self.keyboardLightKey)
+        if SkyDeskSetKeyboardBacklight(0) { DisplayLog.write("keyboard backlight off while iPad only (was \(String(format: "%.2f", level)))") }
+        else { UserDefaults.standard.removeObject(forKey: Self.keyboardLightKey) }
+    }
+    /// Also called once at launch, for a light left off by a host that did not get to restore it.
+    func restoreKeyboardLight() {
+        guard !isEnabled, let level = UserDefaults.standard.object(forKey: Self.keyboardLightKey) as? Double else { return }
+        UserDefaults.standard.removeObject(forKey: Self.keyboardLightKey)
+        // Only while it is still dark: a level someone has set at the Mac since then is theirs.
+        guard SkyDeskKeyboardBacklight() >= 0, SkyDeskKeyboardBacklight() <= 0.001 else { return }
+        if SkyDeskSetKeyboardBacklight(Float(level)) { DisplayLog.write("keyboard backlight back to \(String(format: "%.2f", level))") }
     }
     private func installActivityMonitors() {
         let mask: NSEvent.EventTypeMask = [.keyDown, .keyUp, .flagsChanged, .mouseMoved,

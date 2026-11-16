@@ -1,4 +1,5 @@
 #import "VirtualDisplayBridge.h"
+#import <dlfcn.h>
 
 // Runtime-only declarations for the private CoreGraphics virtual-display API.
 // Kept behind this bridge; an unavailable API fails without changing a physical display.
@@ -90,3 +91,43 @@ BOOL SkyDeskPointerIsVisible(void) {
     return CGCursorIsVisible() != 0;
 #pragma clang diagnostic pop
 }
+
+// The system's own keyboard backlight interface (CoreBrightness, private). Everything is looked up at run time, so
+// a macOS without it simply reports "no keyboard".
+@interface NSObject (SkyDeskKeyboardBacklight)
+- (NSArray *)copyKeyboardBacklightIDs;
+- (float)brightnessForKeyboard:(unsigned long long)keyboard;
+- (BOOL)setBrightness:(float)brightness fadeSpeed:(int)speed commit:(BOOL)commit forKeyboard:(unsigned long long)keyboard;
+@end
+
+static id SkyDeskKeyboardClient(unsigned long long *keyboard) {
+    static id client;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        dlopen("/System/Library/PrivateFrameworks/CoreBrightness.framework/CoreBrightness", RTLD_NOW);
+        Class type = NSClassFromString(@"KeyboardBrightnessClient");
+        if ([type instancesRespondToSelector:@selector(copyKeyboardBacklightIDs)]
+            && [type instancesRespondToSelector:@selector(brightnessForKeyboard:)]
+            && [type instancesRespondToSelector:@selector(setBrightness:fadeSpeed:commit:forKeyboard:)]) {
+            client = [[type alloc] init];
+        }
+    });
+    if (!client) return nil;
+    NSArray *keyboards = [client copyKeyboardBacklightIDs];
+    if (![keyboards isKindOfClass:[NSArray class]] || keyboards.count == 0) return nil;
+    *keyboard = [keyboards.firstObject unsignedLongLongValue];
+    return client;
+}
+
+float SkyDeskKeyboardBacklight(void) {
+    unsigned long long keyboard = 0;
+    id client = SkyDeskKeyboardClient(&keyboard);
+    return client ? [client brightnessForKeyboard:keyboard] : -1;
+}
+
+BOOL SkyDeskSetKeyboardBacklight(float value) {
+    unsigned long long keyboard = 0;
+    id client = SkyDeskKeyboardClient(&keyboard);
+    return client ? [client setBrightness:value fadeSpeed:0 commit:NO forKeyboard:keyboard] : NO;
+}
+
