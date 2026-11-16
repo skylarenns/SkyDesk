@@ -460,6 +460,9 @@ private struct StreamView: View {
                             Button { client.getClipboard() } label: { Label("Get Mac clipboard", systemImage: "arrow.down.doc") }
                         }
                     }
+                    Section("Microphone") {
+                        Toggle("Send iPad microphone to Mac", isOn: $client.sendMicrophone)
+                    }
                     Section {
                         Toggle("Show statistics", isOn: $client.showStats)
                         // Settings in a submenu keep More short enough that it never scrolls under the pointer.

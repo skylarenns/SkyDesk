@@ -248,6 +248,24 @@ final class ClientModel: ObservableObject {
     /// The Mac agreed to send sound in this session.
     var soundOffered: Bool { (info?.features ?? 0) & StreamFeature.audio != 0 }
     private var audioChannel: SecureChannel?
+    private var micChannel: SecureChannel?
+    private var micCapture: MicCapture?
+    /// Send this iPad's microphone to the Mac (build 50). Never remembered: it is off whenever SkyDesk starts and
+    /// whenever a session ends, so the microphone is only ever live because it was switched on in this session.
+    @Published var sendMicrophone = false {
+        didSet {
+            guard oldValue != sendMicrophone else { return }
+            if !sendMicrophone { closeMicrophone(); return }
+            guard let info, (info.features ?? 0) & StreamFeature.microphone != 0 else {
+                notice = "The Mac isn't set up to take a microphone. In SkyDesk Host: Display & quality › Let the iPad send its microphone; it needs a loopback sound device such as BlackHole."
+                DispatchQueue.main.async { [weak self] in self?.sendMicrophone = false }
+                return
+            }
+            startMicrophoneIfWanted()
+            notice = "Microphone on. In the Mac app that should hear you, choose “\(info.microphoneName ?? "the loopback device")” as the microphone."
+        }
+    }
+    var microphoneAvailable: Bool { (info?.features ?? 0) & StreamFeature.microphone != 0 }
     /// Set by the stream view: a few words about its drawing for the diagnostic log.
     var drawNote: (() -> String)?
     private var audioPlayer: AudioPlayer?
@@ -577,7 +595,7 @@ final class ClientModel: ObservableObject {
         var features = StreamFeature.idleGapFlags | StreamFeature.pauseVideo | StreamFeature.liveCursorToggle
             | StreamFeature.clipboardSync | StreamFeature.fileTransfer | StreamFeature.scrollMomentum | StreamFeature.remoteUpdate
             | StreamFeature.gestures | StreamFeature.audio | StreamFeature.deviceKeys | StreamFeature.updateSignals
-            | StreamFeature.relativeMouse | StreamFeature.pointerHeldSignal
+            | StreamFeature.relativeMouse | StreamFeature.pointerHeldSignal | StreamFeature.microphone
         if localPointer { features |= StreamFeature.localCursor }
         if datagramVideo { features |= StreamFeature.datagramVideo }
         if sharperColour, Self.canDecodeFullColour, !UserDefaults.standard.bool(forKey: Self.colourFailedKey) { features |= StreamFeature.chroma444 }
@@ -629,6 +647,8 @@ final class ClientModel: ObservableObject {
                     }
                     if agreed & StreamFeature.fileTransfer != 0 { self.openFiles(endpoint: endpoint, credential: credential, session: session) }
                     if agreed & StreamFeature.audio != 0, self.playMacSound { self.openAudio(endpoint: endpoint, credential: credential, session: session) }
+                    self.micEndpoint = (endpoint, credential, session)
+                    self.startMicrophoneIfWanted()
                     // The Mac agreed to video over UDP: open the flow to the address this session is already using.
                     if agreed & StreamFeature.datagramVideo != 0, let remote = control?.connection.currentPath?.remoteEndpoint,
                        case .hostPort(let host, _) = remote, let port = NWEndpoint.Port(rawValue: DeskNetwork.datagramPort) {
@@ -832,6 +852,8 @@ final class ClientModel: ObservableObject {
         fileEngine?.close(reason: "Disconnected from the Mac."); fileEngine = nil
         files?.close(); files = nil; filesReady = false
         closeAudio()
+        closeMicrophone(); micEndpoint = nil
+        if sendMicrophone { sendMicrophone = false }
         info = nil; connecting = false
         if let reason { status = reason }
         textFocus = .none; keyboardWanted = false; awaitingTextFocus = false; lastTapRect = nil; remoteCursor = nil
@@ -872,6 +894,7 @@ final class ClientModel: ObservableObject {
             resumeTarget = activeTarget
             if let gate = videoGate { videoQueue?.async { gate.paused = true } }
             audioPlayer?.setSuspended(true)
+            micCapture?.setSuspended(true)
             control?.send(.pauseVideo(true))
             beginBackgroundTask()
         case .disconnectAndResumeLater:
@@ -897,6 +920,7 @@ final class ClientModel: ObservableObject {
                 videoQueue?.async { decoder.reset(); gate.needKeyframe = true; gate.paused = false }
             }
             audioPlayer?.setSuspended(false)
+            micCapture?.setSuspended(false)
             control?.send(.pauseVideo(false))
             checkClipboard()
         case .reconnect:
@@ -1202,6 +1226,43 @@ final class ClientModel: ObservableObject {
     private func closeAudio() {
         audioPlayer?.stop(); audioPlayer = nil
         audioChannel?.close(); audioChannel = nil
+    }
+
+    // MARK: Microphone
+
+    private var micEndpoint: (endpoint: NWEndpoint, credential: PairingCredential, session: UUID)?
+    private func startMicrophoneIfWanted() {
+        guard sendMicrophone, micChannel == nil, microphoneAvailable, let target = micEndpoint else { return }
+        let queue = DispatchQueue(label: "skydesk.mic.net", qos: .userInteractive)
+        let channel = SecureChannel(connection: NWConnection(to: target.endpoint, using: DeskNetwork.parameters(credentials: [target.credential])), queue: queue,
+                                    maxPendingBytes: 64 * 1_024)
+        let capture = MicCapture(channel: channel)
+        capture.onFailure = { [weak self, weak channel] reason in
+            channel?.close()
+            DispatchQueue.main.async { self?.notice = reason; self?.sendMicrophone = false }
+        }
+        let session = target.session
+        channel.onReady = { [weak channel] in
+            channel?.send(.hello(Hello(session: session, role: .microphone)))
+            capture.start()
+        }
+        channel.onClose = { [weak self, weak channel] _ in
+            capture.stop()
+            DispatchQueue.main.async {
+                guard let self, let channel, self.micChannel === channel else { return }
+                self.micChannel = nil; self.micCapture = nil
+                if self.sendMicrophone, self.info != nil { self.sendMicrophone = false; self.notice = "The microphone connection to the Mac ended." }
+            }
+        }
+        micChannel = channel; micCapture = capture
+        if inBackground { capture.setSuspended(true) }
+        channel.start()
+    }
+    private func closeMicrophone() {
+        let channel = micChannel
+        micChannel = nil
+        micCapture?.stop(); micCapture = nil
+        channel?.close()
     }
 
     // MARK: Files

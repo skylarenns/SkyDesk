@@ -2,7 +2,7 @@
 
 A native Apple remote desktop for one person's own devices. **SkyDesk Host** runs in the Mac's menu bar, captures a display and streams it as hardware-encoded HEVC. **SkyDesk** on the iPad decodes it in hardware, draws it with Metal and sends back keyboard, trackpad, touch and gesture input. The same link carries clipboard text, files in both directions, the Mac's sound, and updates of both apps. The two devices talk to each other directly: there is no account, relay or server.
 
-This file describes the code at **build 49** (`CURRENT_PROJECT_VERSION` in `project.yml`). [VERIFICATION.md](VERIFICATION.md) is the dated record of the first builds and does not describe the current state.
+This file describes the code at **build 50** (`CURRENT_PROJECT_VERSION` in `project.yml`). [VERIFICATION.md](VERIFICATION.md) is the dated record of the first builds and does not describe the current state.
 
 **No end-to-end performance figure has been measured.** 120 FPS is the default target frame rate, not a verified result. The delays the iPad shows are estimates added up from parts (see [Statistics](#statistics)); nobody has yet filmed an input and its response to check them.
 
@@ -24,13 +24,14 @@ This file describes the code at **build 49** (`CURRENT_PROJECT_VERSION` in `proj
 | 47 (captured pointer for games: the mouse or trackpad sends how far it moved, the Mac moves its pointer by that and reports it) | Installed on 2026-11-15; not yet reported on. **Nothing of it was run with a mouse or a game before that**: iPadOS's pointer lock and mouse reporting do not exist in the simulator, and the Mac side would have meant moving the pointer during a live session. |
 | 48 (the pointer is captured by itself when a Mac app takes the mouse, and given back when the app shows the pointer again) | Installed on 2026-11-15 and **wrong**: 92 seconds after connecting it captured the pointer during ordinary use of a browser and did not give it back ("this thing genuinely broke my mouse"). On a Mac driven from an iPad the pointer often reads as hidden: after typing, macOS hides it until the real mouse moves, and injected movement does not count. The 25 s of "hidden" taken as evidence for this build was that, not an app holding the mouse. |
 | 49 (automatic capture needs the pointer hidden *and* not going where it is put, and undoes itself when the pointer follows again; the Mac side of the microphone, unused until the iPad side exists) | Built and unit-tested. Not run with a game. It also rests on an assumption that has not been measured here: that in ordinary use the pointer's position, read back, is where the last movement put it. If that is false nothing is captured automatically at all, because the check must first be seen to work in each session. |
+| 50 (microphone: the iPad's microphone is sent to the Mac and played into a loopback sound device, which Mac apps use as their microphone) | Built. The Mac side is unit-tested, including playing into BlackHole on this Mac (silence, so nothing was heard). **The iPad side has not been run**: there is no microphone path in the simulator worth trusting, so capture, the permission prompt and what it does to the sound being played are untried. |
 
 Not yet confirmed on real hardware, even in the installed builds:
 
 - that the Mac's speakers really are silent while the iPad plays its sound (the log says the Mac asked for that; nobody has yet confirmed it by ear);
 - pinch and rotate actually reaching Mac apps (a unit test shows AppKit reads the injected events as magnify and rotate events, nothing more).
 
-`swift test` runs 177 tests with no failures (last run 2026-11-15 on the build 49 sources). Tests use the Mac's hardware encoder and loopback connections; they never capture the screen.
+`swift test` runs 177 tests with no failures (last run 2026-11-15 on the build 50 sources). Tests use the Mac's hardware encoder and loopback connections; they never capture the screen.
 
 ## Requirements
 
@@ -228,6 +229,13 @@ A small readout in the bottom-right corner is always shown: received bitrate, th
 
 The iPad keeps a little sound in hand (a cushion, 30 ms to start with) so uneven arrival does not break it up; when it runs dry the cushion is rebuilt slightly larger, and a backlog far above it is thrown away. Since build 46 "in hand" is read from the player's own clock (scheduled, not yet taken by the output) and the cushion is sized to how much the iPad's output takes at once, which iPadOS decides. Before that, sound counted as in hand until it had been heard, which includes the whole way to the speaker: running dry went unnoticed and sound merely on its way looked like a backlog. Both sides now log sound once a second. The iPad's line ends with `snd=` packets arrived, `gap=` longest wait between two (ms; they are sent 10 ms apart), `under=` times it ran dry, `flush=` backlogs thrown away, `reb=` engine rebuilds, `int=` interruptions, `wait=`/`cush=` sound in hand and the cushion (ms), `io=` how much the output takes at once (ms), `lat=` its delay to the speaker (ms), `out=` the output in use. The Mac's line ends with packets sent, capture buffers dropped, and the longest wait between two capture buffers.
 
+**Microphone (build 50).** macOS has no way for an app to be a microphone; that takes a sound driver. A loopback device is such a driver (BlackHole is a free one): what is played into it comes out of it as a microphone. With "Let the iPad send its microphone to this Mac" on (the default) and such a device present, the iPad offers **More › Send iPad microphone to Mac**. It is off at the start of every session and has to be switched on each time. The iPad then records its own microphone, sends it as one channel of Opus on a fifth connection, and the Mac plays it into the device chosen under "Play it into" (by default the first loopback device). In the Mac app that should hear you, choose that device as the microphone; the iPad names it when the microphone is switched on.
+
+- The iPad's built-in microphone is used even with Bluetooth headphones connected, on purpose: using the headphones' microphone switches them to their headset mode, and everything played through them then sounds like a phone call.
+- Without headphones the iPad's microphone also hears the Mac's sound coming out of the iPad's speaker, and whoever is listening on the Mac hears it back. There is no echo cancelling.
+- SkyDesk leaves its own output out of the sound it captures for the iPad, so the microphone is not played back to you.
+- The Mac's log line gains `mic N arrived, N played, ran dry N, dropped N` while it is on.
+
 ## iPad only mode
 
 **iPad only** makes the iPad the Mac's only display: it first moves existing windows onto the iPad desktop, then switches the Mac's other displays off at the WindowServer level. It is available with a separate iPad desktop, input allowed and Accessibility granted, and by default it starts by itself on every connection ("Start in iPad only mode").
@@ -379,7 +387,7 @@ That refusal happens after the handshake because it cannot happen in it: Apple's
 ## Tests and checks
 
 ```sh
-swift test                                  # 177 tests at build 49 (about 30 s; several open loopback sockets) (about 20 s; a few open loopback sockets)
+swift test                                  # 177 tests at build 50 (about 30 s; several open loopback sockets) (about 20 s; a few open loopback sockets)
 swift run skydesk-check --frames 120        # synthetic frames, hardware HEVC, encrypted loopback
 swift run skydesk-check --width 1920 --height 1200 --frames 240 --low-latency
 ```

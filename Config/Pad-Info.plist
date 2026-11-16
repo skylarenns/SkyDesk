@@ -37,6 +37,8 @@
 	<array>
 		<string>_skydesk._tcp</string>
 	</array>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Sends this iPad's microphone to your Mac when you switch it on, so Mac apps can hear you.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Find and securely connect to your SkyDesk Mac on your local network.</string>
 	<key>UIApplicationSceneManifest</key>

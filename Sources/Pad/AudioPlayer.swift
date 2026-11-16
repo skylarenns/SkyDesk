@@ -93,10 +93,8 @@ final class AudioPlayer {
     private func startEngine() throws {
         guard let decoder else { return }
         let session = AVAudioSession.sharedInstance()
-        // Mixes with whatever the iPad itself is playing instead of stopping it.
-        try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
-        try? session.setPreferredIOBufferDuration(0.005)
-        try session.setActive(true)
+        // The session is shared with the microphone (MicCapture.swift).
+        try PadAudioSession.set(playing: true)
         let engine = AVAudioEngine(), node = AVAudioPlayerNode()
         engine.attach(node)
         engine.connect(node, to: engine.mainMixerNode, format: decoder.format)
@@ -135,7 +133,7 @@ final class AudioPlayer {
         node?.stop(); engine?.stop()
         engine = nil; node = nil; decoder = nil
         report(false)
-        try? AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
+        try? PadAudioSession.set(playing: false)
     }
     private func report(_ playing: Bool) {
         guard reportedPlaying != playing else { return }
