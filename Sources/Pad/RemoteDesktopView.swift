@@ -30,6 +30,7 @@ struct RemoteDesktopView: UIViewRepresentable {
         view.controlsFrame = controlsFrame
         view.setSharpening(client.sharpenText)
         view.presentOnArrival = client.presentOnArrival
+        view.setLowDelay(client.lowDelayDisplay)
         view.setLocalCursorEnabled(client.localCursorActive)
         view.setPointerScale(client.pointerScale)
         view.setCursor(client.remoteCursor)
@@ -103,6 +104,15 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
     private let mailbox: FrameMailbox
     private var displayLink: CADisplayLink?
     private var pacer = ArrivalPacer()
+    /// Build 53: draw with a CAMetalDisplayLink asking iPadOS for the shortest wait between drawing and the screen.
+    private var lowDelay = true
+    private var metalLink: CAMetalDisplayLink?
+    /// Set when the low-delay path showed nothing while frames kept arriving; the session then keeps the old path.
+    private var lowDelayFailed = false
+    private var lowDelayCheck: Timer?
+    private var silentChecks = 0
+    private var linkRate = 120
+    private var lastPresentationTarget = 0.0
 
     init(mailbox: FrameMailbox, info: StreamInfo) {
         self.mailbox = mailbox
@@ -194,7 +204,7 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
     deinit {
         repeatTimer?.invalidate(); edgePushTimer?.invalidate(); flushWork?.cancel()
         mouseObservers.forEach { NotificationCenter.default.removeObserver($0) }
-        displayLink?.invalidate(); mailbox.onArrival(nil)
+        displayLink?.invalidate(); metalLink?.invalidate(); lowDelayCheck?.invalidate(); mailbox.onArrival(nil)
         if let deactivateObserver { NotificationCenter.default.removeObserver(deactivateObserver) }
         keyboardObservers.forEach { NotificationCenter.default.removeObserver($0) }
     }
@@ -210,19 +220,63 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
         } else { stopDisplayLink(); releaseKeys() }
     }
     private func startDisplayLink(rate: Int) {
-        displayLink?.invalidate()
-        let link = CADisplayLink(target: DisplayLinkTarget(self), selector: #selector(DisplayLinkTarget.tick(_:)))
+        linkRate = rate
+        stopDisplayLink()
         // Exactly the stream's rate, not a range: given 80–120, iPadOS chose the slow end and every frame waited
         // longer for its turn (build 35: local display 19 ms instead of 16.4).
         let fastest = Float(max(30, rate))
-        link.preferredFrameRateRange = CAFrameRateRange(minimum: fastest, maximum: fastest, preferred: fastest)
+        let range = CAFrameRateRange(minimum: fastest, maximum: fastest, preferred: fastest)
+        if lowDelay, !lowDelayFailed, let layer = layer as? CAMetalLayer {
+            let link = CAMetalDisplayLink(metalLayer: layer)
+            link.preferredFrameRateRange = range
+            // One refresh between handing out a drawable and showing it: the least iPadOS allows.
+            link.preferredFrameLatency = 1
+            link.delegate = metalTarget
+            link.add(to: .main, forMode: .common)
+            metalLink = link
+            silentChecks = 0
+            lowDelayCheck = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.checkLowDelay() }
+            return
+        }
+        let link = CADisplayLink(target: DisplayLinkTarget(self), selector: #selector(DisplayLinkTarget.tick(_:)))
+        link.preferredFrameRateRange = range
         link.add(to: .main, forMode: .common)
         displayLink = link
         mailbox.onArrival { [weak self] in DispatchQueue.main.async { self?.frameArrived() } }
     }
     func stopDisplayLink() {
         displayLink?.invalidate(); displayLink = nil
+        metalLink?.invalidate(); metalLink = nil
+        lowDelayCheck?.invalidate(); lowDelayCheck = nil
         mailbox.onArrival(nil)
+    }
+    private lazy var metalTarget = MetalLinkTarget(self)
+    /// Switches between the low-delay and the original drawing path; takes effect at once.
+    func setLowDelay(_ enabled: Bool) {
+        guard enabled != lowDelay else { return }
+        lowDelay = enabled
+        if enabled { lowDelayFailed = false }
+        guard let window else { return }
+        startDisplayLink(rate: min(targetFPS, window.screen.maximumFramesPerSecond))
+    }
+    /// Low-delay refresh: draw whatever is waiting into the drawable for this refresh.
+    fileprivate func metalTick(_ update: CAMetalDisplayLink.Update) {
+        let target = update.targetPresentationTimestamp
+        let interval = target - lastPresentationTarget
+        lastPresentationTarget = target
+        if interval > 0.001, interval < 0.1 { refreshHz = refreshHz == 0 ? 1 / interval : refreshHz * 0.9 + 0.1 / interval }
+        renderer?.draw(into: update.drawable)
+    }
+    /// Safety net: frames arriving but none reaching the screen for two checks in a row means the low-delay path
+    /// is not working on this iPad; fall back to the original one for the rest of the session.
+    private func checkLowDelay() {
+        guard metalLink != nil else { return }
+        let values = mailbox.statistics.snapshot()
+        silentChecks = values.arrivedFPS > 0 && values.fps == 0 ? silentChecks + 1 : 0
+        guard silentChecks >= 2 else { return }
+        lowDelayFailed = true
+        Breadcrumb.mark("lowdelay:failed")
+        if let window { startDisplayLink(rate: min(targetFPS, window.screen.maximumFramesPerSecond)) }
     }
     /// Every screen refresh: draw whatever is waiting (a new frame, or a redraw after a layout change).
     fileprivate func displayTick(_ link: CADisplayLink) {
@@ -237,6 +291,7 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
     /// For the diagnostic log: the display link's real rate, and how drawing on arrival is going.
     var drawNote: String {
         String(format: "hz=%.0f early=%d/%d margin=%.1f", refreshHz, pacer.hits, pacer.misses, pacer.margin * 1_000)
+            + " dl=" + (metalLink != nil ? "lowdelay" : lowDelayFailed ? "classic-fallback" : "classic")
     }
     /// A frame finished decoding. If nothing has been drawn for the coming refresh and there is still time to
     /// make it, draw now; otherwise the next tick takes it, as before.
@@ -666,6 +721,15 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
 }
 
 /// A display link keeps its target alive; this stand-in lets the view go away.
+private final class MetalLinkTarget: NSObject, CAMetalDisplayLinkDelegate {
+    private weak var view: DesktopMetalView?
+    init(_ view: DesktopMetalView) { self.view = view }
+    func metalDisplayLink(_ link: CAMetalDisplayLink, needsUpdate update: CAMetalDisplayLink.Update) {
+        guard let view else { link.invalidate(); return }
+        view.metalTick(update)
+    }
+}
+
 private final class DisplayLinkTarget {
     private weak var view: DesktopMetalView?
     init(_ view: DesktopMetalView) { self.view = view }

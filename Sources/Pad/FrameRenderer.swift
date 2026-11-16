@@ -78,18 +78,38 @@ final class FrameRenderer: NSObject, MTKViewDelegate {
     func draw(in view: MTKView) {
         // Nothing new to show: return before touching a drawable, so an idle or busy GPU never stalls the main thread.
         guard inFlight.wait(timeout: .now()) == .success else { return }
-        Breadcrumb.mark("draw:take")
-        guard let fresh = mailbox.take() ?? (needsRedraw ? current : nil) else {
-            inFlight.signal(); Breadcrumb.mark("draw:nothing"); return
-        }
-        current = fresh
+        guard let fresh = nextImage() else { inFlight.signal(); return }
         Breadcrumb.mark("draw:drawable"); defer { Breadcrumb.mark("draw:end") }
-        guard let pass = view.currentRenderPassDescriptor, let drawable = view.currentDrawable,
-              let command = commandQueue.makeCommandBuffer() else {
+        guard let pass = view.currentRenderPassDescriptor, let drawable = view.currentDrawable else {
             needsRedraw = true; inFlight.signal(); return
         }
+        submit(fresh, pass: pass, drawable: drawable, size: view.drawableSize)
+    }
+    /// Low-delay path (build 53): draws into the drawable a CAMetalDisplayLink handed out for its coming refresh.
+    /// Never calls the view's currentDrawable, which would take a second drawable from the same layer.
+    func draw(into drawable: CAMetalDrawable) {
+        guard inFlight.wait(timeout: .now()) == .success else { return }
+        guard let fresh = nextImage() else { inFlight.signal(); return }
+        Breadcrumb.mark("draw:drawable"); defer { Breadcrumb.mark("draw:end") }
+        let pass = MTLRenderPassDescriptor()
+        pass.colorAttachments[0].texture = drawable.texture
+        pass.colorAttachments[0].loadAction = .clear
+        pass.colorAttachments[0].storeAction = .store
+        pass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
+        submit(fresh, pass: pass, drawable: drawable, size: CGSize(width: drawable.texture.width, height: drawable.texture.height))
+    }
+    /// The frame to draw now: a new one, or the current one again after a layout change; nil when nothing changed.
+    private func nextImage() -> DecodedImage? {
+        Breadcrumb.mark("draw:take")
+        guard let fresh = mailbox.take() ?? (needsRedraw ? current : nil) else { Breadcrumb.mark("draw:nothing"); return nil }
+        current = fresh
+        return fresh
+    }
+    /// Called with one `inFlight` slot taken; gives it back on every path.
+    private func submit(_ fresh: DecodedImage, pass: MTLRenderPassDescriptor, drawable: MTLDrawable, size: CGSize) {
+        guard let command = commandQueue.makeCommandBuffer() else { needsRedraw = true; inFlight.signal(); return }
         Breadcrumb.mark("draw:encode")
-        let bounds = CGRect(origin: .zero, size: view.drawableSize)
+        let bounds = CGRect(origin: .zero, size: size)
         let content = CGSize(width: CVPixelBufferGetWidth(fresh.pixels), height: CVPixelBufferGetHeight(fresh.pixels))
         let fit = DesktopGeometry.keyboardAdjustedFit(content: content, in: bounds,
                                                       keyboardHeight: bounds.height * keyboardFraction, focus: focusRect)

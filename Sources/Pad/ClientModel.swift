@@ -113,6 +113,11 @@ final class ClientModel: ObservableObject {
     @Published var presentOnArrival = UserDefaults.standard.object(forKey: "presentOnArrival") as? Bool ?? false {
         didSet { UserDefaults.standard.set(presentOnArrival, forKey: "presentOnArrival") }
     }
+    /// Build 53: draw video with CAMetalDisplayLink at one refresh of frame latency, the shortest wait iPadOS offers
+    /// between drawing and the screen. Falls back to the original path for the session if nothing gets shown.
+    @Published var lowDelayDisplay = UserDefaults.standard.object(forKey: "lowDelayDisplay") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(lowDelayDisplay, forKey: "lowDelayDisplay") }
+    }
     /// Receive video as UDP datagrams when the Mac offers it (build 38): a lost packet is asked for again at once
     /// instead of holding up everything behind it. TCP is used until UDP is up and whenever it stops working.
     /// Applies from the next connection.
