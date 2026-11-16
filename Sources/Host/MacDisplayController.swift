@@ -73,7 +73,8 @@ final class MacDisplayController {
             // instead of staying behind on the Space of the display being disabled.
             DisplayLog.write("enable: iPad display \(displayID); \(DisplayLog.displays())")
             let desktops = saved.screens.map { CGDisplayBounds($0.id) }
-            _ = await windows.migrate(to: Self.usableBounds(of: displayID), desktops: desktops, apps: Self.windowApps())
+            _ = await windows.migrate(to: Self.usableBounds(of: displayID), mac: CGDisplayBounds(saved.main),
+                                      desktops: desktops, apps: Self.windowApps())
             guard generation == token, isEnabled else { return }
             seatOwnWindows(on: displayID)
             try DisplayLayout.makeExclusive(displayID, snapshot: saved)

@@ -47,4 +47,16 @@ final class WindowPlacementTests: XCTestCase {
         let rescued = WindowPlacement.restored(original: original, placed: placed, lastSeen: moved, current: stranded, mac: mac)
         XCTAssertEqual(rescued.size, moved.size); XCTAssertTrue(WindowPlacement.isContained(rescued, in: mac))
     }
+    func testWindowsRecordedWhileTheIPadWasMainGoBackOntoTheMacDisplay() {
+        // 2026-11-16 19:37:50: the iPad's desktop was made main while waiting, which put the Mac's display at
+        // x = 1376, and windows were recorded there. On return the Mac's display was at x = 0 again.
+        let recordedMac = CGRect(x: 1376, y: 0, width: 2056, height: 1329)
+        let mac = CGRect(x: 0, y: 0, width: 2056, height: 1329)
+        let window = CGRect(x: 1376 + 300, y: 120, width: 1200, height: 800)
+        let back = WindowPlacement.translated(window, recordedMac: recordedMac, mac: mac)
+        XCTAssertEqual(back, CGRect(x: 300, y: 120, width: 1200, height: 800))
+        XCTAssertTrue(WindowPlacement.isContained(back, in: mac, tolerance: 0))
+        // Recorded with the Mac's display where it is on return: nothing moves.
+        XCTAssertEqual(WindowPlacement.translated(window, recordedMac: mac, mac: mac), window)
+    }
 }

@@ -45,6 +45,14 @@ public enum WindowPlacement {
     /// iPad desktop just before the switch back; `current` is its frame afterwards.
     /// A window the user left alone returns to its original frame; one they moved or
     /// resized on the iPad keeps that and is only pulled back if it would be stranded.
+    /// A frame recorded while the Mac's display sat at `recordedMac`, in the coordinates of the arrangement where it
+    /// sits at `mac`. Build 42 makes the iPad's desktop main while waiting to connect, which moves the Mac's display
+    /// to the right of it (x = 1376), and windows were recorded there; put back at the same numbers once the Mac's
+    /// display was at x = 0 again, they landed past its right side and macOS pushed them in against the edge
+    /// (user report 2026-11-16: "the windows are all on the very edge of the screen").
+    public static func translated(_ frame: CGRect, recordedMac: CGRect, mac: CGRect) -> CGRect {
+        frame.offsetBy(dx: mac.minX - recordedMac.minX, dy: mac.minY - recordedMac.minY)
+    }
     public static func restored(original: CGRect, placed: CGRect, lastSeen: CGRect, current: CGRect, mac: CGRect) -> CGRect {
         if matches(lastSeen, placed) { return original }
         return isReachable(current, in: mac) ? current : fit(current, from: mac, into: mac)

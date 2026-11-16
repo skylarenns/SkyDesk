@@ -15,6 +15,8 @@ final class WindowMigrator: @unchecked Sendable {
     }
     private let queue = DispatchQueue(label: "skydesk.window-migration", qos: .userInitiated)
     private var entries: [Entry] = []
+    /// Where the Mac's own display was when the originals were recorded (not always where it is on return).
+    private var recordedMac: CGRect?
     private var active = false
     private var timer: DispatchSourceTimer?
     private let frozen = NSLock()
@@ -23,10 +25,11 @@ final class WindowMigrator: @unchecked Sendable {
 
     /// Step 1, while both desktops are still active: remember every movable window
     /// and move the ones on other desktops onto the iPad desktop.
-    func migrate(to target: CGRect, desktops: [CGRect], apps: [pid_t]) async -> Int {
+    /// `mac`: the Mac's own display, in the arrangement the windows are read in now.
+    func migrate(to target: CGRect, mac: CGRect?, desktops: [CGRect], apps: [pid_t]) async -> Int {
         await withCheckedContinuation { continuation in
             queue.async {
-                self.entries = []; self.active = true; self.setFrozen(false)
+                self.entries = []; self.active = true; self.setFrozen(false); self.recordedMac = mac
                 var moved = 0
                 for pid in apps {
                     for element in self.windows(of: pid) {
@@ -42,7 +45,7 @@ final class WindowMigrator: @unchecked Sendable {
                     }
                 }
                 self.startTracking()
-                DisplayLog.write("migrate: \(self.entries.count) windows recorded, \(moved) moved to \(target)")
+                DisplayLog.write("migrate: \(self.entries.count) windows recorded with the Mac display at \(mac.map { "\($0)" } ?? "?"), \(moved) moved to \(target)")
                 continuation.resume(returning: moved)
             }
         }
@@ -92,11 +95,13 @@ final class WindowMigrator: @unchecked Sendable {
             usleep(250_000) // let apps observe the new screen arrangement first
             var goals: [(AXUIElement, CGRect)] = []
             var returned = 0, kept = 0
+            let recorded = self.recordedMac ?? mac
             for entry in saved {
                 guard let current = self.frame(of: entry.element) else { continue }
-                let goal = WindowPlacement.restored(original: entry.original, placed: entry.placed,
+                let original = WindowPlacement.translated(entry.original, recordedMac: recorded, mac: mac)
+                let goal = WindowPlacement.restored(original: original, placed: entry.placed,
                                                     lastSeen: entry.lastSeen, current: current, mac: mac)
-                if WindowPlacement.matches(goal, entry.original) { returned += 1 } else { kept += 1 }
+                if WindowPlacement.matches(goal, original) { returned += 1 } else { kept += 1 }
                 goals.append((entry.element, goal))
             }
             // Two passes: some apps re-clamp their frame once after a screen change.
@@ -107,7 +112,11 @@ final class WindowMigrator: @unchecked Sendable {
                 }
                 if pass == 0 { usleep(400_000) }
             }
-            DisplayLog.write("restore: \(returned) windows to original frames, \(kept) user-moved windows kept; \(DisplayLog.displays())")
+            // What really happened, not what was asked for: a window an app or macOS put elsewhere is counted.
+            let missed = goals.filter { element, goal in self.frame(of: element).map { !WindowPlacement.matches($0, goal) } ?? false }.count
+            let shift = CGPoint(x: mac.minX - recorded.minX, y: mac.minY - recorded.minY)
+            DisplayLog.write("restore: \(returned) windows to original frames, \(kept) user-moved windows kept, \(missed) not where sent; "
+                             + "originals shifted by \(shift); \(DisplayLog.displays())")
         }
     }
     private var frozenNow: Bool { frozen.lock(); defer { frozen.unlock() }; return isFrozen }
