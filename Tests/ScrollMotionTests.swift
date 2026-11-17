@@ -35,6 +35,12 @@ final class ScrollMotionTests: XCTestCase {
         while fast.step(0.01) != nil { seconds += 0.01 }
         XCTAssertLessThanOrEqual(seconds, ScrollMomentum.maximumDuration)
     }
+    func testAZeroStepDoesNotEndTheGlide() {
+        // Build 64: a glide whose first refresh shared the fingers' last timestamp ended at once.
+        var glide = ScrollMomentum(velocity: CGPoint(x: 0, y: 300))!
+        XCTAssertEqual(glide.step(0), .zero)
+        XCTAssertGreaterThan(glide.step(1.0 / 120)?.y ?? 0, 0)
+    }
     func testPhaseIsOptionalOnTheWireAndValidated() throws {
         let old = try JSONDecoder().decode(InputEvent.self, from: Data(#"{"kind":"scroll","x":0,"y":3,"button":0,"keyCode":0,"isDown":false,"modifiers":0}"#.utf8))
         XCTAssertNil(old.phase); XCTAssertTrue(old.isValid)

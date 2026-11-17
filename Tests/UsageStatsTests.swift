@@ -64,4 +64,13 @@ final class ScrollPacerTests: XCTestCase {
         let last = pacer.next(ending: true)
         XCTAssertTrue(pacer.isEmpty); XCTAssertEqual(last.y, 23.5, accuracy: 0.001)
     }
+    func testWhatIsLeftAtLiftOffEasesOutInAFewRefreshes() {
+        // Build 64: a short scroll's last 30 points go out shrinking, not in one jump, and are all delivered.
+        var pacer = ScrollPacer(); pacer.add(CGPoint(x: 0, y: 30))
+        var steps: [Double] = []
+        while !pacer.isEmpty, steps.count < 20 { steps.append(pacer.next().y) }
+        XCTAssertEqual(steps.reduce(0, +), 30, accuracy: 0.001)
+        XCTAssertLessThanOrEqual(steps.count, 6)
+        XCTAssertEqual(steps, steps.sorted(by: >))
+    }
 }

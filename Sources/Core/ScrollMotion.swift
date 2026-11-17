@@ -37,8 +37,11 @@ public struct ScrollMomentum {
         self.velocity = CGPoint(x: velocity.x * scale, y: velocity.y * scale)
     }
     /// Advances by `dt` seconds. Returns the distance to scroll, or nil when the glide is over.
+    /// A zero step (two refreshes with one timestamp) moves nothing but does not end the glide (build 64: glides that
+    /// began in the same refresh the fingers' last movement went out were ended at once, logged as "lasted 0.00 s").
     public mutating func step(_ dt: Double) -> CGPoint? {
-        guard dt > 0, elapsed < Self.maximumDuration, hypot(velocity.x, velocity.y) >= Self.stopBelow else { return nil }
+        guard elapsed < Self.maximumDuration, hypot(velocity.x, velocity.y) >= Self.stopBelow else { return nil }
+        guard dt > 0 else { return .zero }
         elapsed += dt
         // Exact integral of v·k^t over the step, so the total distance does not depend on the tick rate.
         let k = log(Self.decayPerMillisecond) * 1_000
@@ -70,8 +73,9 @@ public enum ModifierSync {
 /// together and then none. Applied on arrival, the app moved in lurches: the Mac drew 60 to 100 distinct frames a
 /// second while scrolling, though every frame drawn was captured, encoded and shown. Here what has arrived waits
 /// in `pending` and each refresh takes a share of it, so two movements arriving together are spread over two
-/// refreshes. The cost is about one refresh of delay. A small remainder, or anything left at the gesture's end,
-/// goes out whole.
+/// refreshes. The cost is about one refresh of delay. A small remainder goes out whole. Build 64: what is left when
+/// the fingers lift is eased out the same way rather than sent in one jump (user report 2026-11-17: "when i only
+/// scroll for a teeny amount it stops very harshly"); only an interrupted gesture lets everything out at once.
 public struct ScrollPacer: Equatable {
     public static let share = 0.5
     /// Below this (points) the remainder goes out in one step.

@@ -175,9 +175,10 @@ final class InputInjector {
         ticker.start()
     }
     private func glide(now: Double) {
-        let dt = min(0.05, max(0, now - momentumLast)); momentumLast = now
+        let dt = min(0.05, max(0, now - momentumLast)); momentumLast = max(momentumLast, now)
         guard var glide = momentum, let delta = glide.step(dt) else { stopMomentum(); return }
         momentum = glide
+        guard delta != .zero else { return }
         let step = scrollSteps.step(delta)
         postScroll(step, flags: [], phase: 0, momentumPhase: momentumStarted ? 2 : 1)
         momentumStarted = true
@@ -223,10 +224,10 @@ final class InputInjector {
     /// One display refresh. Returns whether there is more to do (otherwise the ticker stops).
     private func refresh(now: Double) -> Bool {
         if fingerScrolling {
-            let out = pacer.next(ending: fingerEnding)
+            let out = pacer.next()
             let step = scrollSteps.step(out)
             if step.x != 0 || step.y != 0 { postScroll(step, flags: pacedFlags, phase: 2, momentumPhase: 0); notePacedStep() }
-            if fingerEnding && pacer.isEmpty { finishFinger() }
+            if fingerEnding && pacer.isEmpty { finishFinger(); return true }
         }
         if glideRunning { glide(now: now) }
         else if !fingerScrolling, momentum != nil { glideRunning = true; momentumLast = now }
@@ -237,6 +238,7 @@ final class InputInjector {
         if rest.x != 0 || rest.y != 0 { postScroll(rest, flags: pacedFlags, phase: 2, momentumPhase: 0) }
         postScroll((0, 0), flags: pacedFlags, phase: 4, momentumPhase: 0)
         fingerScrolling = false; fingerEnding = false; pacer.reset()
+        // The glide's first step comes on the next refresh, a whole refresh after this one.
         if momentum != nil { glideRunning = true; momentumLast = CACurrentMediaTime() }
     }
 
