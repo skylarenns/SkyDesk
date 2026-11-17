@@ -140,6 +140,32 @@ final class HostAudio {
         watchOutputDevice()
         sync()
     }
+
+    // MARK: SkyDesk Speakers (build 65)
+
+    /// The output this object itself last chose, so the change notice it causes is not taken for the user's choice.
+    private var expectedOutput: AudioObjectID?
+    /// With SkyDesk Speakers installed, the Mac's Sound output menu is the switch: sound goes to the iPad only
+    /// while SkyDesk Speakers is chosen, and nothing on the Mac needs silencing (that output makes no sound).
+    private var speakers: AudioObjectID? { SpeakersDriver.device() }
+    /// Chooses SkyDesk Speakers or the Mac's own output to match the session and the user's last choice.
+    private func route() {
+        guard speakers != nil else { return }
+        let toPad = !stopped && !paused && padPlaying && SpeakersDriver.wanted
+        let switched = toPad ? SpeakersDriver.routeToPad() : SpeakersDriver.routeToMac()
+        if switched { expectedOutput = SpeakersDriver.defaultOutput() }
+    }
+    /// A change of output made in the Sound menu during a session becomes the choice for later sessions.
+    private func noteOutputChange(_ output: AudioObjectID?) {
+        defer { expectedOutput = nil }
+        guard let speakers, output != expectedOutput, !stopped, !paused else { return }
+        let chose = output == speakers
+        if SpeakersDriver.wanted != chose {
+            SpeakersDriver.wanted = chose
+            MetricsLog.shared.append("host  sound output chosen in the Sound menu: " + (chose ? "SkyDesk Speakers (iPad plays)" : "a Mac output (Mac plays)"))
+        }
+        if !chose, let output { SpeakersDriver.previousUID = SpeakersDriver.uid(of: output) }
+    }
     func setPadPlaying(_ playing: Bool) {
         guard padPlaying != playing else { return }
         padPlaying = playing
@@ -165,6 +191,15 @@ final class HostAudio {
     }
     private func sync(force: Bool = false) {
         guard #available(macOS 14.2, *), let worker = worker as? AudioCaptureWorker else { return }
+        if let speakers {
+            route()
+            // Captured while the sound goes into SkyDesk Speakers, and at the start of a session that will use it:
+            // the iPad only says it is playing once sound has reached it, and the switch waits for that.
+            let onSpeakers = SystemAudioTap.defaultOutput() == speakers
+            let starting = !padPlaying && SpeakersDriver.wanted
+            worker.set(running: !stopped && !paused && (onSpeakers || starting), muted: false, force: force)
+            return
+        }
         worker.set(running: !stopped && !paused, muted: heardSound && padPlaying && !paused, force: force)
     }
     func statisticsText() -> String? {
@@ -184,6 +219,7 @@ final class HostAudio {
                 let output = SystemAudioTap.defaultOutput()
                 guard output != self.lastOutput else { return }
                 self.lastOutput = output
+                self.noteOutputChange(output)
                 self.restartWork?.cancel()
                 let work = DispatchWorkItem { [weak self] in MainActor.assumeIsolated { self?.sync(force: true) } }
                 self.restartWork = work

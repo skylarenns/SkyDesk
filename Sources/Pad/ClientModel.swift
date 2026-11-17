@@ -1008,23 +1008,30 @@ final class ClientModel: ObservableObject {
     /// Seconds left before SkyDesk steps aside for the update (nil = not counting down).
     @Published var closingForUpdate: Int?
     private var closeForUpdateWork: DispatchWorkItem?
-    /// iPadOS only replaces an app once it is no longer on screen, so after starting the install SkyDesk counts
-    /// down, disconnects cleanly (the Mac then updates itself) and goes to the Home Screen.
-    private func scheduleCloseForUpdate(seconds: Int = 3) {
+    /// iPadOS only replaces an app once it is no longer on screen, so after starting the install SkyDesk
+    /// disconnects cleanly (the Mac then updates itself) and goes to the Home Screen. With a countdown only when
+    /// nothing else said the install had begun (older Macs); once the download has started there is nothing to
+    /// wait for (build 65, user request 2026-11-17: no "closing in 3 2 1" when it already waited for the button).
+    private func scheduleCloseForUpdate(seconds: Int = 0) {
+        guard seconds > 0 else { closeForUpdateNow(); return }
         closingForUpdate = seconds
         let work = DispatchWorkItem { [weak self] in
             guard let self, let left = self.closingForUpdate else { return }
             if left > 1 { self.scheduleCloseForUpdate(seconds: left - 1); return }
-            self.closingForUpdate = nil
-            self.releaseInput()
-            self.disconnect(reason: "Updating SkyDesk…")
-            // Not an exit: the same as pressing Home. iPadOS then installs and the app reopens fresh.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
-                UIControl().sendAction(Selector(("suspend")), to: UIApplication.shared, for: nil)
-            }
+            self.closeForUpdateNow()
         }
         closeForUpdateWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: work)
+    }
+    private func closeForUpdateNow() {
+        closeForUpdateWork?.cancel(); closeForUpdateWork = nil
+        closingForUpdate = nil
+        releaseInput()
+        disconnect(reason: "Updating SkyDesk…")
+        // Not an exit: the same as pressing Home. iPadOS then installs and the app reopens fresh.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+            UIControl().sendAction(Selector(("suspend")), to: UIApplication.shared, for: nil)
+        }
     }
     func stayOpenForUpdate() {
         closeForUpdateWork?.cancel(); closeForUpdateWork = nil; closingForUpdate = nil
@@ -1197,7 +1204,7 @@ final class ClientModel: ObservableObject {
                         self.stayOpenForUpdate()
                         self.updateDownload = .waitingForPrompt
                     } else {
-                        self.scheduleCloseForUpdate()
+                        self.scheduleCloseForUpdate(seconds: 3)
                     }
                 } else if let error = error as? URLError, [.serverCertificateUntrusted, .serverCertificateHasUnknownRoot,
                           .serverCertificateNotYetValid, .serverCertificateHasBadDate, .secureConnectionFailed].contains(error.code) {

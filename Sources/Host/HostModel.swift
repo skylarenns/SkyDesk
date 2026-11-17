@@ -68,6 +68,32 @@ final class HostModel: ObservableObject {
     @Published private(set) var soundOutputs: [SoundOutput] = []
     var microphoneTarget: SoundOutput? { SoundOutputs.microphoneTarget(saved: microphoneDeviceUID, among: soundOutputs) }
     func refreshSoundOutputs() { soundOutputs = SoundOutputs.all(); updateMicrophoneAlias() }
+
+    // MARK: SkyDesk Speakers (build 65)
+
+    @Published private(set) var speakersInstalled = SpeakersDriver.installedVersion != nil
+    @Published private(set) var speakersBusy = false
+    @Published private(set) var speakersNote: String?
+    /// Installs (or updates) the driver behind macOS's administrator prompt. Core Audio restarts, so any sound
+    /// playing stops for a moment.
+    func installSpeakers() { changeSpeakers(install: true) }
+    func removeSpeakers() { changeSpeakers(install: false) }
+    private func changeSpeakers(install: Bool) {
+        speakersBusy = true; speakersNote = install ? "Installing…" : "Removing…"
+        let finish: @Sendable (String?) -> Void = { [weak self] problem in
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.speakersBusy = false
+                    self.speakersInstalled = SpeakersDriver.installedVersion != nil
+                    self.speakersNote = problem ?? (install ? "Added. It's in the Sound menu now." : "Removed.")
+                    MetricsLog.shared.append("host  SkyDesk Speakers " + (install ? "install" : "removal") + ": " + (problem ?? "done"))
+                    self.refreshSoundOutputs()
+                }
+            }
+        }
+        if install { SpeakersDriver.install(done: finish) } else { SpeakersDriver.uninstall(done: finish) }
+    }
     /// The loopback device under the name "SkyDesk Microphone", so it is easy to find in Mac apps.
     private let microphoneAlias = MicrophoneAlias()
     @Published private(set) var microphoneName: String?

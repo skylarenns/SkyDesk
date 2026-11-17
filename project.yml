@@ -9,7 +9,7 @@ settings:
     SWIFT_VERSION: "5.0"
     SWIFT_STRICT_CONCURRENCY: targeted
     MARKETING_VERSION: "0.1.0"
-    CURRENT_PROJECT_VERSION: 64
+    CURRENT_PROJECT_VERSION: 65
     ENABLE_USER_SCRIPT_SANDBOXING: YES
     CODE_SIGN_STYLE: Automatic
     GENERATE_INFOPLIST_FILE: NO
@@ -32,6 +32,12 @@ targets:
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Host/SkyDesk-Bridging-Header.h
     dependencies:
+      - target: SkyDeskSpeakers
+        link: false
+        embed: true
+        codeSign: true
+        copy:
+          destination: resources
       - target: SkyDeskRestore
         link: false
         embed: true
@@ -41,6 +47,21 @@ targets:
           subpath: Contents/Helpers
     scheme:
       gatherCoverageData: false
+  # Core Audio driver for the "SkyDesk Speakers" output (build 65). Installed from the host window.
+  SkyDeskSpeakers:
+    type: bundle
+    platform: macOS
+    sources: [Sources/Speakers]
+    settings:
+      base:
+        PRODUCT_NAME: SkyDesk Speakers
+        PRODUCT_BUNDLE_IDENTIFIER: com.skylar.skydesk.speakers
+        WRAPPER_EXTENSION: driver
+        INFOPLIST_FILE: Config/Speakers-Info.plist
+        SKIP_INSTALL: YES
+    dependencies:
+      - sdk: CoreAudio.framework
+      - sdk: CoreFoundation.framework
   SkyDeskRestore:
     type: tool
     platform: macOS

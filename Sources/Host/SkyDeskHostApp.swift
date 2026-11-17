@@ -35,6 +35,8 @@ final class HostAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         let quiet = Self.launchedAtLogin(loginItemOn: login.enabled) || Self.relaunchedHidden()
         login.enableOnFirstRun()
+        // SkyDesk Host quit (or crashed) while the sound was going to the iPad: give the Mac its own output back.
+        SpeakersDriver.routeToMac()
         let workspace = NSWorkspace.shared.notificationCenter
         observers.append(workspace.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.host.sleep() }
@@ -496,8 +498,18 @@ private struct HostView: View {
                 Toggle("Sync clipboard text with the iPad automatically", isOn: $host.allowClipboard)
                 Toggle("Allow file transfers (incoming files go to Downloads)", isOn: $host.allowFiles)
                 Toggle("Play this Mac's sound on the iPad", isOn: $host.allowAudio)
-                Text("The Mac's own speakers go quiet only while the iPad is playing. macOS asks once for permission to record system audio.")
+                Text(host.speakersInstalled
+                     ? "While the iPad plays, the Mac's sound output is “SkyDesk Speakers”. Choose another output in the Sound menu to play on the Mac instead; SkyDesk remembers the choice, and switches back to your own output when the iPad stops."
+                     : "The Mac's own speakers go quiet only while the iPad is playing. macOS asks once for permission to record system audio.")
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                HStack {
+                    if !host.speakersInstalled || !SpeakersDriver.upToDate {
+                        Button(host.speakersInstalled ? "Update SkyDesk Speakers…" : "Add SkyDesk Speakers to the Sound menu…") { host.installSpeakers() }
+                    } else {
+                        Button("Remove SkyDesk Speakers…") { host.removeSpeakers() }
+                    }
+                    if let note = host.speakersNote { Text(note).font(.caption).foregroundStyle(.secondary) }
+                }.disabled(host.speakersBusy)
                 Toggle("Let the iPad send its microphone to this Mac", isOn: $host.allowMicrophone)
                     .onAppear { host.refreshSoundOutputs() }
                 if host.allowMicrophone {
