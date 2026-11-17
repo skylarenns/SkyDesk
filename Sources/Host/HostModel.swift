@@ -28,6 +28,10 @@ final class HostModel: ObservableObject {
     @Published var useiPadDesktop = UserDefaults.standard.object(forKey: "useiPadDesktop") as? Bool ?? true {
         didSet { UserDefaults.standard.set(useiPadDesktop, forKey: "useiPadDesktop") }
     }
+    /// Scroll movement from the iPad goes to Mac apps in even steps, one per display refresh (build 63).
+    @Published var paceScrolling = UserDefaults.standard.object(forKey: "paceScrolling") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(paceScrolling, forKey: "paceScrolling"); input.paceScrolling = paceScrolling }
+    }
     @Published var fps = HostModel.saved("fps", among: [30, 60, 120], default: 120) {
         didSet { UserDefaults.standard.set(fps, forKey: "fps") }
     }
@@ -806,6 +810,7 @@ final class HostModel: ObservableObject {
         } catch { channel.close(reason: error.localizedDescription) }
     }
     private func beginCapture() {
+        input.paceScrolling = paceScrolling
         guard !startingCapture, capture == nil, let video, let control, let sessionID else { return }
         startingCapture = true
         let token = generation

@@ -41,3 +41,27 @@ final class UsageStatsTests: XCTestCase {
                        "open=1.0m sess=1.0m drain=0%/0m cpu=20/20 gpu=1.2/1.2 therm=0")
     }
 }
+
+final class ScrollPacerTests: XCTestCase {
+    func testMovementsArrivingTogetherAreSpreadOverRefreshes() {
+        // Steady input, 10 points a refresh: after the first refresh, steps settle at about 10 a refresh.
+        var pacer = ScrollPacer()
+        var steps: [Double] = []
+        for _ in 0..<20 { pacer.add(CGPoint(x: 0, y: 10)); steps.append(pacer.next().y) }
+        XCTAssertEqual(steps.last ?? 0, 10, accuracy: 0.01)
+        // Wi-Fi delivers two at once, then none: on arrival that was 20, 0, 20, 0. Paced, the steps stay close.
+        pacer = ScrollPacer(); steps = []
+        for refresh in 0..<40 {
+            if refresh % 2 == 0 { pacer.add(CGPoint(x: 0, y: 10)); pacer.add(CGPoint(x: 0, y: 10)) }
+            steps.append(pacer.next().y)
+        }
+        let late = steps.suffix(20)
+        XCTAssertLessThan((late.max() ?? 0) - (late.min() ?? 0), 10.1)   // against 20 unpaced
+        XCTAssertEqual(late.reduce(0, +) / Double(late.count), 10, accuracy: 0.5)
+        // Nothing is lost, and the end lets everything out.
+        pacer = ScrollPacer(); pacer.add(CGPoint(x: 3, y: 47))
+        _ = pacer.next()
+        let last = pacer.next(ending: true)
+        XCTAssertTrue(pacer.isEmpty); XCTAssertEqual(last.y, 23.5, accuracy: 0.001)
+    }
+}

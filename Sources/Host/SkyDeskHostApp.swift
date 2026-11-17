@@ -492,6 +492,7 @@ private struct HostView: View {
                 }
                 Toggle("Lower the bitrate when the network is slow (recommended)", isOn: $host.adaptiveBitrate)
                 Toggle("Allow keyboard, trackpad and touch input", isOn: $host.allowInput)
+                Toggle("Smooth scrolling (even steps, about 8 ms later)", isOn: $host.paceScrolling)
                 Toggle("Sync clipboard text with the iPad automatically", isOn: $host.allowClipboard)
                 Toggle("Allow file transfers (incoming files go to Downloads)", isOn: $host.allowFiles)
                 Toggle("Play this Mac's sound on the iPad", isOn: $host.allowAudio)

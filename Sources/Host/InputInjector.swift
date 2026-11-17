@@ -12,7 +12,6 @@ final class InputInjector {
     private var clickCount: Int64 = 1
     private var scrollSteps = ScrollAccumulator()
     private var momentum: ScrollMomentum?
-    private var momentumTimer: Timer?
     private var momentumLast = 0.0
     private var momentumStarted = false
     private var gestures: Set<GestureEvent.Kind> = []
@@ -56,6 +55,11 @@ final class InputInjector {
         case .scroll:
             if input.phase == ScrollPhase.began || input.phase == nil { stopMomentum() }
             if input.phase == ScrollPhase.began { scrollSteps.reset() }
+            noteScrollArrival()
+            if paceScrolling, let phase = input.phase {
+                pacedScroll(CGPoint(x: input.x, y: input.y), phase: phase, flags: flags)
+                return
+            }
             let step = scrollSteps.step(CGPoint(x: input.x, y: input.y))
             // Whole points only reach the Mac, but the fractions carry over (slow scrolls used to be rounded away).
             guard input.phase != nil || step.x != 0 || step.y != 0 else { return }
@@ -163,13 +167,15 @@ final class InputInjector {
     /// Lift-off velocity from the iPad (points per second): glide on, generated here at 120 Hz.
     func startMomentum(velocity: CGPoint) {
         stopMomentum()
-        guard let glide = ScrollMomentum(velocity: velocity) else { return }
+        noteGlide(start: velocity)
+        guard let glide = ScrollMomentum(velocity: velocity) else { noteGlideEnd(); return }
         momentum = glide; momentumStarted = false; momentumLast = CACurrentMediaTime()
-        let timer = Timer(timeInterval: 1.0 / 120, repeats: true) { [weak self] _ in MainActor.assumeIsolated { self?.glide() } }
-        RunLoop.main.add(timer, forMode: .common); momentumTimer = timer
+        // With paced scrolling the glide waits until the fingers' last movement has gone out and their end posted.
+        if !fingerScrolling { glideRunning = true }
+        ticker.start()
     }
-    private func glide() {
-        let now = CACurrentMediaTime(); let dt = min(0.05, now - momentumLast); momentumLast = now
+    private func glide(now: Double) {
+        let dt = min(0.05, max(0, now - momentumLast)); momentumLast = now
         guard var glide = momentum, let delta = glide.step(dt) else { stopMomentum(); return }
         momentum = glide
         let step = scrollSteps.step(delta)
@@ -177,10 +183,89 @@ final class InputInjector {
         momentumStarted = true
     }
     func stopMomentum() {
-        guard momentumTimer != nil else { return }
-        momentumTimer?.invalidate(); momentumTimer = nil; momentum = nil
+        guard momentum != nil || glideRunning else { return }
+        momentum = nil; glideRunning = false
         if momentumStarted { postScroll((0, 0), flags: [], phase: 0, momentumPhase: 3) }
         momentumStarted = false
+        noteGlideEnd()
+    }
+
+    // MARK: Paced scrolling (build 63)
+
+    /// Scroll movement goes out in even portions, one per display refresh (ScrollPacer). Host setting.
+    var paceScrolling = true
+    private var pacer = ScrollPacer()
+    private var fingerScrolling = false, fingerEnding = false
+    private var pacedFlags: CGEventFlags = []
+    private var glideRunning = false
+    private lazy var ticker: DisplayTicker = {
+        let ticker = DisplayTicker { [weak self] now in self?.refresh(now: now) ?? false }
+        ticker.screen = { [weak self] in
+            guard let bounds = self?.displayBounds else { return nil }
+            return NSScreen.screens.first { screen in
+                (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber).map { CGDisplayBounds($0.uint32Value) == bounds } ?? false
+            }
+        }
+        return ticker
+    }()
+    private func pacedScroll(_ delta: CGPoint, phase: Int, flags: CGEventFlags) {
+        pacedFlags = flags
+        if phase == ScrollPhase.began {
+            // A gesture still letting out its last movement ends first, so apps never see two at once.
+            if fingerScrolling { finishFinger() }
+            pacer.reset(); fingerScrolling = true; fingerEnding = false
+            postScroll((0, 0), flags: flags, phase: 1, momentumPhase: 0)
+        } else if !fingerScrolling { return }
+        pacer.add(delta)
+        if phase == ScrollPhase.ended { fingerEnding = true }
+        ticker.start()
+    }
+    /// One display refresh. Returns whether there is more to do (otherwise the ticker stops).
+    private func refresh(now: Double) -> Bool {
+        if fingerScrolling {
+            let out = pacer.next(ending: fingerEnding)
+            let step = scrollSteps.step(out)
+            if step.x != 0 || step.y != 0 { postScroll(step, flags: pacedFlags, phase: 2, momentumPhase: 0); notePacedStep() }
+            if fingerEnding && pacer.isEmpty { finishFinger() }
+        }
+        if glideRunning { glide(now: now) }
+        else if !fingerScrolling, momentum != nil { glideRunning = true; momentumLast = now }
+        return fingerScrolling ? !pacer.isEmpty || fingerEnding : glideRunning
+    }
+    private func finishFinger() {
+        let rest = scrollSteps.step(pacer.next(ending: true))
+        if rest.x != 0 || rest.y != 0 { postScroll(rest, flags: pacedFlags, phase: 2, momentumPhase: 0) }
+        postScroll((0, 0), flags: pacedFlags, phase: 4, momentumPhase: 0)
+        fingerScrolling = false; fingerEnding = false; pacer.reset()
+        if momentum != nil { glideRunning = true; momentumLast = CACurrentMediaTime() }
+    }
+
+    // MARK: Scroll log (build 63)
+
+    private var scrollIn = 0, scrollOut = 0, scrollGapMax = 0.0, lastScrollArrival = 0.0, scrollSecond = 0.0
+    private var glideStart: (speed: Double, at: Double)?
+    private func noteScrollArrival() {
+        let now = CACurrentMediaTime()
+        if lastScrollArrival > 0, now - lastScrollArrival < 0.2 { scrollGapMax = max(scrollGapMax, now - lastScrollArrival) }
+        lastScrollArrival = now; scrollIn += 1
+        flushScrollLog(now: now)
+    }
+    private func notePacedStep() { scrollOut += 1 }
+    /// At most once a second while scrolling: how many movements came in, the longest gap between two of them
+    /// inside a gesture, and how many even steps went out.
+    private func flushScrollLog(now: Double) {
+        if scrollSecond == 0 { scrollSecond = now; return }
+        guard now - scrollSecond >= 1 else { return }
+        MetricsLog.shared.append(String(format: "host  scroll: %d movements in, longest gap %.1f ms, %d steps out%@",
+                                        scrollIn, scrollGapMax * 1_000, scrollOut, paceScrolling ? " (paced)" : " (as they came)"))
+        scrollSecond = now; scrollIn = 0; scrollOut = 0; scrollGapMax = 0
+    }
+    private func noteGlide(start velocity: CGPoint) { glideStart = (hypot(velocity.x, velocity.y), CACurrentMediaTime()) }
+    private func noteGlideEnd() {
+        guard let start = glideStart else { return }
+        glideStart = nil
+        MetricsLog.shared.append(String(format: "host  glide from %.0f pt/s lasted %.2f s%@", start.speed, CACurrentMediaTime() - start.at,
+                                        start.speed < 60 ? " (too slow to glide)" : ""))
     }
     /// Continuous (trackpad-style) pixel scrolling with macOS phases, so apps scroll smoothly and rubber-band.
     private func postScroll(_ step: (x: Int32, y: Int32), flags: CGEventFlags, phase: Int64, momentumPhase: Int64) {
@@ -193,7 +278,8 @@ final class InputInjector {
     /// SkyDesk phase → CGScrollPhase (began 1, changed 2, ended 4).
     private static func cgPhase(_ phase: Int) -> Int64 { phase == ScrollPhase.began ? 1 : phase == ScrollPhase.changed ? 2 : 4 }
     func releaseAll() {
-        stopMomentum()
+        if fingerScrolling { finishFinger() }
+        stopMomentum(); ticker.stop()
         // An unfinished pinch or rotation would leave the Mac app waiting for its end.
         for kind in gestures { postGesture(GestureEvent(kind: kind, value: 0, phase: ScrollPhase.ended)) }
         gestures.removeAll()

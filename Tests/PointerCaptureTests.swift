@@ -64,13 +64,13 @@ final class PointerCaptureTests: XCTestCase {
         var changes: [(Double, Bool)] = []
         // The game puts it back in the middle of its window each time (a point or two either way).
         let middle = CGPoint(x: 688, y: 516)
-        for step in 0..<40 {
+        for step in 0..<130 {
             let now = Double(step) * 0.008
             let actual = CGPoint(x: middle.x + Double(step % 3), y: middle.y - Double(step % 2))
             if let held = mac.note(hidden: true, moved: true, followed: false, actual: actual, now: now) { changes.append((now, held)) }
         }
         XCTAssertEqual(changes.count, 1); XCTAssertEqual(changes.first?.1, true)
-        XCTAssertEqual(changes.first?.0 ?? 0, 0.304, accuracy: 0.001)
+        XCTAssertEqual(changes.first?.0 ?? 0, 1.0, accuracy: 0.001)
         // Given back once the pointer has been showing for a fifth of a second, movement or not; one flash does not count.
         XCTAssertNil(mac.note(hidden: false, moved: false, followed: nil, now: 1.00))
         XCTAssertNil(mac.note(hidden: true, moved: false, followed: nil, now: 1.05))
@@ -112,16 +112,16 @@ final class PointerCaptureTests: XCTestCase {
         // A wrong capture must undo itself: the pointer follows again, so the hold ends without waiting for it to show.
         var mac = PointerHoldDetector()
         for step in 0..<PointerHoldDetector.provenAfter { _ = mac.note(hidden: false, moved: true, followed: true, now: -1 + Double(step) * 0.008) }
-        for step in 0..<40 { _ = mac.note(hidden: true, moved: true, followed: false, actual: CGPoint(x: 688, y: 516), now: Double(step) * 0.008) }
+        for step in 0..<130 { _ = mac.note(hidden: true, moved: true, followed: false, actual: CGPoint(x: 688, y: 516), now: Double(step) * 0.008) }
         XCTAssertTrue(mac.held)
         var released: Double?
         for step in 0..<100 where released == nil {
-            let now = 1 + Double(step) * 0.008
+            let now = 2 + Double(step) * 0.008
             if mac.note(hidden: true, moved: true, followed: true, now: now) == false { released = now }
         }
-        XCTAssertEqual(released ?? 0, 1.304, accuracy: 0.001)
+        XCTAssertEqual(released ?? 0, 2.304, accuracy: 0.001)
         // While the game keeps putting it back, it stays held.
-        for step in 0..<40 { _ = mac.note(hidden: true, moved: true, followed: false, actual: CGPoint(x: 688, y: 516), now: 3 + Double(step) * 0.008) }
+        for step in 0..<130 { _ = mac.note(hidden: true, moved: true, followed: false, actual: CGPoint(x: 688, y: 516), now: 3 + Double(step) * 0.008) }
         XCTAssertTrue(mac.held)
         for step in 0..<1_000 { XCTAssertNil(mac.note(hidden: true, moved: true, followed: step % 9 == 0, now: 4 + Double(step) * 0.008)) }
         XCTAssertTrue(mac.held)

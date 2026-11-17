@@ -188,8 +188,12 @@ final class ClientModel: ObservableObject {
     }
     /// Capture by itself when the Mac reports that an app has taken the mouse, and release when it gives it back
     /// (build 48). The toolbar button and Control-Option-G still do it by hand.
-    @Published var autoCapturePointer = UserDefaults.standard.object(forKey: "autoCapturePointer") as? Bool ?? true {
-        didSet { UserDefaults.standard.set(autoCapturePointer, forKey: "autoCapturePointer"); updatePointerCapture(announce: false) }
+    ///
+    /// Off unless switched on (build 63, a new key so an earlier "on" is not carried over): it captured in
+    /// ordinary use three times on 2026-11-17 ("it keeps entering game mode ... even when my mouse isn't
+    /// captured"), each time with the Mac's pointer readings frozen for a moment, which a stalled Mac also does.
+    @Published var autoCapturePointer = UserDefaults.standard.object(forKey: "autoCapturePointer63") as? Bool ?? false {
+        didSet { UserDefaults.standard.set(autoCapturePointer, forKey: "autoCapturePointer63"); updatePointerCapture(announce: false) }
     }
     private var captureByHand = false
     /// The Mac's word on whether an app there holds the mouse (StreamFeature.pointerHeldSignal).

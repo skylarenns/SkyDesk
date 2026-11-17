@@ -62,3 +62,33 @@ public enum ModifierSync {
         keys.filter { actual & $0.bit == 0 }.flatMap(\.usages).filter(held.contains).sorted()
     }
 }
+
+/// Scroll movement handed to the Mac app in even portions, one per display refresh (build 63, user report
+/// 2026-11-17: "the scrolling is just like stuttery and not the 120fps smooth that i expect").
+///
+/// The iPad sends scroll movement as iPadOS reports it, at an even rate; Wi-Fi delivers it unevenly, two
+/// together and then none. Applied on arrival, the app moved in lurches: the Mac drew 60 to 100 distinct frames a
+/// second while scrolling, though every frame drawn was captured, encoded and shown. Here what has arrived waits
+/// in `pending` and each refresh takes a share of it, so two movements arriving together are spread over two
+/// refreshes. The cost is about one refresh of delay. A small remainder, or anything left at the gesture's end,
+/// goes out whole.
+public struct ScrollPacer: Equatable {
+    public static let share = 0.5
+    /// Below this (points) the remainder goes out in one step.
+    public static let whole = 1.5
+    public private(set) var pending = CGPoint.zero
+    public init() {}
+    public mutating func add(_ delta: CGPoint) {
+        guard delta.x.isFinite, delta.y.isFinite else { return }
+        pending.x += delta.x; pending.y += delta.y
+    }
+    public var isEmpty: Bool { pending == .zero }
+    /// The movement for this refresh. `ending`: the fingers have lifted, so let everything out now.
+    public mutating func next(ending: Bool = false) -> CGPoint {
+        let out = ending || hypot(pending.x, pending.y) <= Self.whole ? pending
+            : CGPoint(x: pending.x * Self.share, y: pending.y * Self.share)
+        pending.x -= out.x; pending.y -= out.y
+        return out
+    }
+    public mutating func reset() { pending = .zero }
+}

@@ -92,7 +92,9 @@ public struct DeltaCoalescer: Equatable {
 public struct PointerHoldDetector: Equatable {
     public private(set) var held = false
     /// Hidden and not following through this many seconds and movements before it counts as held.
-    public static let holdAfter = 0.3, movesNeeded = 10
+    /// One second since build 63: 0.3 s was met three times on 2026-11-17 in ordinary use, the readings frozen
+    /// in place for a moment (a busy Mac) and moving again 0.1 to 2 s later. A game holds the mouse for minutes.
+    public static let holdAfter = 1.0, movesNeeded = 30
     /// While suspected, every reading of the pointer must stay this close (points) to the first one.
     public static let stillRadius = 16.0
     /// How far the pointer's readings strayed from the first one during the hold just found (for the log).
