@@ -21,6 +21,11 @@ enum SpeakersDriver {
     /// Installed and the same build as the one inside this app.
     static var upToDate: Bool { installedVersion != nil && installedVersion == bundledVersion }
 
+    static let microphoneUID = "SkyDeskMicrophone_UID"
+    /// "SkyDesk Microphone" (build 68): the iPad's microphone is played into it and Mac apps record from it.
+    static func microphone() -> SoundOutput? {
+        device(uid: microphoneUID).map { SoundOutput(id: $0, uid: microphoneUID, name: "SkyDesk Microphone") }
+    }
     /// The device, once Core Audio has loaded the driver.
     static func device() -> AudioObjectID? { device(uid: deviceUID) }
 

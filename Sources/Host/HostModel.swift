@@ -66,7 +66,13 @@ final class HostModel: ObservableObject {
         didSet { UserDefaults.standard.set(microphoneDeviceUID, forKey: "microphoneDeviceUID"); updateMicrophoneAlias() }
     }
     @Published private(set) var soundOutputs: [SoundOutput] = []
-    var microphoneTarget: SoundOutput? { SoundOutputs.microphoneTarget(saved: microphoneDeviceUID, among: soundOutputs) }
+    /// Automatic picks SkyDesk's own microphone device when its driver is installed (build 68), otherwise the first
+    /// loopback device; the renamed loopback ("SkyDesk Microphone" over BlackHole) is then removed, being a
+    /// two-way device that macOS also listed as an output.
+    var microphoneTarget: SoundOutput? {
+        if microphoneDeviceUID.isEmpty || microphoneDeviceUID == SpeakersDriver.microphoneUID, let own = SpeakersDriver.microphone() { return own }
+        return SoundOutputs.microphoneTarget(saved: microphoneDeviceUID, among: soundOutputs)
+    }
     func refreshSoundOutputs() { soundOutputs = SoundOutputs.all(); updateMicrophoneAlias() }
 
     // MARK: SkyDesk Speakers (build 65)

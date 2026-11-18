@@ -506,11 +506,12 @@ private struct HostView: View {
                     .onAppear { host.refreshSoundOutputs() }
                 if host.allowMicrophone {
                     Picker("Play it into", selection: $host.microphoneDeviceUID) {
-                        Text(host.soundOutputs.first(where: { SoundOutputs.isLoopback($0.name) }).map { "Automatic (\($0.name))" } ?? "Automatic (no loopback device found)").tag("")
+                        Text(SpeakersDriver.microphone() != nil ? "Automatic (SkyDesk Microphone)"
+                             : host.soundOutputs.first(where: { SoundOutputs.isLoopback($0.name) }).map { "Automatic (\($0.name))" } ?? "Automatic (no loopback device found)").tag("")
                         ForEach(host.soundOutputs) { Text($0.name).tag($0.uid) }
                     }
                     Text(host.microphoneTarget.map { "In the Mac app that should hear you, choose “\(host.microphoneName ?? $0.name)” as the microphone. The iPad decides when its microphone is on." }
-                         ?? "This needs a loopback sound device, such as the free BlackHole: what is played into it comes out as a microphone for Mac apps.")
+                         ?? "This needs SkyDesk Speakers (below), which adds a “SkyDesk Microphone” for Mac apps, or a loopback sound device such as the free BlackHole.")
                         .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 }
                 Toggle("Encode faster (about 5 ms less delay; uses more data while little is moving)", isOn: $host.fastEncoding)
@@ -520,7 +521,7 @@ private struct HostView: View {
             // Installing the driver applies at once (build 67: inside the group it was greyed out while connected).
             HStack {
                 if !host.speakersInstalled || !SpeakersDriver.upToDate {
-                    Button(host.speakersInstalled ? "Update SkyDesk Speakers…" : "Add SkyDesk Speakers to the Sound menu…") { host.installSpeakers() }
+                    Button(host.speakersInstalled ? "Update SkyDesk Speakers & Microphone…" : "Add SkyDesk Speakers & Microphone to the Sound menu…") { host.installSpeakers() }
                 } else {
                     Button("Remove SkyDesk Speakers…") { host.removeSpeakers() }
                 }

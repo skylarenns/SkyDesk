@@ -348,7 +348,8 @@ final class InputInjector {
             let now = CACurrentMediaTime()
             if now - lastFlagNote >= 2 {
                 lastFlagNote = now
-                MetricsLog.shared.append("host  iPad sent modifiers \(input.modifiers) on a \(input.kind.rawValue) with no such key held; dropped \(dropped)")
+                let what = input.kind == .key ? "key \(input.keyCode) " + (input.isDown ? "down" : "up") : input.kind.rawValue
+                MetricsLog.shared.append("host  iPad sent modifiers \(input.modifiers) on a \(what) with no such key held; dropped \(dropped)")
             }
         }
         return input.modifiers & allowed

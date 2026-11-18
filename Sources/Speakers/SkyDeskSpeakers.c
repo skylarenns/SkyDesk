@@ -1,12 +1,18 @@
-// SkyDesk Speakers (build 65, user request 2026-11-17: "can u have "skydesk speakers" in the output option on my mac
-// that outputs to my ipad").
+// SkyDesk's Core Audio driver (AudioServerPlugIn), installed from the SkyDesk Host window.
 //
-// A Core Audio driver (AudioServerPlugIn) with one output device and nothing else. It makes no sound: whatever apps
-// play into it is picked up by SkyDesk Host's system sound tap and sent to the iPad, so choosing "SkyDesk Speakers"
-// in the Mac's Sound output menu sends the Mac's sound to the iPad, and choosing anything else keeps it on the Mac.
+// "SkyDesk Speakers" (build 65, user request 2026-11-17: "can u have "skydesk speakers" in the output option on my
+// mac that outputs to my ipad"): an output that makes no sound. Whatever apps play into it is picked up by SkyDesk
+// Host's system sound tap and sent to the iPad, so choosing it in the Mac's Sound menu sends the Mac's sound to the
+// iPad, and choosing anything else keeps it on the Mac.
 //
-// Objects: the plug-in (1), the device (2) and its output stream (3). 48 kHz stereo 32-bit float, fixed.
-// The clock is the host clock, advanced one ring-buffer period at a time, as in Apple's NullAudio sample.
+// "SkyDesk Microphone" (build 68, user report 2026-11-18: "why is sky desk microphone in the output thing"): a
+// loopback for the iPad's microphone. SkyDesk Host plays the microphone into its output side and Mac apps record
+// it from its input side. Its output side cannot be the Mac's default output, so the Sound menu and settings list
+// it under input only. It replaces the renamed BlackHole device, which as a two-way device showed under output too.
+//
+// Objects: the plug-in (1); SkyDesk Speakers (2) with its output stream (3); SkyDesk Microphone (4) with its output
+// stream (5) and input stream (6). 48 kHz stereo 32-bit float, fixed. Each device's clock is the host clock,
+// advanced one ring-buffer period at a time, as in Apple's NullAudio sample.
 
 #include <CoreAudio/AudioServerPlugIn.h>
 #include <mach/mach_time.h>
@@ -14,23 +20,34 @@
 #include <stdatomic.h>
 #include <string.h>
 
-#define kPlugInID      kAudioObjectPlugInObject
-#define kDeviceID      2
-#define kStreamID      3
-#define kSampleRate    48000.0
-#define kChannels      2
-#define kPeriodFrames  16384
-#define kDeviceUID     "SkyDeskSpeakers_UID"
-#define kModelUID      "SkyDeskSpeakers_Model"
+#define kPlugInID          kAudioObjectPlugInObject
+#define kSpeakersID        2
+#define kSpeakersOutID     3
+#define kMicID             4
+#define kMicOutID          5
+#define kMicInID           6
+#define kSampleRate        48000.0
+#define kChannels          2
+#define kPeriodFrames      16384
+#define kSpeakersUID       "SkyDeskSpeakers_UID"
+#define kMicUID            "SkyDeskMicrophone_UID"
 
-static AudioServerPlugInHostRef gHost = NULL;
 static atomic_uint gRefCount = 0;
 static pthread_mutex_t gLock = PTHREAD_MUTEX_INITIALIZER;
-static UInt32 gIOCount = 0;
 static Float64 gHostTicksPerFrame = 0;
-static UInt64 gAnchorHostTime = 0;
-static UInt64 gTimeStamps = 0;
-static Boolean gStreamActive = true;
+
+typedef struct { UInt32 ioCount; UInt64 anchor; UInt64 stamps; } Clock;
+static Clock gClock[2]; // 0 = speakers, 1 = microphone
+static Boolean gActive[7] = { false, false, false, true, false, true, true };
+
+// The microphone's loopback: written at the output's sample time, read at the input's, and cleared once read so
+// a silence on the writing side reads as silence, not a repeat of the last buffer.
+static Float32 gRing[kPeriodFrames * kChannels];
+
+static int ClockIndex(AudioObjectID device) { return device == kSpeakersID ? 0 : device == kMicID ? 1 : -1; }
+static Boolean IsDevice(AudioObjectID obj) { return obj == kSpeakersID || obj == kMicID; }
+static Boolean IsStream(AudioObjectID obj) { return obj == kSpeakersOutID || obj == kMicOutID || obj == kMicInID; }
+static AudioObjectID StreamOwner(AudioObjectID stream) { return stream == kSpeakersOutID ? kSpeakersID : kMicID; }
 
 // MARK: Interface
 
@@ -54,7 +71,7 @@ static OSStatus SD_StopIO(AudioServerPlugInDriverRef d, AudioObjectID id, UInt32
 static OSStatus SD_GetZeroTimeStamp(AudioServerPlugInDriverRef d, AudioObjectID id, UInt32 client, Float64 *sampleTime, UInt64 *hostTime, UInt64 *seed);
 static OSStatus SD_WillDoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID id, UInt32 client, UInt32 op, Boolean *willDo, Boolean *inPlace);
 static OSStatus SD_BeginIOOperation(AudioServerPlugInDriverRef d, AudioObjectID id, UInt32 client, UInt32 op, UInt32 frames, const AudioServerPlugInIOCycleInfo *info) { return noErr; }
-static OSStatus SD_DoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID id, AudioObjectID stream, UInt32 client, UInt32 op, UInt32 frames, const AudioServerPlugInIOCycleInfo *info, void *main, void *secondary) { return noErr; }
+static OSStatus SD_DoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID id, AudioObjectID stream, UInt32 client, UInt32 op, UInt32 frames, const AudioServerPlugInIOCycleInfo *info, void *main, void *secondary);
 static OSStatus SD_EndIOOperation(AudioServerPlugInDriverRef d, AudioObjectID id, UInt32 client, UInt32 op, UInt32 frames, const AudioServerPlugInIOCycleInfo *info) { return noErr; }
 
 static AudioServerPlugInDriverInterface gInterface = {
@@ -93,7 +110,6 @@ static ULONG SD_Release(void *driver) {
 }
 static OSStatus SD_Initialize(AudioServerPlugInDriverRef driver, AudioServerPlugInHostRef host) {
     if (driver != gDriver) return kAudioHardwareBadObjectError;
-    gHost = host;
     mach_timebase_info_data_t timebase;
     mach_timebase_info(&timebase);
     Float64 hostClockFrequency = (Float64)timebase.denom / (Float64)timebase.numer * 1000000000.0;
@@ -116,6 +132,23 @@ static AudioStreamBasicDescription Format(void) {
     return f;
 }
 
+/// The device's streams in a scope: speakers have output only; the microphone has both.
+static UInt32 Streams(AudioObjectID device, AudioObjectPropertyScope scope, AudioObjectID *list) {
+    UInt32 n = 0;
+    if (device == kSpeakersID) {
+        if (scope != kAudioObjectPropertyScopeInput) list[n++] = kSpeakersOutID;
+    } else {
+        if (scope != kAudioObjectPropertyScopeInput) list[n++] = kMicOutID;
+        if (scope != kAudioObjectPropertyScopeOutput) list[n++] = kMicInID;
+    }
+    return n;
+}
+/// Whether the device may be the Mac's default in a scope: this is what keeps the microphone out of output lists.
+static UInt32 CanBeDefault(AudioObjectID device, AudioObjectPropertyScope scope) {
+    if (device == kSpeakersID) return scope != kAudioObjectPropertyScopeInput;
+    return scope == kAudioObjectPropertyScopeInput;
+}
+
 static Boolean SD_HasProperty(AudioServerPlugInDriverRef d, AudioObjectID obj, pid_t pid, const AudioObjectPropertyAddress *addr) {
     UInt32 size = 0;
     return SD_GetPropertyDataSize(d, obj, pid, addr, 0, NULL, &size) == noErr;
@@ -124,24 +157,22 @@ static Boolean SD_HasProperty(AudioServerPlugInDriverRef d, AudioObjectID obj, p
 static OSStatus SD_IsPropertySettable(AudioServerPlugInDriverRef d, AudioObjectID obj, pid_t pid, const AudioObjectPropertyAddress *addr, Boolean *out) {
     if (d != gDriver || addr == NULL || out == NULL) return kAudioHardwareIllegalOperationError;
     if (!SD_HasProperty(d, obj, pid, addr)) return kAudioHardwareUnknownPropertyError;
-    *out = false;
-    if (obj == kStreamID && (addr->mSelector == kAudioStreamPropertyIsActive)) *out = true;
+    *out = IsStream(obj) && addr->mSelector == kAudioStreamPropertyIsActive;
     return noErr;
 }
 
 static OSStatus SD_GetPropertyDataSize(AudioServerPlugInDriverRef d, AudioObjectID obj, pid_t pid, const AudioObjectPropertyAddress *addr, UInt32 qs, const void *q, UInt32 *out) {
     if (d != gDriver || addr == NULL || out == NULL) return kAudioHardwareIllegalOperationError;
-    switch (obj) {
-    case kPlugInID:
+    if (obj == kPlugInID) {
         switch (addr->mSelector) {
         case kAudioObjectPropertyBaseClass: case kAudioObjectPropertyClass: *out = sizeof(AudioClassID); return noErr;
         case kAudioObjectPropertyOwner: *out = sizeof(AudioObjectID); return noErr;
         case kAudioObjectPropertyManufacturer: case kAudioPlugInPropertyResourceBundle: *out = sizeof(CFStringRef); return noErr;
-        case kAudioObjectPropertyOwnedObjects: case kAudioPlugInPropertyDeviceList: *out = sizeof(AudioObjectID); return noErr;
+        case kAudioObjectPropertyOwnedObjects: case kAudioPlugInPropertyDeviceList: *out = 2 * sizeof(AudioObjectID); return noErr;
         case kAudioPlugInPropertyTranslateUIDToDevice: *out = sizeof(AudioObjectID); return noErr;
         }
-        break;
-    case kDeviceID:
+    } else if (IsDevice(obj)) {
+        AudioObjectID list[2];
         switch (addr->mSelector) {
         case kAudioObjectPropertyBaseClass: case kAudioObjectPropertyClass: *out = sizeof(AudioClassID); return noErr;
         case kAudioObjectPropertyOwner: *out = sizeof(AudioObjectID); return noErr;
@@ -154,14 +185,13 @@ static OSStatus SD_GetPropertyDataSize(AudioServerPlugInDriverRef d, AudioObject
         case kAudioDevicePropertyIsHidden: case kAudioDevicePropertyZeroTimeStampPeriod: *out = sizeof(UInt32); return noErr;
         case kAudioDevicePropertyRelatedDevices: *out = sizeof(AudioObjectID); return noErr;
         case kAudioObjectPropertyOwnedObjects: case kAudioDevicePropertyStreams:
-            *out = (addr->mScope == kAudioObjectPropertyScopeInput ? 0 : 1) * sizeof(AudioObjectID); return noErr;
+            *out = Streams(obj, addr->mScope, list) * sizeof(AudioObjectID); return noErr;
         case kAudioObjectPropertyControlList: *out = 0; return noErr;
         case kAudioDevicePropertyNominalSampleRate: *out = sizeof(Float64); return noErr;
         case kAudioDevicePropertyAvailableNominalSampleRates: *out = sizeof(AudioValueRange); return noErr;
         case kAudioDevicePropertyPreferredChannelsForStereo: *out = 2 * sizeof(UInt32); return noErr;
         }
-        break;
-    case kStreamID:
+    } else if (IsStream(obj)) {
         switch (addr->mSelector) {
         case kAudioObjectPropertyBaseClass: case kAudioObjectPropertyClass: *out = sizeof(AudioClassID); return noErr;
         case kAudioObjectPropertyOwner: *out = sizeof(AudioObjectID); return noErr;
@@ -171,7 +201,6 @@ static OSStatus SD_GetPropertyDataSize(AudioServerPlugInDriverRef d, AudioObject
         case kAudioStreamPropertyVirtualFormat: case kAudioStreamPropertyPhysicalFormat: *out = sizeof(AudioStreamBasicDescription); return noErr;
         case kAudioStreamPropertyAvailableVirtualFormats: case kAudioStreamPropertyAvailablePhysicalFormats: *out = sizeof(AudioStreamRangedDescription); return noErr;
         }
-        break;
     }
     return kAudioHardwareUnknownPropertyError;
 }
@@ -180,47 +209,58 @@ static OSStatus SD_GetPropertyDataSize(AudioServerPlugInDriverRef d, AudioObject
 
 static OSStatus SD_GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obj, pid_t pid, const AudioObjectPropertyAddress *addr, UInt32 qs, const void *q, UInt32 size, UInt32 *outSize, void *out) {
     if (d != gDriver || addr == NULL || outSize == NULL || out == NULL) return kAudioHardwareIllegalOperationError;
-    switch (obj) {
-    case kPlugInID:
+    if (obj == kPlugInID) {
         switch (addr->mSelector) {
         case kAudioObjectPropertyBaseClass: PUT(AudioClassID, kAudioObjectClassID);
         case kAudioObjectPropertyClass: PUT(AudioClassID, kAudioPlugInClassID);
         case kAudioObjectPropertyOwner: PUT(AudioObjectID, kAudioObjectUnknown);
         case kAudioObjectPropertyManufacturer: PUT(CFStringRef, CFSTR("SkyDesk"));
         case kAudioPlugInPropertyResourceBundle: PUT(CFStringRef, CFSTR(""));
-        case kAudioObjectPropertyOwnedObjects: case kAudioPlugInPropertyDeviceList:
-            if (size < sizeof(AudioObjectID)) { *outSize = 0; return noErr; }
-            PUT(AudioObjectID, kDeviceID);
+        case kAudioObjectPropertyOwnedObjects: case kAudioPlugInPropertyDeviceList: {
+            AudioObjectID devices[2] = { kSpeakersID, kMicID };
+            UInt32 n = size / sizeof(AudioObjectID); if (n > 2) n = 2;
+            memcpy(out, devices, n * sizeof(AudioObjectID)); *outSize = n * sizeof(AudioObjectID); return noErr;
+        }
         case kAudioPlugInPropertyTranslateUIDToDevice: {
             AudioObjectID found = kAudioObjectUnknown;
-            if (qs == sizeof(CFStringRef) && q != NULL && CFStringCompare(*(CFStringRef *)q, CFSTR(kDeviceUID), 0) == kCFCompareEqualTo) found = kDeviceID;
+            if (qs == sizeof(CFStringRef) && q != NULL) {
+                CFStringRef uid = *(CFStringRef *)q;
+                if (CFStringCompare(uid, CFSTR(kSpeakersUID), 0) == kCFCompareEqualTo) found = kSpeakersID;
+                else if (CFStringCompare(uid, CFSTR(kMicUID), 0) == kCFCompareEqualTo) found = kMicID;
+            }
             PUT(AudioObjectID, found);
         }
         }
-        break;
-    case kDeviceID:
+    } else if (IsDevice(obj)) {
+        Boolean mic = obj == kMicID;
         switch (addr->mSelector) {
         case kAudioObjectPropertyBaseClass: PUT(AudioClassID, kAudioObjectClassID);
         case kAudioObjectPropertyClass: PUT(AudioClassID, kAudioDeviceClassID);
         case kAudioObjectPropertyOwner: PUT(AudioObjectID, kPlugInID);
-        case kAudioObjectPropertyName: PUT(CFStringRef, CFSTR("SkyDesk Speakers"));
+        case kAudioObjectPropertyName: PUT(CFStringRef, mic ? CFSTR("SkyDesk Microphone") : CFSTR("SkyDesk Speakers"));
         case kAudioObjectPropertyManufacturer: PUT(CFStringRef, CFSTR("SkyDesk"));
-        case kAudioDevicePropertyDeviceUID: PUT(CFStringRef, CFSTR(kDeviceUID));
-        case kAudioDevicePropertyModelUID: PUT(CFStringRef, CFSTR(kModelUID));
+        case kAudioDevicePropertyDeviceUID: PUT(CFStringRef, mic ? CFSTR(kMicUID) : CFSTR(kSpeakersUID));
+        case kAudioDevicePropertyModelUID: PUT(CFStringRef, mic ? CFSTR("SkyDeskMicrophone_Model") : CFSTR("SkyDeskSpeakers_Model"));
         case kAudioDevicePropertyTransportType: PUT(UInt32, kAudioDeviceTransportTypeVirtual);
-        case kAudioDevicePropertyRelatedDevices: PUT(AudioObjectID, kDeviceID);
+        case kAudioDevicePropertyRelatedDevices: PUT(AudioObjectID, obj);
         case kAudioDevicePropertyClockDomain: PUT(UInt32, 0);
         case kAudioDevicePropertyDeviceIsAlive: PUT(UInt32, 1);
-        case kAudioDevicePropertyDeviceIsRunning: { pthread_mutex_lock(&gLock); UInt32 running = gIOCount > 0; pthread_mutex_unlock(&gLock); PUT(UInt32, running); }
-        case kAudioDevicePropertyDeviceCanBeDefaultDevice: PUT(UInt32, addr->mScope == kAudioObjectPropertyScopeInput ? 0 : 1);
-        case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice: PUT(UInt32, addr->mScope == kAudioObjectPropertyScopeInput ? 0 : 1);
+        case kAudioDevicePropertyDeviceIsRunning: {
+            pthread_mutex_lock(&gLock); UInt32 running = gClock[ClockIndex(obj)].ioCount > 0; pthread_mutex_unlock(&gLock);
+            PUT(UInt32, running);
+        }
+        case kAudioDevicePropertyDeviceCanBeDefaultDevice: PUT(UInt32, CanBeDefault(obj, addr->mScope));
+        case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice: PUT(UInt32, CanBeDefault(obj, addr->mScope));
         case kAudioDevicePropertyLatency: PUT(UInt32, 0);
         case kAudioDevicePropertySafetyOffset: PUT(UInt32, 0);
         case kAudioDevicePropertyIsHidden: PUT(UInt32, 0);
         case kAudioDevicePropertyZeroTimeStampPeriod: PUT(UInt32, kPeriodFrames);
-        case kAudioObjectPropertyOwnedObjects: case kAudioDevicePropertyStreams:
-            if (addr->mScope == kAudioObjectPropertyScopeInput || size < sizeof(AudioObjectID)) { *outSize = 0; return noErr; }
-            PUT(AudioObjectID, kStreamID);
+        case kAudioObjectPropertyOwnedObjects: case kAudioDevicePropertyStreams: {
+            AudioObjectID list[2];
+            UInt32 n = Streams(obj, addr->mScope, list), fit = size / sizeof(AudioObjectID);
+            if (n > fit) n = fit;
+            memcpy(out, list, n * sizeof(AudioObjectID)); *outSize = n * sizeof(AudioObjectID); return noErr;
+        }
         case kAudioObjectPropertyControlList: *outSize = 0; return noErr;
         case kAudioDevicePropertyNominalSampleRate: PUT(Float64, kSampleRate);
         case kAudioDevicePropertyAvailableNominalSampleRates: { AudioValueRange r = { kSampleRate, kSampleRate }; PUT(AudioValueRange, r); }
@@ -228,16 +268,16 @@ static OSStatus SD_GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID o
             if (size < 2 * sizeof(UInt32)) return kAudioHardwareBadPropertySizeError;
             ((UInt32 *)out)[0] = 1; ((UInt32 *)out)[1] = 2; *outSize = 2 * sizeof(UInt32); return noErr;
         }
-        break;
-    case kStreamID:
+    } else if (IsStream(obj)) {
+        Boolean input = obj == kMicInID;
         switch (addr->mSelector) {
         case kAudioObjectPropertyBaseClass: PUT(AudioClassID, kAudioObjectClassID);
         case kAudioObjectPropertyClass: PUT(AudioClassID, kAudioStreamClassID);
-        case kAudioObjectPropertyOwner: PUT(AudioObjectID, kDeviceID);
+        case kAudioObjectPropertyOwner: PUT(AudioObjectID, StreamOwner(obj));
         case kAudioObjectPropertyOwnedObjects: *outSize = 0; return noErr;
-        case kAudioStreamPropertyIsActive: { pthread_mutex_lock(&gLock); UInt32 active = gStreamActive; pthread_mutex_unlock(&gLock); PUT(UInt32, active); }
-        case kAudioStreamPropertyDirection: PUT(UInt32, 0); // 0 = output
-        case kAudioStreamPropertyTerminalType: PUT(UInt32, kAudioStreamTerminalTypeSpeaker);
+        case kAudioStreamPropertyIsActive: { pthread_mutex_lock(&gLock); UInt32 active = gActive[obj]; pthread_mutex_unlock(&gLock); PUT(UInt32, active); }
+        case kAudioStreamPropertyDirection: PUT(UInt32, input ? 1 : 0);
+        case kAudioStreamPropertyTerminalType: PUT(UInt32, input ? kAudioStreamTerminalTypeMicrophone : kAudioStreamTerminalTypeSpeaker);
         case kAudioStreamPropertyStartingChannel: PUT(UInt32, 1);
         case kAudioStreamPropertyLatency: PUT(UInt32, 0);
         case kAudioStreamPropertyVirtualFormat: case kAudioStreamPropertyPhysicalFormat: PUT(AudioStreamBasicDescription, Format());
@@ -246,25 +286,24 @@ static OSStatus SD_GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID o
             PUT(AudioStreamRangedDescription, r);
         }
         }
-        break;
     }
     return kAudioHardwareUnknownPropertyError;
 }
 
 static OSStatus SD_SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obj, pid_t pid, const AudioObjectPropertyAddress *addr, UInt32 qs, const void *q, UInt32 size, const void *data) {
     if (d != gDriver || addr == NULL) return kAudioHardwareIllegalOperationError;
-    if (obj == kStreamID && addr->mSelector == kAudioStreamPropertyIsActive) {
+    if (IsStream(obj) && addr->mSelector == kAudioStreamPropertyIsActive) {
         if (size != sizeof(UInt32) || data == NULL) return kAudioHardwareBadPropertySizeError;
-        pthread_mutex_lock(&gLock); gStreamActive = *(const UInt32 *)data != 0; pthread_mutex_unlock(&gLock);
+        pthread_mutex_lock(&gLock); gActive[obj] = *(const UInt32 *)data != 0; pthread_mutex_unlock(&gLock);
         return noErr;
     }
     // The one format is all there is: setting it to itself is fine, anything else is refused.
-    if (obj == kStreamID && (addr->mSelector == kAudioStreamPropertyVirtualFormat || addr->mSelector == kAudioStreamPropertyPhysicalFormat)) {
+    if (IsStream(obj) && (addr->mSelector == kAudioStreamPropertyVirtualFormat || addr->mSelector == kAudioStreamPropertyPhysicalFormat)) {
         if (size != sizeof(AudioStreamBasicDescription) || data == NULL) return kAudioHardwareBadPropertySizeError;
         const AudioStreamBasicDescription *f = data;
         return f->mSampleRate == kSampleRate && f->mChannelsPerFrame == kChannels ? noErr : kAudioDeviceUnsupportedFormatError;
     }
-    if (obj == kDeviceID && addr->mSelector == kAudioDevicePropertyNominalSampleRate) {
+    if (IsDevice(obj) && addr->mSelector == kAudioDevicePropertyNominalSampleRate) {
         if (size != sizeof(Float64) || data == NULL) return kAudioHardwareBadPropertySizeError;
         return *(const Float64 *)data == kSampleRate ? noErr : kAudioDeviceUnsupportedFormatError;
     }
@@ -274,36 +313,64 @@ static OSStatus SD_SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID o
 // MARK: IO
 
 static OSStatus SD_StartIO(AudioServerPlugInDriverRef d, AudioObjectID id, UInt32 client) {
-    if (d != gDriver || id != kDeviceID) return kAudioHardwareBadObjectError;
+    int c = ClockIndex(id);
+    if (d != gDriver || c < 0) return kAudioHardwareBadObjectError;
     pthread_mutex_lock(&gLock);
-    if (gIOCount == 0) { gAnchorHostTime = mach_absolute_time(); gTimeStamps = 0; }
-    gIOCount++;
+    if (gClock[c].ioCount == 0) {
+        gClock[c].anchor = mach_absolute_time(); gClock[c].stamps = 0;
+        if (id == kMicID) memset(gRing, 0, sizeof(gRing));
+    }
+    gClock[c].ioCount++;
     pthread_mutex_unlock(&gLock);
     return noErr;
 }
 static OSStatus SD_StopIO(AudioServerPlugInDriverRef d, AudioObjectID id, UInt32 client) {
-    if (d != gDriver || id != kDeviceID) return kAudioHardwareBadObjectError;
+    int c = ClockIndex(id);
+    if (d != gDriver || c < 0) return kAudioHardwareBadObjectError;
     pthread_mutex_lock(&gLock);
-    if (gIOCount > 0) gIOCount--;
+    if (gClock[c].ioCount > 0) gClock[c].ioCount--;
     pthread_mutex_unlock(&gLock);
     return noErr;
 }
 static OSStatus SD_GetZeroTimeStamp(AudioServerPlugInDriverRef d, AudioObjectID id, UInt32 client, Float64 *sampleTime, UInt64 *hostTime, UInt64 *seed) {
-    if (d != gDriver || id != kDeviceID) return kAudioHardwareBadObjectError;
+    int c = ClockIndex(id);
+    if (d != gDriver || c < 0) return kAudioHardwareBadObjectError;
     pthread_mutex_lock(&gLock);
+    Clock *clock = &gClock[c];
     Float64 ticksPerPeriod = gHostTicksPerFrame * kPeriodFrames;
     UInt64 now = mach_absolute_time();
-    while ((Float64)(now - gAnchorHostTime) >= (Float64)(gTimeStamps + 1) * ticksPerPeriod) gTimeStamps++;
-    *sampleTime = (Float64)(gTimeStamps * kPeriodFrames);
-    *hostTime = gAnchorHostTime + (UInt64)((Float64)gTimeStamps * ticksPerPeriod);
+    while ((Float64)(now - clock->anchor) >= (Float64)(clock->stamps + 1) * ticksPerPeriod) clock->stamps++;
+    *sampleTime = (Float64)(clock->stamps * kPeriodFrames);
+    *hostTime = clock->anchor + (UInt64)((Float64)clock->stamps * ticksPerPeriod);
     *seed = 1;
     pthread_mutex_unlock(&gLock);
     return noErr;
 }
 static OSStatus SD_WillDoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID id, UInt32 client, UInt32 op, Boolean *willDo, Boolean *inPlace) {
-    if (d != gDriver || id != kDeviceID) return kAudioHardwareBadObjectError;
-    // Mixed output is accepted and dropped: the sound reaches the iPad through SkyDesk Host's tap.
-    *willDo = op == kAudioServerPlugInIOOperationWriteMix;
+    if (d != gDriver || !IsDevice(id)) return kAudioHardwareBadObjectError;
+    // Speakers: mixed output is accepted and dropped (the sound reaches the iPad through SkyDesk Host's tap).
+    // Microphone: mixed output goes into the loopback and input is read back out of it.
+    *willDo = op == kAudioServerPlugInIOOperationWriteMix || (id == kMicID && op == kAudioServerPlugInIOOperationReadInput);
     *inPlace = true;
+    return noErr;
+}
+static OSStatus SD_DoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID id, AudioObjectID stream, UInt32 client, UInt32 op, UInt32 frames, const AudioServerPlugInIOCycleInfo *info, void *main, void *secondary) {
+    if (d != gDriver || !IsDevice(id)) return kAudioHardwareBadObjectError;
+    if (id != kMicID || main == NULL || info == NULL) return noErr;
+    Float32 *buffer = main;
+    UInt64 start = op == kAudioServerPlugInIOOperationWriteMix ? (UInt64)info->mOutputTime.mSampleTime : (UInt64)info->mInputTime.mSampleTime;
+    UInt32 offset = (UInt32)(start % kPeriodFrames);
+    UInt32 first = frames < kPeriodFrames - offset ? frames : kPeriodFrames - offset;
+    UInt32 second = frames - first;
+    if (frames > kPeriodFrames) return noErr;
+    if (op == kAudioServerPlugInIOOperationWriteMix) {
+        memcpy(gRing + offset * kChannels, buffer, first * kChannels * sizeof(Float32));
+        memcpy(gRing, buffer + first * kChannels, second * kChannels * sizeof(Float32));
+    } else if (op == kAudioServerPlugInIOOperationReadInput) {
+        memcpy(buffer, gRing + offset * kChannels, first * kChannels * sizeof(Float32));
+        memcpy(buffer + first * kChannels, gRing, second * kChannels * sizeof(Float32));
+        memset(gRing + offset * kChannels, 0, first * kChannels * sizeof(Float32));
+        memset(gRing, 0, second * kChannels * sizeof(Float32));
+    }
     return noErr;
 }

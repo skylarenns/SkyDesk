@@ -8,6 +8,7 @@ public struct SoundOutput: Equatable, Identifiable, Sendable {
     public let id: AudioDeviceID
     public let uid: String
     public let name: String
+    public init(id: AudioDeviceID, uid: String, name: String) { self.id = id; self.uid = uid; self.name = name }
 }
 
 /// The Mac has no way for an app to *be* a microphone; that takes a sound driver. A loopback device is such a
