@@ -502,14 +502,6 @@ private struct HostView: View {
                      ? "While the iPad plays, the Mac's sound output is “SkyDesk Speakers”. Choose another output in the Sound menu to play on the Mac instead; SkyDesk remembers the choice, and switches back to your own output when the iPad stops."
                      : "The Mac's own speakers go quiet only while the iPad is playing. macOS asks once for permission to record system audio.")
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                HStack {
-                    if !host.speakersInstalled || !SpeakersDriver.upToDate {
-                        Button(host.speakersInstalled ? "Update SkyDesk Speakers…" : "Add SkyDesk Speakers to the Sound menu…") { host.installSpeakers() }
-                    } else {
-                        Button("Remove SkyDesk Speakers…") { host.removeSpeakers() }
-                    }
-                    if let note = host.speakersNote { Text(note).font(.caption).foregroundStyle(.secondary) }
-                }.disabled(host.speakersBusy)
                 Toggle("Let the iPad send its microphone to this Mac", isOn: $host.allowMicrophone)
                     .onAppear { host.refreshSoundOutputs() }
                 if host.allowMicrophone {
@@ -525,6 +517,15 @@ private struct HostView: View {
                 Toggle("Low-latency rate control (experimental)", isOn: $host.lowLatencyRateControl)
                 Text("Changes apply the next time the iPad connects.").font(.caption).foregroundStyle(.secondary)
             }.padding(.top, 8).disabled(host.clientConnected || host.busy)
+            // Installing the driver applies at once (build 67: inside the group it was greyed out while connected).
+            HStack {
+                if !host.speakersInstalled || !SpeakersDriver.upToDate {
+                    Button(host.speakersInstalled ? "Update SkyDesk Speakers…" : "Add SkyDesk Speakers to the Sound menu…") { host.installSpeakers() }
+                } else {
+                    Button("Remove SkyDesk Speakers…") { host.removeSpeakers() }
+                }
+                if let note = host.speakersNote { Text(note).font(.caption).foregroundStyle(.secondary) }
+            }.disabled(host.speakersBusy).frame(maxWidth: .infinity, alignment: .leading).padding(.top, 10)
             // Applies at once, so it is not part of the group that waits for the next connection.
             Toggle("Keep this Mac awake while SkyDesk is ready (it won't sleep on its own)", isOn: $host.keepAwake)
                 .frame(maxWidth: .infinity, alignment: .leading).padding(.top, 10)

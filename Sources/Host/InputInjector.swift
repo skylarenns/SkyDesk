@@ -18,7 +18,8 @@ final class InputInjector {
 
     func handle(_ input: InputEvent) {
         guard input.isValid, AXIsProcessTrusted(), displayBounds.width > 0 else { return }
-        let flags = Self.flags(input.modifiers)
+        lastInputTime = CACurrentMediaTime()
+        let flags = Self.flags(sanitized(input))
         switch input.kind {
         case .move, .down, .up:
             if input.kind == .down { stopMomentum() }
@@ -68,8 +69,10 @@ final class InputInjector {
             guard let code = Self.keyMap[input.keyCode] else { return }
             let repeated = input.isDown && keys.contains(code)
             if input.isDown { keys.insert(code) } else { keys.remove(code) }
+            if Self.commandKeys.contains(code) { MetricsLog.shared.append("host  ⌘ key " + (input.isDown ? (repeated ? "down again" : "down") : "up") + " from the iPad") }
             let event = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: input.isDown)
-            event?.flags = flags
+            // After the key itself is counted, so a modifier's own press carries its flag and its release does not.
+            event?.flags = Self.flags(sanitized(input))
             event?.setIntegerValueField(.keyboardEventAutorepeat, value: repeated ? 1 : 0)
             Self.post(event)
         }
@@ -327,6 +330,50 @@ final class InputInjector {
         RemoteInputOrigin.mark(event)
         event.post(tap: .cghidEventTap)
     }
+    // MARK: Modifier honesty (build 67)
+
+    /// Mac key codes of each modifier's left and right keys, by SkyDesk modifier bit.
+    static let modifierCodes: [(bit: UInt, codes: Set<CGKeyCode>)] = [(1, [56, 60]), (2, [59, 62]), (4, [58, 61]), (8, [55, 54])]
+    static let commandKeys: Set<CGKeyCode> = [55, 54]
+    private var lastFlagNote = 0.0
+    /// A modifier counts only while its key is held here (user report 2026-11-18: ⌘ stuck again with the iPad's own
+    /// check finding nothing held). The iPad's flags follow its own idea of the modifiers, which can lag behind
+    /// the keys; every real modifier press arrives as a key, so a flag without its key is dropped. Caps Lock is a
+    /// toggle with no held key and passes through.
+    private func sanitized(_ input: InputEvent) -> UInt {
+        var allowed: UInt = 16
+        for (bit, codes) in Self.modifierCodes where !keys.isDisjoint(with: codes) { allowed |= bit }
+        let dropped = input.modifiers & ~allowed
+        if dropped != 0 {
+            let now = CACurrentMediaTime()
+            if now - lastFlagNote >= 2 {
+                lastFlagNote = now
+                MetricsLog.shared.append("host  iPad sent modifiers \(input.modifiers) on a \(input.kind.rawValue) with no such key held; dropped \(dropped)")
+            }
+        }
+        return input.modifiers & allowed
+    }
+    private var macCommandSince: Double?
+    /// Once a second: does macOS itself think ⌘ is down while SkyDesk holds no ⌘ key? Logged, and released after
+    /// three seconds of that while the iPad is the one being used (a ⌘ held on the Mac's own keyboard is left alone
+    /// unless the iPad has been sending input meanwhile).
+    func checkModifiers(padActive: Bool) {
+        let macCommand = CGEventSource.flagsState(.combinedSessionState).contains(.maskCommand)
+        let ours = !keys.isDisjoint(with: Self.commandKeys)
+        guard macCommand, !ours else { macCommandSince = nil; return }
+        let now = CACurrentMediaTime()
+        if macCommandSince == nil {
+            macCommandSince = now
+            MetricsLog.shared.append("host  macOS reports ⌘ down, but SkyDesk holds no ⌘ key" + (padActive ? " (iPad in use)" : ""))
+        }
+        guard padActive, let since = macCommandSince, now - since >= 3 else { return }
+        macCommandSince = nil
+        let event = CGEvent(keyboardEventSource: nil, virtualKey: 55, keyDown: false)
+        event?.flags = []; Self.post(event)
+        MetricsLog.shared.append("host  released a stuck ⌘ (macOS still had it down after 3 s)")
+    }
+    var lastInputTime = 0.0
+
     private static func flags(_ value: UInt) -> CGEventFlags {
         var flags: CGEventFlags = []
         if value & 1 != 0 { flags.insert(.maskShift) }

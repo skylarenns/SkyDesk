@@ -89,6 +89,10 @@ final class HostModel: ObservableObject {
                     self.speakersNote = problem ?? (install ? "Added. It's in the Sound menu now." : "Removed.")
                     MetricsLog.shared.append("host  SkyDesk Speakers " + (install ? "install" : "removal") + ": " + (problem ?? "done"))
                     self.refreshSoundOutputs()
+                    // Core Audio takes a moment to come back after its restart.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                        MainActor.assumeIsolated { self?.audio?.soundSystemRestarted() }
+                    }
                 }
             }
         }
@@ -1303,6 +1307,7 @@ final class HostModel: ObservableObject {
         if let controller = bitrateController, controller.target < controller.maximum {
             metrics += String(format: " · bitrate limited to %.1f Mbps by the network", Double(controller.target) / 1e6)
         }
+        input.checkModifiers(padActive: CACurrentMediaTime() - input.lastInputTime < 5)
         hostCPU.sample(wall: CACurrentMediaTime(), cpu: ProcessCPU.seconds())
         let usage = " · host CPU " + (hostCPU.recent.map { String(format: "%.0f%%", $0) } ?? "-")
             + (hostCPU.average.map { String(format: " (avg %.0f%%)", $0) } ?? "")

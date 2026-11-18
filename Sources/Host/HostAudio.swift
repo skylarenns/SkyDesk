@@ -143,6 +143,13 @@ final class HostAudio {
 
     // MARK: SkyDesk Speakers (build 65)
 
+    /// Core Audio restarted (SkyDesk Speakers added or removed mid-session): capture and routing start over.
+    func soundSystemRestarted() {
+        guard #available(macOS 14.2, *) else { return }
+        lastOutput = SystemAudioTap.defaultOutput()
+        sync(force: true)
+    }
+
     /// The output this object itself last chose, so the change notice it causes is not taken for the user's choice.
     private var expectedOutput: AudioObjectID?
     /// With SkyDesk Speakers installed, the Mac's Sound output menu is the switch: sound goes to the iPad only
