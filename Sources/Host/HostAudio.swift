@@ -11,6 +11,7 @@ final class SystemAudioTap {
     private var tapID = AudioObjectID(kAudioObjectUnknown)
     private var deviceID = AudioObjectID(kAudioObjectUnknown)
     private var procID: AudioDeviceIOProcID?
+    private var tapBuffers: UnsafeMutableAudioBufferListPointer?
     private let queue = DispatchQueue(label: "skydesk.audio.tap", qos: .userInteractive)
     private(set) var format: AVAudioFormat?
     private(set) var muted = false
@@ -51,9 +52,19 @@ final class SystemAudioTap {
             try Self.check(AudioHardwareCreateAggregateDevice(composition as CFDictionary, &device), "Create the sound capture device")
             deviceID = device
             var proc: AudioDeviceIOProcID?
+            // The device also carries the output device's own inputs when it has any (an audio interface such as a
+            // Scarlett 4i4), ahead of the tap's: every buffer list then had more buffers than the format, and
+            // wrapping it failed, so nothing was ever sent (build 69, found 2026-11-18 with the output on a 4i4).
+            // Only the tap's buffers, the last ones, are read.
+            let needed = format.isInterleaved ? 1 : Int(format.channelCount)
+            let tapOnly = AudioBufferList.allocate(maximumBuffers: needed)
+            self.tapBuffers = tapOnly
             try Self.check(AudioDeviceCreateIOProcIDWithBlock(&proc, device, queue) { [weak self] _, input, _, _, _ in
-                guard let self, let format = self.format,
-                      let buffer = AVAudioPCMBuffer(pcmFormat: format, bufferListNoCopy: input, deallocator: nil) else { return }
+                guard let self, let format = self.format else { return }
+                let all = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: input))
+                guard all.count >= needed else { return }
+                for index in 0..<needed { tapOnly[index] = all[all.count - needed + index] }
+                guard let buffer = AVAudioPCMBuffer(pcmFormat: format, bufferListNoCopy: tapOnly.unsafePointer, deallocator: nil) else { return }
                 self.onBuffer?(buffer)
             }, "Read the Mac's sound")
             procID = proc
@@ -68,6 +79,7 @@ final class SystemAudioTap {
         }
         if tapID != kAudioObjectUnknown { AudioHardwareDestroyProcessTap(tapID) }
         deviceID = AudioObjectID(kAudioObjectUnknown); tapID = AudioObjectID(kAudioObjectUnknown); procID = nil
+        tapBuffers.map { free($0.unsafeMutablePointer) }; tapBuffers = nil
         muted = false
     }
     deinit { stop() }
@@ -158,8 +170,12 @@ final class HostAudio {
     /// Chooses SkyDesk Speakers or the Mac's own output to match the session and the user's last choice.
     private func route() {
         guard speakers != nil else { return }
+        // Back to the Mac only when the iPad can't play it (session over or in the background), or when this
+        // object chose SkyDesk Speakers and the user has since said no. Not while waiting for the iPad to start
+        // playing: that switched a SkyDesk Speakers chosen by hand back to the Mac (build 69, 2026-11-18).
         let toPad = !stopped && !paused && padPlaying && SpeakersDriver.wanted
-        let switched = toPad ? SpeakersDriver.routeToPad() : SpeakersDriver.routeToMac()
+        let toMac = stopped || paused || (padPlaying && !SpeakersDriver.wanted)
+        let switched = toPad ? SpeakersDriver.routeToPad() : toMac ? SpeakersDriver.routeToMac() : false
         if switched { expectedOutput = SpeakersDriver.defaultOutput() }
     }
     /// A change of output made in the Sound menu during a session becomes the choice for later sessions.

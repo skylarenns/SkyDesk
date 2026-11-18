@@ -343,6 +343,10 @@ final class InputInjector {
     private func sanitized(_ input: InputEvent) -> UInt {
         var allowed: UInt = 16
         for (bit, codes) in Self.modifierCodes where !keys.isDisjoint(with: codes) { allowed |= bit }
+        // A modifier's own press carries its flag before the key is counted; that is not a stale flag.
+        if input.kind == .key, input.isDown, let code = Self.keyMap[input.keyCode] {
+            for (bit, codes) in Self.modifierCodes where codes.contains(code) { allowed |= bit }
+        }
         let dropped = input.modifiers & ~allowed
         if dropped != 0 {
             let now = CACurrentMediaTime()
