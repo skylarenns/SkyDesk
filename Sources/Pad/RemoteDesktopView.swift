@@ -110,7 +110,10 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
     private var dragActive = false
     private var repeatTimer: Timer?
     private var repeatKey: Int?
-    private var heldKeys: Set<Int> = []
+    private var heldKeys: Set<Int> = [] { didSet { if heldKeys.isEmpty != oldValue.isEmpty { updateKeyCheck() } } }
+    private var stuckCheck = StuckKeyCheck()
+    private var keyCheckTimer: Timer?
+    private var stuckReleased = 0
     private var deactivateObserver: NSObjectProtocol?
     /// Draw a frame the moment it arrives when it can still make the next screen refresh (build 35).
     var presentOnArrival = true
@@ -251,8 +254,8 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
     /// For the diagnostic log: the display link's real rate, and how drawing on arrival is going.
     var gpuSeconds: Double? { renderer?.gpuSeconds }
     var drawNote: String {
-        String(format: "hz=%.0f early=%d/%d margin=%.1f dragfix=%.1f/%d hoverend=%d/%.0f", refreshHz, pacer.hits, pacer.misses, pacer.margin * 1_000,
-               dragStartError, dragStarts, hoverEnds, hoverEndJump)
+        String(format: "hz=%.0f early=%d/%d margin=%.1f dragfix=%.1f/%d hoverend=%d/%.0f stuckkeys=%d", refreshHz, pacer.hits, pacer.misses, pacer.margin * 1_000,
+               dragStartError, dragStarts, hoverEnds, hoverEndJump, stuckReleased)
     }
     /// A frame finished decoding. If nothing has been drawn for the coming refresh and there is still time to
     /// make it, draw now; otherwise the next tick takes it, as before.
@@ -339,6 +342,33 @@ final class DesktopMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInt
     func setSharpening(_ enabled: Bool) { renderer?.setSharpening(enabled) }
     private func updateViewport() {
         renderer?.setViewport(keyboardFraction: bounds.height > 0 ? keyboardHeight / bounds.height : 0, focus: focusRect)
+    }
+    /// The keyboard's real state is checked while anything is held (StuckKeyCheck).
+    private func updateKeyCheck() {
+        if heldKeys.isEmpty { keyCheckTimer?.invalidate(); keyCheckTimer = nil; stuckCheck.reset(); return }
+        guard keyCheckTimer == nil else { return }
+        let timer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in self?.releaseStuckKeys() }
+        timer.tolerance = 0.05
+        RunLoop.main.add(timer, forMode: .common); keyCheckTimer = timer
+    }
+    private func releaseStuckKeys() {
+        guard let keyboard = GCKeyboard.coalesced?.keyboardInput else { return }
+        let stale = stuckCheck.stale(held: heldKeys) { code in
+            keyboard.button(forKeyCode: GCKeyCode(rawValue: CFIndex(code)))?.isPressed
+        }
+        guard !stale.isEmpty else { return }
+        // The modifiers still really down, with Caps Lock (a toggle) as it was.
+        var actual = modifiers & 16
+        for (bit, usages) in ModifierSync.keys where usages.contains(where: { keyboard.button(forKeyCode: GCKeyCode(rawValue: CFIndex($0)))?.isPressed == true }) {
+            actual |= bit
+        }
+        modifiers = actual
+        for code in stale {
+            heldKeys.remove(code)
+            if repeatKey == code { repeatTimer?.invalidate(); repeatTimer = nil; repeatKey = nil }
+            sendInput?(InputEvent(kind: .key, keyCode: code, isDown: false, modifiers: actual))
+            stuckReleased += 1
+        }
     }
     func releaseKeys() {
         repeatTimer?.invalidate(); repeatTimer = nil; repeatKey = nil

@@ -96,3 +96,28 @@ public struct ScrollPacer: Equatable {
     }
     public mutating func reset() { pending = .zero }
 }
+
+/// Keys the iPad still counts as held after the keyboard itself has let go (build 66, user report 2026-11-18: "it
+/// seems like cmd is being held down sometimes for some reason even when its not"). iPadOS keeps some key-ups for
+/// itself (holding ⌘ for the shortcut list, its own ⌘ shortcuts), and the Mac then kept ⌘ down until the pointer
+/// next moved over the screen, which never happens while the pointer is captured. The keyboard's own state
+/// (GameController) is checked a few times a second; a key it reports up on two checks running is released, so a
+/// check made a moment before the keyboard state catches up with a new press cannot release it.
+public struct StuckKeyCheck {
+    public static let missesToRelease = 2
+    private var misses: [Int: Int] = [:]
+    public init() {}
+    /// `isPressed`: the keyboard's state for a key, or nil when it cannot say (the key is then left alone).
+    public mutating func stale(held: Set<Int>, isPressed: (Int) -> Bool?) -> [Int] {
+        misses = misses.filter { held.contains($0.key) }
+        var release: [Int] = []
+        for code in held.sorted() {
+            guard let pressed = isPressed(code) else { misses[code] = nil; continue }
+            if pressed { misses[code] = nil; continue }
+            let count = (misses[code] ?? 0) + 1
+            if count >= Self.missesToRelease { release.append(code); misses[code] = nil } else { misses[code] = count }
+        }
+        return release
+    }
+    public mutating func reset() { misses = [:] }
+}

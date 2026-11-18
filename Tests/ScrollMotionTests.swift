@@ -62,3 +62,24 @@ final class ModifierSyncTests: XCTestCase {
         XCTAssertEqual(ModifierSync.stale(held: [], actual: 15), [])
     }
 }
+
+final class StuckKeyCheckTests: XCTestCase {
+    func testAKeyTheKeyboardReportsUpTwiceRunningIsReleased() {
+        var check = StuckKeyCheck()
+        var down: Set<Int> = [227]
+        // Held for real: never released.
+        for _ in 0..<5 { XCTAssertEqual(check.stale(held: [227, 6]) { down.contains($0) || $0 == 6 }, []) }
+        // iPadOS kept ⌘'s key-up: the first check only notes it, the second releases it.
+        down = []
+        XCTAssertEqual(check.stale(held: [227]) { down.contains($0) }, [])
+        XCTAssertEqual(check.stale(held: [227]) { down.contains($0) }, [227])
+    }
+    func testOneMissedCheckIsForgivenAndUnknownKeysAreLeftAlone() {
+        var check = StuckKeyCheck()
+        XCTAssertEqual(check.stale(held: [227]) { _ in false }, [])   // keyboard state not caught up yet
+        XCTAssertEqual(check.stale(held: [227]) { _ in true }, [])
+        XCTAssertEqual(check.stale(held: [227]) { _ in false }, [])   // counting starts again
+        XCTAssertEqual(check.stale(held: [40]) { _ in nil }, [])
+        XCTAssertEqual(check.stale(held: [40]) { _ in nil }, [])
+    }
+}
